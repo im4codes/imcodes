@@ -1567,7 +1567,6 @@ final class QwenSegmentedDecodeEngine {
     private let initialStrideSamples: Int
     private let strideSamples: Int
     private let maxSegmentSamples: Int
-    private let maxFinalReDecodeSamples: Int
     private let rollbackTokenCount: Int
     private let expectLanguageHeader: Bool
     private let hotwordTerms: [String]
@@ -1581,11 +1580,10 @@ final class QwenSegmentedDecodeEngine {
 
     private var pendingSamples: [Float] = []
     private var activeSegment: [Float] = []
-    private var utteranceSamples: [Float] = []
-    private var utteranceExceededFinalCap = false
     private var lastDecodedCount = 0
     private var committedText = ""
     private var committedHasTrustedRealText = false
+    private var committedPendingSingleHotword = false
     private var activeText = ""
     private var activeTrustedRealText = ""
     private var activePendingSingleHotword = false
@@ -1602,7 +1600,6 @@ final class QwenSegmentedDecodeEngine {
         initialStrideSamples: Int = 12_800,
         strideSamples: Int = 16_000,
         maxSegmentSamples: Int = 216_000,
-        maxFinalReDecodeSamples: Int = 480_000,
         rollbackTokenCount: Int = 5,
         expectLanguageHeader: Bool,
         hotwordTerms: [String] = [],
@@ -1614,7 +1611,6 @@ final class QwenSegmentedDecodeEngine {
         self.initialStrideSamples = initialStrideSamples
         self.strideSamples = strideSamples
         self.maxSegmentSamples = maxSegmentSamples
-        self.maxFinalReDecodeSamples = maxFinalReDecodeSamples
         self.rollbackTokenCount = rollbackTokenCount
         self.expectLanguageHeader = expectLanguageHeader
         self.hotwordTerms = hotwordTerms
@@ -1624,23 +1620,12 @@ final class QwenSegmentedDecodeEngine {
         self.onLoopFinishedFn = onLoopFinishedFn
     }
 
-    private func appendUtteranceSamplesLocked(_ samples: [Float]) {
-        guard !utteranceExceededFinalCap, !samples.isEmpty else { return }
-        if utteranceSamples.count + samples.count > maxFinalReDecodeSamples {
-            utteranceExceededFinalCap = true
-            utteranceSamples.removeAll(keepingCapacity: false)
-        } else {
-            utteranceSamples.append(contentsOf: samples)
-        }
-    }
-
     func preload(_ initial: [Float]) {
         guard !initial.isEmpty else { return }
         lock.lock()
         let active = !producerFinished && !aborted
         if active {
             pendingSamples.append(contentsOf: initial)
-            appendUtteranceSamplesLocked(initial)
         }
         lock.unlock()
         if active {
@@ -1655,7 +1640,6 @@ final class QwenSegmentedDecodeEngine {
         let active = !producerFinished && !aborted
         if active {
             pendingSamples.append(contentsOf: samples)
-            appendUtteranceSamplesLocked(samples)
         }
         let shouldWake = active && !pendingSamples.isEmpty
         lock.unlock()
@@ -1685,7 +1669,6 @@ final class QwenSegmentedDecodeEngine {
         if abort {
             aborted = true
             producerFinished = true
-            utteranceSamples.removeAll(keepingCapacity: false)
         } else if producerAlsoFinished {
             producerFinished = true
         }
@@ -1737,8 +1720,6 @@ final class QwenSegmentedDecodeEngine {
             let currentLen = activeSegment.count
             let decodedCountSnapshot = lastDecodedCount
             let newCount = currentLen - decodedCountSnapshot
-            let canReDecodeWholeUtterance = !utteranceExceededFinalCap && !utteranceSamples.isEmpty
-            let exceededFinalCap = utteranceExceededFinalCap
             lock.unlock()
 
             if isAborted {
@@ -1746,63 +1727,68 @@ final class QwenSegmentedDecodeEngine {
             }
 
             let isFinalPass = isStop && isProducerFinished && !hasRemainingPending
-            let isFinalWholeUtterance = isFinalPass && canReDecodeWholeUtterance
-            let isFinalExceededSegment = isFinalPass && exceededFinalCap && currentLen > 0
-            let shouldRunFinalDecode = isFinalWholeUtterance || isFinalExceededSegment
-
-            if isFinalPass && !shouldRunFinalDecode && (!lastEmittedText.isEmpty || !committedText.isEmpty || pendingRetractionFinal || retractedSegmentSingleHotword) {
-                let rawFinalCombined = !committedText.isEmpty && !activeText.isEmpty
-                    ? joinTranscriptSegments(committedText, activeText)
-                    : (!lastEmittedText.isEmpty ? lastEmittedText : committedText)
-                let finalCombined = (!hotwordTerms.isEmpty
-                    && (retractedSegmentSingleHotword || pendingRetractionFinal)
-                    && !committedHasTrustedRealText
-                    && activeTrustedRealText.isEmpty)
-                    ? ""
-                    : rawFinalCombined
-                pendingRetractionFinal = false
-                retractedSegmentSingleHotword = false
-                _ = emitJsonIfNotAborted([
-                    "type": "result",
-                    "text": finalCombined,
-                    "isFinal": true,
-                ])
+            if isFinalPass && newCount == 0 {
+                if !lastEmittedText.isEmpty || !committedText.isEmpty || pendingRetractionFinal || retractedSegmentSingleHotword {
+                    let dropRetractedCommitted = !hotwordTerms.isEmpty
+                        && committedPendingSingleHotword
+                        && !committedHasTrustedRealText
+                        && (retractedSegmentSingleHotword || pendingRetractionFinal)
+                    let baseCommitted = dropRetractedCommitted ? "" : committedText
+                    let rawFinalCombined = !baseCommitted.isEmpty && !activeText.isEmpty
+                        ? joinTranscriptSegments(baseCommitted, activeText)
+                        : (!lastEmittedText.isEmpty && !dropRetractedCommitted ? lastEmittedText : baseCommitted)
+                    let guardedCombined = hotwordTerms.isEmpty
+                        ? rawFinalCombined
+                        : stripVoiceHotwordHallucination(
+                            rawFinalCombined,
+                            hotwordTerms: hotwordTerms,
+                            allowSingle: false,
+                            wholeOnly: true
+                        )
+                    let finalCombined: String
+                    if !hotwordTerms.isEmpty
+                        && (retractedSegmentSingleHotword || pendingRetractionFinal)
+                        && !committedHasTrustedRealText
+                        && activeTrustedRealText.isEmpty {
+                        finalCombined = ""
+                    } else if !hotwordTerms.isEmpty && guardedCombined.isEmpty && !rawFinalCombined.isEmpty && committedHasTrustedRealText {
+                        finalCombined = committedText
+                    } else {
+                        finalCombined = guardedCombined
+                    }
+                    pendingRetractionFinal = false
+                    retractedSegmentSingleHotword = false
+                    _ = emitJsonIfNotAborted([
+                        "type": "result",
+                        "text": finalCombined,
+                        "isFinal": true,
+                    ])
+                }
                 break
             }
 
             let threshold = decodedCountSnapshot == 0 ? initialStrideSamples : strideSamples
-            if shouldRunFinalDecode || newCount >= threshold || (currentLen >= maxSegmentSamples && hasRemainingPending) {
+            if (isFinalPass && currentLen > 0) || newCount >= threshold || (currentLen >= maxSegmentSamples && hasRemainingPending) {
                 let audioCopy: [Float]
                 let prefixCopy: [Int32]
                 lock.lock()
-                if isFinalWholeUtterance {
-                    audioCopy = utteranceSamples
-                    utteranceSamples.removeAll(keepingCapacity: false)
-                } else {
-                    audioCopy = activeSegment
-                }
-                prefixCopy = isFinalPass ? [] : confirmedTokens
+                audioCopy = activeSegment
+                prefixCopy = confirmedTokens
                 lastDecodedCount = currentLen
                 lock.unlock()
 
-                let hasTrustedText = isFinalWholeUtterance
-                    ? (committedHasTrustedRealText || !activeTrustedRealText.isEmpty || (hotwordTerms.isEmpty && (!committedText.isEmpty || !activeText.isEmpty)))
-                    : (!activeTrustedRealText.isEmpty || (hotwordTerms.isEmpty && !activeText.isEmpty))
+                let hasTrustedText = !activeTrustedRealText.isEmpty || (hotwordTerms.isEmpty && !activeText.isEmpty)
 
                 let decodeAudio: [Float]
-                if !isFinalPass && !prefixCopy.isEmpty {
+                if !prefixCopy.isEmpty {
                     let fixedStart = activeSegmentTrimStart ?? 0
                     decodeAudio = trimTrailingSilence(audioCopy, fixedStart: fixedStart)
                 } else if let trimmed = trimSilenceEdgesWithRange(audioCopy) {
                     decodeAudio = trimmed.samples
-                    if !isFinalPass {
-                        activeSegmentTrimStart = trimmed.range.lowerBound
-                    }
+                    activeSegmentTrimStart = trimmed.range.lowerBound
                 } else {
                     decodeAudio = []
-                    if !isFinalPass {
-                        activeSegmentTrimStart = nil
-                    }
+                    activeSegmentTrimStart = nil
                 }
 
                 if decodeAudio.isEmpty && (!hasTrustedText || isFinalPass) {
@@ -1811,8 +1797,6 @@ final class QwenSegmentedDecodeEngine {
                         let finalCombined: String
                         if hotwordTerms.isEmpty {
                             finalCombined = !lastEmittedText.isEmpty ? lastEmittedText : committedText
-                        } else if isFinalWholeUtterance {
-                            finalCombined = committedHasTrustedRealText ? committedText : ""
                         } else {
                             finalCombined = (!lastEmittedText.isEmpty && !activePendingSingleHotword) ? lastEmittedText : committedText
                         }
@@ -1852,13 +1836,9 @@ final class QwenSegmentedDecodeEngine {
                                 expectLanguageHeader
                             )
                         }
-                        let baseCommitted = isFinalWholeUtterance ? "" : committedText
-                        var combined = joinTranscriptSegments(baseCommitted, activeText)
+                        var combined = joinTranscriptSegments(committedText, activeText)
                         if isFinalPass && combined.isEmpty && !lastEmittedText.isEmpty && !hitRepetitionLoop {
                             combined = lastEmittedText
-                        }
-                        if isFinalWholeUtterance && !combined.isEmpty {
-                            committedText = ""
                         }
                         if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
                             lastEmittedText = combined
@@ -1894,20 +1874,23 @@ final class QwenSegmentedDecodeEngine {
                             hadRetractedSingleHotword
                             && !hasRealNonHotword
                             && activeTrustedRealText.isEmpty
-                            && (!isFinalWholeUtterance || !committedHasTrustedRealText)
                         let blockedTrustedOverwriteSingleHotword =
                             isFinalPass
                             && !text.isEmpty
                             && !hasRealNonHotword
-                            && (isFinalWholeUtterance ? (committedHasTrustedRealText || !activeTrustedRealText.isEmpty) : !activeTrustedRealText.isEmpty)
+                            && !activeTrustedRealText.isEmpty
 
                         if hitHotwordHallucination
                             || blockedRetractedSingleHotword
                             || blockedTrustedOverwriteSingleHotword
-                            || (text.isEmpty && (activePendingSingleHotword || !activeTrustedRealText.isEmpty || (isFinalWholeUtterance && committedHasTrustedRealText))) {
+                            || (text.isEmpty && (activePendingSingleHotword || !activeTrustedRealText.isEmpty)) {
                             confirmedTokens = []
                             activeSegmentTrimStart = nil
-                            let trustedCommitted = (!isFinalWholeUtterance || committedHasTrustedRealText) ? committedText : ""
+                            let dropRetractedCommitted =
+                                committedPendingSingleHotword
+                                && !committedHasTrustedRealText
+                                && (retractedSegmentSingleHotword || pendingRetractionFinal || activePendingSingleHotword)
+                            let trustedCommitted = dropRetractedCommitted ? "" : committedText
                             if !activeTrustedRealText.isEmpty {
                                 activeText = activeTrustedRealText
                                 let combined = joinTranscriptSegments(trustedCommitted, activeText)
@@ -1943,7 +1926,7 @@ final class QwenSegmentedDecodeEngine {
                                         break
                                     }
                                 }
-                            } else if activePendingSingleHotword || blockedRetractedSingleHotword || blockedTrustedOverwriteSingleHotword || (isFinalWholeUtterance && (!lastEmittedText.isEmpty || pendingRetractionFinal)) {
+                            } else if activePendingSingleHotword || blockedRetractedSingleHotword || blockedTrustedOverwriteSingleHotword {
                                 activeText = ""
                                 if activePendingSingleHotword {
                                     retractedSegmentSingleHotword = true
@@ -1973,7 +1956,11 @@ final class QwenSegmentedDecodeEngine {
                                     activeTrustedRealText = text
                                     activePendingSingleHotword = false
                                     retractedSegmentSingleHotword = false
-                                } else if activeTrustedRealText.isEmpty && !isFinalWholeUtterance {
+                                    if !committedText.isEmpty {
+                                        committedHasTrustedRealText = true
+                                        committedPendingSingleHotword = false
+                                    }
+                                } else if activeTrustedRealText.isEmpty {
                                     activePendingSingleHotword = true
                                 }
                             }
@@ -1987,8 +1974,7 @@ final class QwenSegmentedDecodeEngine {
                                     expectLanguageHeader
                                 )
                             }
-                            let baseCommitted = isFinalWholeUtterance ? "" : committedText
-                            let rawCombined = joinTranscriptSegments(baseCommitted, activeText)
+                            let rawCombined = joinTranscriptSegments(committedText, activeText)
                             let combined = stripVoiceHotwordHallucination(
                                 rawCombined,
                                 hotwordTerms: hotwordTerms,
@@ -2004,6 +1990,7 @@ final class QwenSegmentedDecodeEngine {
                                 activeSegmentTrimStart = nil
                                 if !committedHasTrustedRealText {
                                     committedText = ""
+                                    committedPendingSingleHotword = false
                                 }
                                 retractedSegmentSingleHotword = true
                                 if !lastEmittedText.isEmpty || isFinalPass {
@@ -2018,9 +2005,6 @@ final class QwenSegmentedDecodeEngine {
                                     }
                                 }
                             } else {
-                                if isFinalWholeUtterance && !combined.isEmpty {
-                                    committedText = ""
-                                }
                                 if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
                                     lastEmittedText = combined
                                     pendingRetractionFinal = false
@@ -2070,8 +2054,12 @@ final class QwenSegmentedDecodeEngine {
                         )
                     if !activeTrustedRealText.isEmpty || (hotwordTerms.isEmpty && !activeText.isEmpty) {
                         committedHasTrustedRealText = true
+                        committedPendingSingleHotword = false
+                    } else if !hotwordTerms.isEmpty && !committedHasTrustedRealText && !nextCommitted.isEmpty {
+                        committedPendingSingleHotword = true
                     } else if nextCommitted.isEmpty && !committedHasTrustedRealText {
                         committedHasTrustedRealText = false
+                        committedPendingSingleHotword = false
                     }
                     committedText = nextCommitted
                     activeText = ""
@@ -2103,7 +2091,6 @@ final class QwenSegmentedDecodeEngine {
 final class QwenStreamingSession {
     private let sampleRate = 16_000
     private let maxSegmentSamples = 216_000 // 13.5s bounded segment
-    private let maxFinalReDecodeSamples = 480_000 // 30s full-utterance final re-decode cap
     private let rollbackTokenCount = 5
 
     private let model: Qwen3ASRModel
@@ -2150,16 +2137,14 @@ final class QwenStreamingSession {
         let sampleRate = self.sampleRate
         let rollbackTokenCount = self.rollbackTokenCount
         let maxSegmentSamples = self.maxSegmentSamples
-        let maxFinalReDecodeSamples = self.maxFinalReDecodeSamples
         return QwenSegmentedDecodeEngine(
             maxSegmentSamples: maxSegmentSamples,
-            maxFinalReDecodeSamples: maxFinalReDecodeSamples,
             rollbackTokenCount: rollbackTokenCount,
             expectLanguageHeader: language == nil,
             hotwordTerms: hotwordTerms,
             decodeFn: { samples, prefixTokens, checkCancellation in
                 let options = Qwen3DecodingOptions(
-                    maxTokens: samples.count > maxSegmentSamples ? 384 : 192,
+                    maxTokens: 192,
                     language: language,
                     context: hotwordsContext
                 )

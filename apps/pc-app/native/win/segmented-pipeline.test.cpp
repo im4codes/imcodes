@@ -107,7 +107,7 @@ int main() {
     assert(cfg.hotword_terms[2] == "BaseTerm");
   }
 
-  // 2. ServeCommandLoop propagates dynamic hotwords, locale, unprefixed 30s redecode, and abort safety
+  // 2. ServeCommandLoop propagates dynamic hotwords, locale, segmented final drain, and abort safety
   {
     std::vector<std::string> emitted;
     std::mutex gate_mu;
@@ -178,7 +178,7 @@ int main() {
     assert(!emitted.empty() && extract_json_string_field(emitted.back(), "type") == "end");
   }
 
-  // 3. <=30s multi-segment full unprefixed final decode replaces streaming segments cleanly
+  // 3. Multi-segment segmented-streaming final decode decodes ONLY trailing active_segment_ (preserving committed_text)
   {
     std::vector<std::string> emitted;
     std::vector<size_t> decode_sizes;
@@ -193,7 +193,7 @@ int main() {
           decode_sizes.push_back(samples.size());
           saw_prefix.push_back(!opts.prefix_tokens.empty());
           DecodeResult r;
-          r.text = samples.size() == 250000 ? "full-250k-utterance" : "seg-one";
+          r.text = samples.size() == 216000 ? "seg-one" : "seg-two";
           r.raw_tokens = {1, 2, 3, 4, 5, 6, 7};
           return r;
         },
@@ -207,9 +207,11 @@ int main() {
     pipeline.request_stop(false, true);
     worker.join();
 
-    assert(!decode_sizes.empty() && decode_sizes.back() == 250000);
+    assert(decode_sizes.size() == 2);
+    assert(decode_sizes[0] == 216000);
+    assert(decode_sizes[1] == 34000);
     assert(!saw_prefix.empty() && saw_prefix.back() == false);
-    assert(extract_json_string_field(emitted[emitted.size() - 2], "text") == "full-250k-utterance");
+    assert(extract_json_string_field(emitted[emitted.size() - 2], "text") == "seg-one seg-two");
     assert(extract_json_bool_or_str(emitted[emitted.size() - 2], "isFinal") == "true");
     assert(extract_json_string_field(emitted.back(), "type") == "end");
   }
@@ -288,7 +290,7 @@ int main() {
            "Next");
   }
 
-  // 5. Silence-edge trimming & prefix-shift alignment + >30s cross-segment hotword retention/retraction
+  // 5. Silence-edge trimming & prefix-shift alignment + cross-segment hotword retention/retraction
   {
     // 5a: Leading & trailing silence is trimmed cleanly before decode while keeping 250ms padding
     std::vector<float> padded_audio(48000, 0.0f);  // 3.0s
@@ -298,12 +300,11 @@ int main() {
     assert(trim_start == 24000 - 4000);
     assert(trimmed.size() == 1600 + 8000);
 
-    // 5b: >cap cross-segment single hotword + real text -> "IM.codes保留这一句"
+    // 5b: Cross-segment single hotword + real text -> "IM.codes保留这一句"
     std::vector<std::string> emitted_18a;
     int call_18a = 0;
     StreamingPipelineConfig cfg_18a;
     cfg_18a.max_segment_samples = 16000;
-    cfg_18a.max_final_redecode_samples = 20000;
     cfg_18a.hotword_terms = {"IM.codes"};
     cfg_18a.expect_language_header = false;
     Qwen3Tokenizer empty_tok;
@@ -411,7 +412,7 @@ int main() {
     }
     assert(final_18c.empty());
 
-    // 5f: >cap incremental retraction across segments never resurrects retracted hotwords
+    // 5f: Incremental retraction across segments never resurrects retracted hotwords
     std::vector<std::string> emitted_18b;
     std::mutex mu_b;
     std::condition_variable cv_b;
@@ -420,7 +421,6 @@ int main() {
     cfg_18b.initial_stride_samples = 12800;
     cfg_18b.step_stride_samples = 12800;
     cfg_18b.max_segment_samples = 32000;
-    cfg_18b.max_final_redecode_samples = 40000;
     cfg_18b.hotword_terms = {"IM.codes"};
     cfg_18b.expect_language_header = false;
     Qwen3StreamingPipeline p18b(

@@ -484,7 +484,7 @@ class ServeCommandLoop {
         }
       }
     } else if (*cmd == "stop") {
-      // Non-blocking: signal final re-decode so stdin remains responsive to abort/shutdown.
+      // Non-blocking: signal final drain so stdin remains responsive to abort/shutdown.
       request_stop_active(false);
     } else if (*cmd == "abort") {
       prefilled_pcm_.clear();
@@ -508,7 +508,7 @@ class ServeCommandLoop {
 /**
  * Handles early stop/abort during capture startup (before open, on interrupted/failed
  * open, or before entering the read loop). Normal stop preserves prefill samples by
- * running one unprefixed final pass (`start` -> `result` -> `end`) with no spurious
+ * running one segmented final pass (`start` -> `result` -> `end`) with no spurious
  * open error; abort discards prefill samples and emits `end` only.
  */
 inline void drain_prefill_or_end(

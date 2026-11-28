@@ -3458,9 +3458,10 @@ it.skipIf(!swiftCompiler)('parses macOS ImcodesSpeechMlx main.swift and executes
   // 1. Full-file Swift parse check across main.swift.
   await runNativeOrThrow(swiftCompiler!, ['-parse', '-swift-version', '5', mainSwiftPath], { timeout: 60000 });
 
-  // 1b. Contract pins on macOS 30s full-utterance final re-decode & token budget.
-  expect(mainSwift).toContain('maxFinalReDecodeSamples: Int = 480_000');
-  expect(mainSwift).toContain('maxTokens: samples.count > maxSegmentSamples ? 384 : 192');
+  // 1b. Contract pins on macOS segmented-streaming finalize (no full-utterance re-decode) & token budget.
+  expect(mainSwift).not.toContain('maxFinalReDecodeSamples');
+  expect(mainSwift).not.toContain('utteranceSamples');
+  expect(mainSwift).toContain('maxTokens: 192');
 
   // 2. Slice production joinTranscriptSegments, sanitizeAsrRepetitionLoop, and QwenSegmentedDecodeEngine.
   const joinSlice = mainSwift.slice(
@@ -3494,8 +3495,8 @@ func markerText(_ samples: [Float]) -> String {
     return first < 0.35 ? "seg-one" : "seg-two"
 }
 
-// 1. <=30s multi-segment (250,000 <= 480,000) prefilled + immediate normal stop -> streaming decodes 216,000,
-//    then final pass re-decodes FULL 250,000 utterance with prefixTokens=[] replacing rolled-over text.
+// 1. Multi-segment (250,000) prefilled + immediate normal stop -> streaming decodes 216,000,
+//    then final pass decodes ONLY trailing 34,000 activeSegment preserving committedText ("seg-one seg-two").
 do {
     let emitLock = NSLock()
     var emitted: [[String: Any]] = []
@@ -3506,8 +3507,7 @@ do {
         decodeFn: { samples, prefix, checkCancel in
             try checkCancel()
             decodeCalls.append((samples.count, prefix.count))
-            let txt = samples.count == 250_000 ? "full-utterance-rewrite" : markerText(samples)
-            return QwenSegmentedDecodeResult(text: txt, tokens: prefix + [1])
+            return QwenSegmentedDecodeResult(text: markerText(samples), tokens: prefix + [1])
         },
         rollbackPrefixFn: { tokens, _, _ in tokens },
         emitJsonFn: { payload in
@@ -3524,14 +3524,14 @@ do {
     engine.requestStop(abort: false, producerAlsoFinished: true)
     DispatchQueue.global(qos: .userInitiated).async { engine.runLoop() }
     check(done.wait(timeout: .now() + 5) == .success, "case 1 timed out")
-    check(decodeCalls.map { $0.size } == [216_000, 250_000], "case 1 decodeSizes mismatch: \\(decodeCalls)")
-    check(decodeCalls.last?.prefixCount == 0, "case 1 final pass must use empty prefixTokens: \\(decodeCalls)")
+    check(decodeCalls.map { $0.size } == [216_000, 34_000], "case 1 decodeSizes mismatch: \\(decodeCalls)")
+    check(decodeCalls.last?.prefixCount == 0, "case 1 post-rollover tail starts with empty prefixTokens: \\(decodeCalls)")
     let finals = emitted.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
-    check(finals.count == 1 && (finals[0]["text"] as? String) == "full-utterance-rewrite", "case 1 final mismatch: \\(finals)")
+    check(finals.count == 1 && (finals[0]["text"] as? String) == "seg-one seg-two", "case 1 final mismatch: \\(finals)")
 }
 
 // 2. Trailing samples enqueued AFTER requestStop(abort: false, producerAlsoFinished: false) and BEFORE markProducerFinished()
-//    (<=30s total = 220,000) must be included in the full-utterance prefix-free final re-decode.
+//    (total 220,000) must finalize ONLY trailing 4,000 activeSegment preserving committedText ("seg-one seg-two").
 do {
     let emitLock = NSLock()
     var emitted: [[String: Any]] = []
@@ -3546,8 +3546,7 @@ do {
             if samples.count == 216_000 {
                 firstDecodeEntered.signal()
             }
-            let txt = samples.count == 220_000 ? "whole-220k" : markerText(samples)
-            return QwenSegmentedDecodeResult(text: txt, tokens: prefix + [1])
+            return QwenSegmentedDecodeResult(text: markerText(samples), tokens: prefix + [1])
         },
         rollbackPrefixFn: { tokens, _, _ in tokens },
         emitJsonFn: { payload in
@@ -3564,13 +3563,13 @@ do {
     check(engine.enqueue([Float](repeating: 0.8, count: 4_000)), "trailing enqueue before markProducerFinished rejected")
     engine.markProducerFinished()
     check(done.wait(timeout: .now() + 5) == .success, "case 2 timed out")
-    check(decodeCalls.map { $0.size } == [216_000, 220_000] && decodeCalls.last?.prefixCount == 0, "case 2 decodeCalls: \\(decodeCalls)")
+    check(decodeCalls.map { $0.size } == [216_000, 4_000] && decodeCalls.last?.prefixCount == 0, "case 2 decodeCalls: \\(decodeCalls)")
     let finals = emitted.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
-    check(finals.count == 1 && (finals[0]["text"] as? String) == "whole-220k", "case 2 final mismatch: \\(finals)")
+    check(finals.count == 1 && (finals[0]["text"] as? String) == "seg-one seg-two", "case 2 final mismatch: \\(finals)")
 }
 
-// 3. <=30s single segment keeps streaming confirmedTokens during partials, then on stop with newCount == 0
-//    MUST NOT shortcut; runs final decode with prefixTokens=[] replacing streaming typo/punctuation.
+// 3. Single segment keeps streaming confirmedTokens during partials, then on stop with newCount == 0
+//    emits finalized text immediately with ZERO extra decode calls (and newCount > 0 preserves confirmedTokens).
 do {
     let emitLock = NSLock()
     var emitted: [[String: Any]] = []
@@ -3590,7 +3589,7 @@ do {
             let p = pass
             decodeLock.unlock()
             return QwenSegmentedDecodeResult(
-                text: p < 3 ? "流式错字。半句" : "完整正确，整句",
+                text: p == 1 ? "流式第一句" : "流式第一句，第二句",
                 tokens: [10, 11, 12]
             )
         },
@@ -3615,19 +3614,58 @@ do {
         if p >= 2 { break }
         Thread.sleep(forTimeInterval: 0.005)
     }
-    // Stop with zero new samples (newCount == 0) while confirmedTokens == [10, 11, 12]!
+    // Stop with zero new samples (newCount == 0) while confirmedTokens == [10, 11, 12] -> ZERO extra decode calls!
     engine.requestStop(abort: false, producerAlsoFinished: true)
     check(done.wait(timeout: .now() + 5) == .success, "case 3 timed out")
     check(
-        decodePrefixes.count == 3 && decodePrefixes[0].isEmpty && decodePrefixes[1] == [10, 11, 12] && decodePrefixes[2].isEmpty,
+        decodePrefixes.count == 2 && decodePrefixes[0].isEmpty && decodePrefixes[1] == [10, 11, 12],
         "case 3 prefixes: \\(decodePrefixes)"
     )
     let finals = emitted.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
-    check(finals.count == 1 && (finals[0]["text"] as? String) == "完整正确，整句", "case 3 final: \\(finals)")
+    check(finals.count == 1 && (finals[0]["text"] as? String) == "流式第一句，第二句", "case 3 final: \\(finals)")
+
+    // 3b: Stop with newCount > 0 (< strideSamples) decodes activeSegment while PRESERVING confirmedTokens!
+    var emittedB: [[String: Any]] = []
+    var prefixesB: [[Int32]] = []
+    let lockB = NSLock()
+    var passB = 0
+    let doneB = DispatchSemaphore(value: 0)
+    let engineB = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 4_000,
+        strideSamples: 4_000,
+        expectLanguageHeader: false,
+        decodeFn: { _, prefix, checkCancel in
+            try checkCancel()
+            lockB.lock()
+            prefixesB.append(prefix)
+            passB += 1
+            let p = passB
+            lockB.unlock()
+            return QwenSegmentedDecodeResult(
+                text: p == 1 ? "前缀部分" : "前缀部分和尾音",
+                tokens: [10, 11, 12]
+            )
+        },
+        rollbackPrefixFn: { tokens, _, _ in tokens },
+        emitJsonFn: { payload in emitLock.lock(); emittedB.append(payload); emitLock.unlock() },
+        onLoopFinishedFn: { doneB.signal() }
+    )
+    DispatchQueue.global(qos: .userInitiated).async { engineB.runLoop() }
+    check(engineB.enqueue([Float](repeating: 0.2, count: 4_000)), "case 3b.1 enqueue failed")
+    for _ in 0..<200 {
+        lockB.lock(); let p = passB; lockB.unlock()
+        if p >= 1 { break }
+        Thread.sleep(forTimeInterval: 0.005)
+    }
+    check(engineB.enqueue([Float](repeating: 0.2, count: 1_500)), "case 3b.2 trailing enqueue failed")
+    engineB.requestStop(abort: false, producerAlsoFinished: true)
+    check(doneB.wait(timeout: .now() + 5) == .success, "case 3b done")
+    check(prefixesB.count == 2 && prefixesB[0].isEmpty && prefixesB[1] == [10, 11, 12], "case 3b prefixes: \\(prefixesB)")
+    let finalsB = emittedB.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
+    check(finalsB.count == 1 && (finalsB[0]["text"] as? String) == "前缀部分和尾音", "case 3b final: \\(finalsB)")
 }
 
-// 4. >30s (>480,000 default cap AND custom cap): drops whole-utterance buffer, keeps committedText,
-//    and decodes only trailing activeSegment with prefixTokens=[] (even when newCount == 0).
+// 4. Multi-segment (>432,000 = 3 segments): keeps committedText and decodes only trailing activeSegment.
 do {
     let emitLock = NSLock()
     var emitted: [[String: Any]] = []
@@ -3638,7 +3676,6 @@ do {
         initialStrideSamples: 4_000,
         strideSamples: 4_000,
         maxSegmentSamples: 216_000,
-        maxFinalReDecodeSamples: 480_000,
         expectLanguageHeader: false,
         decodeFn: { samples, prefix, checkCancel in
             try checkCancel()
@@ -3648,7 +3685,7 @@ do {
             if samples.count == 216_000 {
                 return QwenSegmentedDecodeResult(text: samples.first! < 0.35 ? "seg-a" : "seg-b", tokens: [1, 2])
             }
-            return QwenSegmentedDecodeResult(text: prefix.isEmpty ? "tail-clean" : "tail-dirty", tokens: [3, 4])
+            return QwenSegmentedDecodeResult(text: "tail-clean", tokens: [3, 4])
         },
         rollbackPrefixFn: { tokens, _, _ in tokens },
         emitJsonFn: { payload in
@@ -3671,7 +3708,8 @@ do {
     check(finals.count == 1 && (finals[0]["text"] as? String) == "seg-a seg-b tail-clean", "case 4 final mismatch: \\(finals)")
 }
 
-// 5. >cap newCount == 0 trailing activeSegment still gets prefix-free re-decode without duplicating committedText.
+// 5. After segment rollover: newCount == 0 trailing stop makes zero extra calls without duplicating committedText;
+//    and newCount > 0 preserves confirmedTokens of the active tail segment.
 do {
     let emitLock = NSLock()
     var emitted: [[String: Any]] = []
@@ -3682,7 +3720,6 @@ do {
         initialStrideSamples: 4,
         strideSamples: 4,
         maxSegmentSamples: 8,
-        maxFinalReDecodeSamples: 10,
         expectLanguageHeader: false,
         decodeFn: { samples, prefix, checkCancel in
             try checkCancel()
@@ -3690,7 +3727,7 @@ do {
             calls.append((samples.count, prefix))
             callLock.unlock()
             if samples.count == 8 { return QwenSegmentedDecodeResult(text: "head", tokens: [7]) }
-            return QwenSegmentedDecodeResult(text: prefix.isEmpty ? "tail-final" : "tail-interim", tokens: [9])
+            return QwenSegmentedDecodeResult(text: prefix == [9] ? "tail-preserves-prefix" : "tail-interim", tokens: [9])
         },
         rollbackPrefixFn: { tokens, _, _ in tokens },
         emitJsonFn: { payload in emitLock.lock(); emitted.append(payload); emitLock.unlock() },
@@ -3705,14 +3742,14 @@ do {
     }
     engine.requestStop(abort: false, producerAlsoFinished: true)
     check(done.wait(timeout: .now() + 5) == .success, "case 5 timed out")
-    check(calls.count == 3 && calls.last?.size == 4 && calls.last?.prefix.isEmpty == true, "case 5 calls: \\(calls)")
+    check(calls.count == 2 && calls.last?.size == 4, "case 5 expected zero extra decode on newCount == 0: \\(calls)")
     let finals = emitted.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
-    check(finals.count == 1 && (finals[0]["text"] as? String) == "head tail-final", "case 5 finals: \\(finals)")
+    check(finals.count == 1 && (finals[0]["text"] as? String) == "head tail-interim", "case 5 finals: \\(finals)")
 }
 
-// 6. Silence gate and hotword hallucination retraction stay intact on both <=cap and >cap final passes.
+// 6. Silence gate and hotword hallucination retraction stay intact on segmented streaming final passes.
 do {
-    // 6a: pure silence <=cap never invokes decodeFn
+    // 6a: pure silence never invokes decodeFn
     var decodedCount = 0
     var silenceEmitted: [[String: Any]] = []
     let doneA = DispatchSemaphore(value: 0)
@@ -3720,7 +3757,6 @@ do {
         initialStrideSamples: 4,
         strideSamples: 4,
         maxSegmentSamples: 8,
-        maxFinalReDecodeSamples: 16,
         expectLanguageHeader: false,
         hotwordTerms: ["IM.codes"],
         decodeFn: { _, _, _ in decodedCount += 1; return QwenSegmentedDecodeResult(text: "IM.codes", tokens: [1]) },
@@ -3734,7 +3770,7 @@ do {
     check(doneA.wait(timeout: .now() + 5) == .success, "case 6a timed out")
     check(decodedCount == 0 && silenceEmitted.isEmpty, "case 6a decoded silent audio: count=\\(decodedCount), emitted=\\(silenceEmitted)")
 
-    // 6b: provisional single hotword interim ("IM.codes") -> <=cap whole-utterance final returns echo -> retracts cleanly to ""
+    // 6b: provisional single hotword interim ("IM.codes") -> trailing stop pass returns echo -> retracts cleanly to ""
     var hwEmitted: [[String: Any]] = []
     var hwPass = 0
     let hwLock = NSLock()
@@ -3743,7 +3779,6 @@ do {
         initialStrideSamples: 4,
         strideSamples: 4,
         maxSegmentSamples: 100,
-        maxFinalReDecodeSamples: 100,
         expectLanguageHeader: false,
         hotwordTerms: ["IM.codes"],
         decodeFn: { _, _, _ in
@@ -3755,20 +3790,20 @@ do {
         onLoopFinishedFn: { doneB.signal() }
     )
     DispatchQueue.global(qos: .userInitiated).async { engineB.runLoop() }
-    check(engineB.enqueue([Float](repeating: 0.1, count: 8)), "case 6b enqueue failed")
+    check(engineB.enqueue([Float](repeating: 0.1, count: 4)), "case 6b chunk 1 failed")
     for _ in 0..<200 {
         hwLock.lock(); let p = hwPass; hwLock.unlock()
         if p >= 1 { break }
         Thread.sleep(forTimeInterval: 0.005)
     }
+    check(engineB.enqueue([Float](repeating: 0.1, count: 2)), "case 6b chunk 2 failed")
     engineB.requestStop(abort: false, producerAlsoFinished: true)
     check(doneB.wait(timeout: .now() + 5) == .success, "case 6b timed out")
     check((hwEmitted.last?["text"] as? String) == "" && (hwEmitted.last?["isFinal"] as? Bool) == true, "case 6b did not retract: \\(hwEmitted)")
 
     // 6c & 6d (P0 #1 counterexamples): interim "IM.codes" -> echo "IM.codes，IM.codes。" retracted to ""
-    // -> final decode returning single "IM.codes" MUST stay retracted ("") under BOTH <=cap and >cap
-    // (including both direct trailing final and post-rollover stop)!
-    for (label, maxCap, step3Count) in [("<=cap", 100, 0), (">cap-tail", 10, 4), (">cap-rollover", 10, 8)] {
+    // -> final pass returning single "IM.codes" MUST stay retracted ("") under direct stop, tail, and rollover!
+    for (label, step3Count) in [("direct-stop", 0), ("tail", 4), ("rollover", 8)] {
         var stepEmitted: [[String: Any]] = []
         var stepPass = 0
         let sem1 = DispatchSemaphore(value: 0)
@@ -3779,7 +3814,6 @@ do {
             initialStrideSamples: 4,
             strideSamples: 4,
             maxSegmentSamples: 8,
-            maxFinalReDecodeSamples: maxCap,
             expectLanguageHeader: false,
             hotwordTerms: ["IM.codes"],
             decodeFn: { _, _, _ in
@@ -3805,7 +3839,7 @@ do {
         check(sem2.wait(timeout: .now() + 5) == .success, "case 6\\(label) retract wait")
         if step3Count > 0 {
             check(stepEngine.enqueue([Float](repeating: 0.1, count: step3Count)), "case 6\\(label) chunk 3")
-            if label == ">cap-rollover" {
+            if label == "rollover" {
                 for _ in 0..<200 {
                     lockStep.lock(); let p = stepPass; lockStep.unlock()
                     if p >= 3 { break }
@@ -3819,7 +3853,7 @@ do {
         check(finals.count == 1 && (finals[0]["text"] as? String) == "", "case 6\\(label) resurrected IM.codes: \\(stepEmitted)")
     }
 
-    // 6e: interim "IM.codes" -> echo retracted -> final returns real sentence "打开 IM.codes" -> accepted!
+    // 6e: interim "IM.codes" -> echo retracted -> trailing chunk returns real sentence "打开 IM.codes" -> accepted!
     var realEmitted: [[String: Any]] = []
     var realPass = 0
     let realSem1 = DispatchSemaphore(value: 0)
@@ -3829,7 +3863,6 @@ do {
         initialStrideSamples: 4,
         strideSamples: 4,
         maxSegmentSamples: 100,
-        maxFinalReDecodeSamples: 100,
         expectLanguageHeader: false,
         hotwordTerms: ["IM.codes"],
         decodeFn: { _, _, _ in
@@ -3853,12 +3886,13 @@ do {
     check(realSem1.wait(timeout: .now() + 5) == .success, "case 6e sem1")
     check(realEngine.enqueue([Float](repeating: 0.1, count: 4)), "case 6e chunk 2")
     check(realSem2.wait(timeout: .now() + 5) == .success, "case 6e sem2")
+    check(realEngine.enqueue([Float](repeating: 0.1, count: 2)), "case 6e chunk 3")
     realEngine.requestStop(abort: false, producerAlsoFinished: true)
     check(doneReal.wait(timeout: .now() + 5) == .success, "case 6e done")
     check((realEmitted.last?["text"] as? String) == "打开 IM.codes" && (realEmitted.last?["isFinal"] as? Bool) == true, "case 6e failed: \\(realEmitted)")
 
     // 6f (Round 2 P0 #1 counterexample): streaming gets trusted text "今天完成文档",
-    // whole-utterance final returns isolated single hotword "IM.codes" -> MUST keep "今天完成文档"!
+    // trailing final pass returns isolated single hotword "IM.codes" -> MUST keep "今天完成文档"!
     do {
         var guardEmitted: [[String: Any]] = []
         var guardPass = 0
@@ -3868,7 +3902,6 @@ do {
             initialStrideSamples: 16_000,
             strideSamples: 16_000,
             maxSegmentSamples: 40_000,
-            maxFinalReDecodeSamples: 48_000,
             expectLanguageHeader: false,
             hotwordTerms: ["IM.codes"],
             decodeFn: { _, _, _ in
@@ -3888,6 +3921,7 @@ do {
         DispatchQueue.global(qos: .userInitiated).async { guardEngine.runLoop() }
         check(guardEngine.enqueue([Float](repeating: 0.15, count: 32_000)), "case 6f enqueue")
         check(guardSem.wait(timeout: .now() + 5) == .success, "case 6f stream wait")
+        check(guardEngine.enqueue([Float](repeating: 0.15, count: 4_000)), "case 6f trail")
         guardEngine.requestStop(abort: false, producerAlsoFinished: true)
         check(doneGuard.wait(timeout: .now() + 5) == .success, "case 6f done")
         let finals = guardEmitted.filter { ($0["isFinal"] as? Bool) == true }
@@ -3895,11 +3929,11 @@ do {
     }
 
     // 6g (Round 2 P0 #1 committed-segment variants): committed "今天完成" (+ optional trailing "文档")
-    // <=cap whole-utterance final returning "IM.codes" preserves trusted text, while real "今天完成 IM.codes 文档" updates!
-    for (label, trailLen, finalReturn, expectedFinal) in [
-        ("committed-only-kept", 0, "IM.codes", "今天完成"),
-        ("committed+tail-kept", 8_000, "IM.codes", "今天完成文档"),
-        ("real-sentence-updates", 8_000, "今天完成 IM.codes 文档", "今天完成 IM.codes 文档"),
+    // stops cleanly or guards against isolated trailing single hotword "IM.codes", while real "文档 IM.codes" updates!
+    for (label, trailLen, extraTail, finalReturn, expectedFinal) in [
+        ("committed-only-kept", 0, 0, "IM.codes", "今天完成"),
+        ("committed+tail-kept", 8_000, 2_000, "IM.codes", "今天完成文档"),
+        ("real-sentence-updates", 8_000, 2_000, "IM.codes 文档", "今天完成IM.codes 文档"),
     ] {
         var varEmitted: [[String: Any]] = []
         var varPass = 0
@@ -3910,7 +3944,6 @@ do {
             initialStrideSamples: 8_000,
             strideSamples: 8_000,
             maxSegmentSamples: 16_000,
-            maxFinalReDecodeSamples: 48_000,
             expectLanguageHeader: false,
             hotwordTerms: ["IM.codes"],
             decodeFn: { samples, _, _ in
@@ -3936,6 +3969,9 @@ do {
             check(varEngine.enqueue([Float](repeating: 0.15, count: trailLen)), "case 6g \\(label) seg2")
             check(tailSem.wait(timeout: .now() + 5) == .success, "case 6g \\(label) tailSem")
         }
+        if extraTail > 0 {
+            check(varEngine.enqueue([Float](repeating: 0.15, count: extraTail)), "case 6g \\(label) extra")
+        }
         varEngine.requestStop(abort: false, producerAlsoFinished: true)
         check(doneVar.wait(timeout: .now() + 5) == .success, "case 6g \\(label) done")
         let finals = varEmitted.filter { ($0["isFinal"] as? Bool) == true }
@@ -3943,7 +3979,7 @@ do {
     }
 }
 
-// 7. Abort rejects new samples and never emits isFinal=true (both before loop start AND during blocked final re-decode).
+// 7. Abort rejects new samples and never emits isFinal=true (both before loop start AND during blocked final decode).
 do {
     var emitted: [[String: Any]] = []
     let engine = QwenSegmentedDecodeEngine(
@@ -3970,7 +4006,6 @@ do {
         initialStrideSamples: 8,
         strideSamples: 8,
         maxSegmentSamples: 100,
-        maxFinalReDecodeSamples: 100,
         expectLanguageHeader: false,
         decodeFn: { samples, _, _ in
             enteredFinalDecode.signal()
@@ -4022,7 +4057,7 @@ do {
 }
 
 // 9. QwenSegmentedDecodeEngine trims silence edges while keeping fixed left start during active confirmedTokens,
-//    re-trims cleanly on whole-utterance final, and strips leading/trailing repeated hotword hallucinations.
+//    emits finalized text with zero extra decode on newCount == 0, and preserves prefix on newCount > 0.
 do {
     var decodeCalls: [(count: Int, prefix: [Int32])] = []
     var emitted: [[String: Any]] = []
@@ -4037,7 +4072,6 @@ do {
         initialStrideSamples: 16_000,
         strideSamples: 16_000,
         maxSegmentSamples: 216_000,
-        maxFinalReDecodeSamples: 480_000,
         rollbackTokenCount: 0,
         expectLanguageHeader: false,
         hotwordTerms: ["IM.codes", "Claude", "Codex"],
@@ -4054,10 +4088,7 @@ do {
             if p == 2 {
                 return QwenSegmentedDecodeResult(text: "你答的对，就这么", tokens: [101, 102, 103])
             }
-            if p == 3 {
-                return QwenSegmentedDecodeResult(text: "你答的对，就这么来", tokens: [101, 102, 103, 104])
-            }
-            return QwenSegmentedDecodeResult(text: "IM.codes，IM.codes。你答的对，就这么来。", tokens: [101, 102, 103, 104])
+            return QwenSegmentedDecodeResult(text: "你答的对，就这么来。", tokens: [101, 102, 103, 104])
         },
         rollbackPrefixFn: { tokens, _, _ in tokens },
         emitJsonFn: { payload in
@@ -4066,7 +4097,7 @@ do {
             let txt = payload["text"] as? String
             if !isF && txt == "你答的对" { sem1.signal() }
             if !isF && txt == "你答的对，就这么" { sem2.signal() }
-            if !isF && txt == "你答的对，就这么来" { sem3.signal() }
+            if !isF && txt == "你答的对，就这么来。" { sem3.signal() }
         },
         onLoopFinishedFn: { done.signal() }
     )
@@ -4092,13 +4123,12 @@ do {
 
     // Pass 1: trimmed 24k lead to 4k -> 20k (edge hallucination cleared confirmedTokens)
     // Pass 2: re-trimmed to 4k lead + 24k speech + 4k trail = 32k, confirmedTokens = [101,102,103] anchored at 20k
-    // Pass 3: anchored left at 20k while trimming trailing silence to 4k -> 4k+16k+8k+8k+4k+4k = 44k with prefix=[101,102,103]!
-    // Pass 4: final pass re-decodes whole utterance with prefix=[] and 44k trimmed!
-    check(decodeCalls.count == 4, "case 9 decodeCalls count: \\(decodeCalls)")
+    // Pass 3: anchored left at 20k while trimming trailing silence to 4k -> 44k with prefix=[101,102,103]!
+    // On stop with newCount == 0: zero extra decode calls; emits finalized text cleanly.
+    check(decodeCalls.count == 3, "case 9 decodeCalls count: \\(decodeCalls)")
     check(decodeCalls[0].count == 20_000 && decodeCalls[0].prefix.isEmpty, "case 9 pass 1: \\(decodeCalls[0])")
     check(decodeCalls[1].count == 32_000 && decodeCalls[1].prefix.isEmpty, "case 9 pass 2: \\(decodeCalls[1])")
     check(decodeCalls[2].count == 44_000 && decodeCalls[2].prefix == [101, 102, 103], "case 9 pass 3: \\(decodeCalls[2])")
-    check(decodeCalls[3].count == 44_000 && decodeCalls[3].prefix.isEmpty, "case 9 pass 4: \\(decodeCalls[3])")
     let finals = emitted.filter { ($0["isFinal"] as? Bool) == true }
     check(finals.count == 1 && (finals[0]["text"] as? String) == "你答的对，就这么来。", "case 9 final: \\(finals)")
 }
@@ -4144,7 +4174,7 @@ do {
     check(stripVoiceHotwordHallucination("〇。IM.codes，IM.codes。", hotwordTerms: matrixTerms) == "〇。", "case 10 trailing stripped after 〇")
 }
 
-// 11. Swift QwenSegmentedDecodeEngine >cap cross-segment pure hotword repeats must strip to "" instead of emitting "IM.codes IM.codes"
+// 11. Swift QwenSegmentedDecodeEngine cross-segment pure hotword repeats must strip to "" instead of emitting "IM.codes IM.codes"
 do {
     var emitted: [[String: Any]] = []
     let done = DispatchSemaphore(value: 0)
@@ -4152,7 +4182,6 @@ do {
         initialStrideSamples: 8_000,
         strideSamples: 8_000,
         maxSegmentSamples: 16_000,
-        maxFinalReDecodeSamples: 20_000,
         rollbackTokenCount: 0,
         expectLanguageHeader: false,
         hotwordTerms: ["IM.codes"],
@@ -4171,7 +4200,7 @@ do {
     let finals = emitted.filter { ($0["isFinal"] as? Bool) == true }
     check(finals.count == 1 && (finals[0]["text"] as? String) == "", "case 11 final must be empty: \\(finals)")
 
-    // 11b: Round 3 counterexample — >cap real prior sentence ending with single hotword + trailing single hotword
+    // 11b: Round 3 counterexample — real prior sentence ending with single hotword + trailing single hotword
     //      must NOT re-run edge slicing across committed body segments ("我常用 IM.codes。IM.codes").
     var emittedKeep: [[String: Any]] = []
     let doneKeep = DispatchSemaphore(value: 0)
@@ -4181,7 +4210,6 @@ do {
         initialStrideSamples: 8_000,
         strideSamples: 8_000,
         maxSegmentSamples: 16_000,
-        maxFinalReDecodeSamples: 20_000,
         rollbackTokenCount: 0,
         expectLanguageHeader: false,
         hotwordTerms: ["IM.codes"],
@@ -4215,7 +4243,8 @@ print("MAC_SEGMENTED_DECODE:PASS")
   const commonIncDir = fileURLToPath(new URL('../../apps/pc-app/native/common', import.meta.url));
   const pipelineHpp = await readFile(join(onnxCoreDir, 'streaming_pipeline.hpp'), 'utf8');
   const winTestPath = fileURLToPath(new URL('../../apps/pc-app/native/win/segmented-pipeline.test.cpp', import.meta.url));
-  expect(pipelineHpp).toContain('max_final_redecode_samples{480000}');
+  expect(pipelineHpp).not.toContain('max_final_redecode_samples');
+  expect(pipelineHpp).not.toContain('full_utterance_samples_');
   expect(pipelineHpp).toContain('final_max_new_tokens{384}');
   const clangPp = process.env.CXX || (existsSync('/usr/bin/clang++') ? '/usr/bin/clang++' : undefined);
   if (clangPp) {

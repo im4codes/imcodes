@@ -420,7 +420,7 @@ export const NATIVE_PERMISSION_TIMEOUT_MS = 15_000;
 export const NATIVE_START_TIMEOUT_MS = 15_000;
 /** Upper bound for normal native `stop()` drain (>15s so legitimate slow drains pass without timing out). */
 export const NATIVE_STOP_DRAIN_MS = 20_000;
-/** Bounded drain timeout for PC App local Qwen3-ASR 30s full-utterance final re-decode (matches PC IPC 45s budget). */
+/** Bounded drain timeout for PC App local Qwen3-ASR segmented finalize drain (matches PC IPC 45s budget). */
 export const PC_APP_FINALIZE_DRAIN_MS = 46_000;
 /** Short cleanup bound when stopping an unsettled native `start()` that never began capture (`!captureStarted`). */
 export const NATIVE_UNSTARTED_STOP_DRAIN_MS = 2_000;

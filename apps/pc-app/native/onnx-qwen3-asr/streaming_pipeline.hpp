@@ -18,8 +18,7 @@ struct StreamingPipelineConfig {
   size_t initial_stride_samples{12800};        // 0.8s @ 16kHz
   size_t step_stride_samples{12800};           // 0.8s stride @ 16kHz
   size_t max_segment_samples{216000};          // 13.5s active segment cap
-  size_t max_final_redecode_samples{480000};   // 30.0s full-utterance unprefixed redecode cap
-  size_t min_final_samples{1600};              // 100ms minimum audio for unvoiced tail redecode
+  size_t min_final_samples{1600};              // 100ms minimum audio for trailing segment finalization
   int rollback_token_count{5};
   int streaming_max_new_tokens{192};
   int final_max_new_tokens{384};
@@ -36,9 +35,9 @@ struct TranscriptUpdate {
 };
 
 /**
- * Thread-safe streaming + 30s unprefixed full-utterance final redecode pipeline.
- * Matches macOS MLX `QwenSegmentedDecodeEngine` hotword hallucination debounce/retraction
- * and Windows/Linux 30s full-redecode policy.
+ * Thread-safe segmented streaming pipeline.
+ * Matches macOS MLX `QwenSegmentedDecodeEngine` segmented streaming, pause-split/segment
+ * rollover, silence-edge trimming, and hotword hallucination debounce/retraction.
  */
 class Qwen3StreamingPipeline {
  public:
@@ -66,17 +65,7 @@ class Qwen3StreamingPipeline {
   /** Blocking worker loop; returns once final result (or abort) finishes and emits end. */
   void run_loop();
 
-  bool exceeded_final_redecode_cap() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    return exceeded_final_cap_;
-  }
-  size_t full_utterance_buffer_size() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    return full_utterance_samples_.size();
-  }
-
  private:
-  void append_utterance_samples_locked(const float* data, size_t count);
   bool is_aborted() const;
 
   StreamingPipelineConfig config_;
@@ -90,8 +79,6 @@ class Qwen3StreamingPipeline {
   std::vector<float> pending_samples_;
   size_t pending_head_{0};
   std::vector<float> active_segment_;
-  std::vector<float> full_utterance_samples_;
-  bool exceeded_final_cap_{false};
   bool producer_finished_{false};
   bool stop_requested_{false};
   bool aborted_{false};

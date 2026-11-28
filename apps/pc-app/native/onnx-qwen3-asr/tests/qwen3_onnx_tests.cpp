@@ -315,13 +315,12 @@ void test_streaming_pipeline_30s_and_guards() {
   };
   EXPECT_TRUE(tok.load_from_memory(vocab, {}, added));
 
-  // 1. Streaming prefix_tokens + <=30s forced unprefixed full redecode (even across pause split!)
+  // 1. Segmented streaming prefix_tokens + stop decodes ONLY active tail (no full-utterance redecode)
   {
     StreamingPipelineConfig cfg;
     cfg.initial_stride_samples = 1600;
     cfg.step_stride_samples = 1600;
     cfg.max_segment_samples = 4000;
-    cfg.max_final_redecode_samples = 10000;
     cfg.min_final_samples = 100;
     cfg.rollback_token_count = 2;
     cfg.expect_language_header = true;
@@ -342,8 +341,8 @@ void test_streaming_pipeline_30s_and_guards() {
           calls.push_back({audio.size(), opts.prefix_tokens, opts.max_new_tokens});
           DecodeResult res;
           if (opts.max_new_tokens == cfg.final_max_new_tokens) {
-            res.text = "language Chinese<asr_text>full_accurate_final";
-            res.raw_tokens = {23, 24, 151704, 100, 101, 102, 103};
+            res.text = "language Chinese<asr_text>tail_seg";
+            res.raw_tokens = {23, 24, 151704, 104, 105};
           } else {
             // Simulate Qwen3OnnxEngine::decode having already extracted clean text after <asr_text>
             res.text = "partial_seg";
@@ -357,71 +356,56 @@ void test_streaming_pipeline_30s_and_guards() {
     std::vector<float> voiced(2000, 0.05f);
     pipe.push_samples(voiced);
     pipe.push_samples(voiced);
-    pipe.push_samples(voiced);  // total 6000 <= 10000 cap, crosses max_segment_samples=4000
+    pipe.push_samples(voiced);  // total 6000 crosses max_segment_samples=4000 -> 4000 committed + 2000 active tail
     pipe.request_stop(false, true);
     pipe.run_loop();
 
     EXPECT_TRUE(ended);
-    EXPECT_TRUE(!pipe.exceeded_final_redecode_cap());
-    EXPECT_TRUE(calls.size() >= 2);
-    // Final pass MUST be full 6000 samples, unprefixed, max_new_tokens=384!
-    EXPECT_EQ(calls.back().samples, size_t{6000});
-    EXPECT_TRUE(calls.back().prefix.empty());
+    EXPECT_EQ(calls.size(), size_t{2});
+    EXPECT_EQ(calls[0].samples, size_t{4000});
+    // Final pass MUST decode ONLY trailing active_segment_ (2000 samples), NOT full 6000!
+    EXPECT_EQ(calls.back().samples, size_t{2000});
+    EXPECT_TRUE(calls.back().prefix.empty());  // fresh post-rollover segment starts with empty prefix
     EXPECT_EQ(calls.back().max_new_tokens, 384);
     EXPECT_TRUE(!updates.empty() && updates.back().is_final);
-    EXPECT_EQ(updates.back().text, "full_accurate_final");
+    EXPECT_EQ(updates.back().text, "partial_seg tail_seg");
   }
 
-  // 2. > 30s overflow immediately frees full buffer and falls back to committed + unprefixed active tail
+  // 2. Stop with new_count == 0 emits finalized text with ZERO extra decode calls (even with confirmed prefix tokens)
   {
     StreamingPipelineConfig cfg;
-    cfg.initial_stride_samples = 1000;
-    cfg.step_stride_samples = 1000;
-    cfg.max_segment_samples = 3000;
-    cfg.max_final_redecode_samples = 5000;
+    cfg.initial_stride_samples = 1600;
+    cfg.step_stride_samples = 1600;
+    cfg.max_segment_samples = 10000;
     cfg.min_final_samples = 100;
     cfg.rollback_token_count = 2;
     cfg.expect_language_header = true;
 
-    std::vector<size_t> decode_sizes;
-    std::vector<std::vector<int64_t>> decode_prefixes;
+    std::atomic<int> call_count{0};
     std::vector<TranscriptUpdate> updates;
-
     Qwen3StreamingPipeline pipe(
         cfg,
         tok,
-        [&](const std::vector<float>& audio, const DecodeOptions& opts) -> DecodeResult {
-          decode_sizes.push_back(audio.size());
-          decode_prefixes.push_back(opts.prefix_tokens);
+        [&](const std::vector<float>&, const DecodeOptions&) -> DecodeResult {
+          ++call_count;
           DecodeResult res;
-          if (opts.max_new_tokens == cfg.final_max_new_tokens) {
-            res.text = "language Chinese<asr_text>tail_part";
-            res.raw_tokens = {23, 24, 151704, 104, 105};
-          } else {
-            res.text = "language Chinese<asr_text>seg_one";
-            res.raw_tokens = {23, 24, 151704, 100, 101, 102, 103};
-          }
+          res.text = "streamed_exact";
+          res.raw_tokens = {23, 24, 151704, 100, 101, 102, 103};
           return res;
         },
         [&](const TranscriptUpdate& u) { updates.push_back(u); });
 
-    std::vector<float> chunk(3000, 0.05f);
-    pipe.push_samples(chunk);
-    EXPECT_TRUE(!pipe.exceeded_final_redecode_cap());
-    EXPECT_EQ(pipe.full_utterance_buffer_size(), size_t{3000});
+    std::thread worker([&]() { pipe.run_loop(); });
+    pipe.push_samples(std::vector<float>(1600, 0.05f));
+    while (call_count.load() < 1) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    pipe.request_stop(false, true);  // new_count == 0 -> no extra decode pass!
+    worker.join();
 
-    pipe.push_samples(chunk);  // 6000 > 5000 cap -> immediately clears full buffer!
-    EXPECT_TRUE(pipe.exceeded_final_redecode_cap());
-    EXPECT_EQ(pipe.full_utterance_buffer_size(), size_t{0});
-
-    pipe.request_stop(false, true);
-    pipe.run_loop();
-
-    EXPECT_TRUE(!decode_sizes.empty());
-    EXPECT_EQ(decode_sizes.back(), size_t{3000});  // tail segment only, NOT 6000!
-    EXPECT_TRUE(decode_prefixes.back().empty());   // final tail decode is unprefixed
+    EXPECT_EQ(call_count.load(), 1);
     EXPECT_TRUE(!updates.empty() && updates.back().is_final);
-    EXPECT_EQ(updates.back().text, "seg_one tail_part");
+    EXPECT_EQ(updates.back().text, "streamed_exact");
   }
 
   // 3. Hotword hallucination silence & single-hotword retraction
@@ -430,7 +414,6 @@ void test_streaming_pipeline_30s_and_guards() {
     cfg.initial_stride_samples = 1600;
     cfg.step_stride_samples = 1600;
     cfg.max_segment_samples = 10000;
-    cfg.max_final_redecode_samples = 20000;
     cfg.hotword_terms = {"IM.codes", "Claude"};
     cfg.expect_language_header = false;
 
@@ -485,13 +468,12 @@ void test_streaming_pipeline_30s_and_guards() {
     EXPECT_EQ(updates.back().text, "");
   }
 
-  // 4. Real streaming rollback=5 prefix delivery + error preservation + non-spinning wait predicate
+  // 4. Real streaming rollback=5 prefix delivery (preserved on stop with new_count > 0) + error preservation
   {
     StreamingPipelineConfig cfg;
     cfg.initial_stride_samples = 1000;
     cfg.step_stride_samples = 1000;
     cfg.max_segment_samples = 10000;
-    cfg.max_final_redecode_samples = 20000;
     cfg.min_final_samples = 100;
     cfg.rollback_token_count = 5;
     cfg.expect_language_header = true;
@@ -516,7 +498,7 @@ void test_streaming_pipeline_30s_and_guards() {
             // Transient streaming error must NOT overwrite preview or clear prefix
             res.error = "transient_stream_err";
           } else {
-            // Final <=30s error must retain valid_preview and propagate error
+            // Final tail error must retain valid_preview and propagate error
             res.error = "final_decode_failed";
           }
           return res;
@@ -528,25 +510,25 @@ void test_streaming_pipeline_30s_and_guards() {
     while (call_num.load() < 1) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     pipe.push_samples(voiced);
     while (call_num.load() < 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    pipe.push_samples(std::vector<float>(300, 0.05f));  // new_count > 0 (< step_stride) triggers final tail decode
     pipe.request_stop(false, true);
     th.join();
 
     EXPECT_TRUE(seen_prefixes.size() >= 3);
     EXPECT_TRUE(seen_prefixes[0].empty());
     EXPECT_EQ(seen_prefixes[1], (std::vector<int64_t>{23, 24, 151704, 100, 101, 102}));
-    EXPECT_TRUE(seen_prefixes[2].empty());
+    EXPECT_EQ(seen_prefixes[2], (std::vector<int64_t>{23, 24, 151704, 100, 101, 102}));
     EXPECT_TRUE(!updates.empty() && updates.back().is_final);
     EXPECT_EQ(updates.back().text, "valid_preview");
     EXPECT_EQ(updates.back().error, "final_decode_failed");
   }
 
-  // 5. >30s final tail error preserves committed + active preview and wait predicate does not spin
+  // 5. Segmented final tail error preserves committed + active preview and wait predicate does not spin
   {
     StreamingPipelineConfig cfg;
     cfg.initial_stride_samples = 1000;
     cfg.step_stride_samples = 1000;
     cfg.max_segment_samples = 2000;
-    cfg.max_final_redecode_samples = 3000;
     cfg.min_final_samples = 100;
     cfg.rollback_token_count = 2;
     cfg.expect_language_header = true;
@@ -569,12 +551,13 @@ void test_streaming_pipeline_30s_and_guards() {
         },
         [&](const TranscriptUpdate& u) { updates.push_back(u); });
 
-    std::vector<float> big(3500, 0.05f);  // > 3000 cap, > 2000 segment cap
+    std::vector<float> big(3500, 0.05f);  // > 2000 segment cap
     pipe.push_samples(big);
     std::thread th([&]() { pipe.run_loop(); });
     while (decode_cnt.load() < 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-    // Call request_stop(false, false) BEFORE mark_producer_finished(): must sleep cleanly, not spin!
+    // Trailing samples + request_stop(false, false) BEFORE mark_producer_finished(): must sleep cleanly, not spin!
+    pipe.push_samples(std::vector<float>(200, 0.05f));
     pipe.request_stop(false, false);
     const double cpu_before = process_cpu_ms();
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -611,6 +594,70 @@ void test_streaming_pipeline_30s_and_guards() {
     th.join();
     EXPECT_TRUE(!updates.empty() && updates.back().is_final);
     EXPECT_EQ(updates.back().text, "done");
+  }
+
+  // 7. Short utterance (< initial_stride_samples, >= min_final_samples) decodes active_segment_ once cleanly on stop
+  {
+    StreamingPipelineConfig cfg;
+    cfg.initial_stride_samples = 12800;
+    cfg.min_final_samples = 1600;
+    cfg.expect_language_header = false;
+    std::vector<size_t> sizes;
+    std::vector<std::vector<int64_t>> prefixes;
+    std::vector<TranscriptUpdate> updates;
+    Qwen3StreamingPipeline pipe(
+        cfg,
+        tok,
+        [&](const std::vector<float>& audio, const DecodeOptions& opts) -> DecodeResult {
+          sizes.push_back(audio.size());
+          prefixes.push_back(opts.prefix_tokens);
+          DecodeResult r;
+          r.text = "short-ok";
+          return r;
+        },
+        [&](const TranscriptUpdate& u) { updates.push_back(u); });
+    pipe.push_samples(std::vector<float>(4000, 0.05f));
+    pipe.request_stop(false, true);
+    pipe.run_loop();
+    EXPECT_EQ(sizes.size(), size_t{1});
+    EXPECT_EQ(sizes[0], size_t{4000});
+    EXPECT_TRUE(prefixes[0].empty());
+    EXPECT_TRUE(!updates.empty() && updates.back().is_final);
+    EXPECT_EQ(updates.back().text, "short-ok");
+  }
+
+  // 8. Pause-split rollover before stop leaves active_segment_ empty (new_count == 0): zero extra decode on stop
+  {
+    StreamingPipelineConfig cfg;
+    cfg.initial_stride_samples = 1600;
+    cfg.step_stride_samples = 1600;
+    cfg.max_segment_samples = 4000;
+    cfg.min_final_samples = 100;
+    cfg.expect_language_header = false;
+    std::atomic<int> decode_calls{0};
+    std::vector<TranscriptUpdate> updates;
+    Qwen3StreamingPipeline pipe(
+        cfg,
+        tok,
+        [&](const std::vector<float>&, const DecodeOptions&) -> DecodeResult {
+          ++decode_calls;
+          DecodeResult r;
+          r.text = "first-clause";
+          return r;
+        },
+        [&](const TranscriptUpdate& u) { updates.push_back(u); });
+
+    // Speech >= 0.8s (3200 samples >= 1600) followed by >1.0s pause (16000 zero samples) triggers pause-split rollover
+    // when active_text is non-empty!
+    std::thread th([&]() { pipe.run_loop(); });
+    pipe.push_samples(std::vector<float>(3200, 0.1f));
+    while (decode_calls.load() < 1) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    pipe.push_samples(std::vector<float>(20000, 0.0f));
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    pipe.request_stop(false, true);
+    th.join();
+    EXPECT_TRUE(!updates.empty() && updates.back().is_final);
+    EXPECT_EQ(updates.back().text, "first-clause");
   }
 }
 

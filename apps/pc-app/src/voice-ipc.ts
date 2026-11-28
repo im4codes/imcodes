@@ -447,7 +447,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   }
 
   const SYSTEM_SPEECH_STOP_TIMEOUT_MS = 2_200;
-  // Local Qwen3-ASR full-utterance final re-decode runs up to 30s of audio (and CPU ONNX can exceed real-time).
+  // Local Qwen3-ASR trailing segment drain / CPU ONNX finalize safety timeout.
   const QWEN_LOCAL_FINALIZE_TIMEOUT_MS = 45_000;
   // Bounded wait for an aborted resident worker to emit its terminating `end` before isolating it cleanly.
   const ABORT_END_DRAIN_TIMEOUT_MS = 250;

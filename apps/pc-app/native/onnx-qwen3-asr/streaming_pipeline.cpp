@@ -37,24 +37,12 @@ Qwen3StreamingPipeline::Qwen3StreamingPipeline(
       emit_result_fn_(std::move(emit_result_fn)),
       emit_end_fn_(std::move(emit_end_fn)) {}
 
-void Qwen3StreamingPipeline::append_utterance_samples_locked(const float* data, size_t count) {
-  if (count == 0 || exceeded_final_cap_) return;
-  if (config_.max_final_redecode_samples == 0 ||
-      full_utterance_samples_.size() + count > config_.max_final_redecode_samples) {
-    exceeded_final_cap_ = true;
-    std::vector<float>().swap(full_utterance_samples_);
-    return;
-  }
-  full_utterance_samples_.insert(full_utterance_samples_.end(), data, data + count);
-}
-
 void Qwen3StreamingPipeline::preload(const std::vector<float>& initial_samples) {
   if (initial_samples.empty()) return;
   {
     std::lock_guard<std::mutex> lock(mu_);
     if (producer_finished_ || aborted_) return;
     pending_samples_.insert(pending_samples_.end(), initial_samples.begin(), initial_samples.end());
-    append_utterance_samples_locked(initial_samples.data(), initial_samples.size());
   }
   cv_.notify_one();
 }
@@ -67,7 +55,6 @@ bool Qwen3StreamingPipeline::push_samples(const float* data, size_t count) {
     active = !producer_finished_ && !aborted_;
     if (active) {
       pending_samples_.insert(pending_samples_.end(), data, data + count);
-      append_utterance_samples_locked(data, count);
     }
   }
   if (active) cv_.notify_one();
@@ -192,7 +179,6 @@ void Qwen3StreamingPipeline::run_loop() {
     bool is_stop = false;
     bool is_producer_finished = false;
     bool has_remaining_pending = false;
-    bool exceeded_cap = false;
     size_t current_len = 0;
 
     {
@@ -230,7 +216,6 @@ void Qwen3StreamingPipeline::run_loop() {
         has_remaining_pending = (pending_head_ < pending_samples_.size());
         is_stop = stop_requested_;
         is_producer_finished = producer_finished_;
-        exceeded_cap = exceeded_final_cap_;
         current_len = active_segment_.size();
       }
     }
@@ -239,25 +224,45 @@ void Qwen3StreamingPipeline::run_loop() {
       break;
     }
 
+    const size_t new_count = current_len - last_decoded_count;
     const bool is_final_pass = is_stop && is_producer_finished && !has_remaining_pending;
 
     if (is_final_pass) {
-      if (!exceeded_cap) {
-        std::vector<float> full_copy;
+      // Segmented finalization: if no new undecoded samples arrived since the last pass
+      // (new_count == 0), emit finalized text with zero extra decode calls; otherwise decode
+      // only active_segment_ while preserving confirmed_prefix_tokens and committed_text.
+      std::string final_seg = active_text;
+      if (new_count > 0) {
+        std::vector<float> seg_copy;
         {
           std::lock_guard<std::mutex> lock(mu_);
-          full_copy = full_utterance_samples_;
+          seg_copy = active_segment_;
+          last_decoded_count = current_len;
         }
-        if (full_copy.size() >= config_.min_final_samples) {
-          const std::vector<float> trimmed_utterance = trim_silence_edges(full_copy);
-          if (!trimmed_utterance.empty()) {
+        if (seg_copy.size() >= config_.min_final_samples) {
+          size_t trim_start = 0;
+          const std::vector<float> trimmed_tail =
+              trim_silence_edges(seg_copy, 16000, 250, &trim_start);
+          if (trimmed_tail.empty()) {
+            confirmed_prefix_tokens.clear();
+            last_prefix_trim_start = std::numeric_limits<size_t>::max();
+            if (has_hotwords) {
+              final_seg = active_trusted_real_text;
+            }
+          } else {
+            if (last_prefix_trim_start != std::numeric_limits<size_t>::max() &&
+                trim_start != last_prefix_trim_start) {
+              confirmed_prefix_tokens.clear();
+            }
+            last_prefix_trim_start = trim_start;
+
             DecodeOptions opts;
             opts.hotwords_context = config_.hotwords_context;
             opts.language = config_.language;
-            opts.prefix_tokens.clear();  // Always unprefixed full-utterance redecode <= 30s
+            opts.prefix_tokens = confirmed_prefix_tokens;
             opts.max_new_tokens = config_.final_max_new_tokens;
             opts.should_cancel = [this]() { return is_aborted(); };
-            const DecodeResult final_res = decode_fn_(trimmed_utterance, opts);
+            const DecodeResult final_res = decode_fn_(trimmed_tail, opts);
             if (is_aborted()) break;
             if (!final_res.error.empty()) {
               emit_result_fn_({best_retained_text(), true, final_res.error});
@@ -265,84 +270,29 @@ void Qwen3StreamingPipeline::run_loop() {
             }
             if (!final_res.cancelled) {
               const auto san = sanitize_decoded(final_res);
-              std::string final_text = san.text;
               if (has_hotwords) {
-                const bool blocked_single_only =
-                    !final_text.empty() && !san.has_real_non_hotword &&
-                    (retracted_segment_single_hotword || pending_retraction_final ||
-                     committed_has_trusted_real_text || !active_trusted_real_text.empty());
-                if (san.hit_hallucination || blocked_single_only || final_text.empty()) {
-                  if (committed_has_trusted_real_text) {
-                    final_text = committed_text;
-                  } else if (!active_trusted_real_text.empty()) {
-                    final_text = active_trusted_real_text;
-                  } else {
-                    final_text.clear();
-                  }
+                if (san.has_real_non_hotword && !committed_text.empty()) {
+                  committed_has_trusted_real_text = true;
+                  committed_pending_single_hotword = false;
                 }
-              } else if (final_text.empty()) {
-                final_text = best_retained_text();
+                const bool blocked_single_only = !san.text.empty() && !san.has_real_non_hotword &&
+                    (retracted_segment_single_hotword || pending_retraction_final || !active_trusted_real_text.empty());
+                if (san.hit_hallucination || blocked_single_only || san.text.empty()) {
+                  if (active_pending_single_hotword && san.hit_hallucination) {
+                    retracted_segment_single_hotword = true;
+                  }
+                  final_seg = active_trusted_real_text;
+                } else {
+                  final_seg = san.text;
+                }
+              } else if (!san.text.empty()) {
+                final_seg = san.text;
               }
-              emit_result_fn_({final_text, true, {}});
-              break;
             }
-          } else if (has_hotwords) {
-            std::string final_text;
-            if (committed_has_trusted_real_text) {
-              final_text = committed_text;
-            } else if (!active_trusted_real_text.empty()) {
-              final_text = active_trusted_real_text;
-            }
-            emit_result_fn_({final_text, true, {}});
-            break;
           }
+        } else if (has_hotwords) {
+          final_seg = active_trusted_real_text;
         }
-        emit_result_fn_({best_retained_text(), true, {}});
-        break;
-      }
-
-      // > 30s: preserve committed segments (applying Rule A/B + single-hotword protections)
-      // and run one unprefixed final decode on trimmed active tail segment.
-      std::vector<float> seg_copy;
-      {
-        std::lock_guard<std::mutex> lock(mu_);
-        seg_copy = active_segment_;
-      }
-      std::string final_seg = active_text;
-      const std::vector<float> trimmed_tail = trim_silence_edges(seg_copy);
-      if (seg_copy.size() >= config_.min_final_samples && !trimmed_tail.empty()) {
-        DecodeOptions opts;
-        opts.hotwords_context = config_.hotwords_context;
-        opts.language = config_.language;
-        opts.prefix_tokens.clear();  // Unprefixed tail redecode
-        opts.max_new_tokens = config_.final_max_new_tokens;
-        opts.should_cancel = [this]() { return is_aborted(); };
-        const DecodeResult final_res = decode_fn_(trimmed_tail, opts);
-        if (is_aborted()) break;
-        if (!final_res.error.empty()) {
-          emit_result_fn_({best_retained_text(), true, final_res.error});
-          break;
-        }
-        if (!final_res.cancelled) {
-          const auto san = sanitize_decoded(final_res);
-          if (has_hotwords) {
-            if (san.has_real_non_hotword && !committed_text.empty()) {
-              committed_has_trusted_real_text = true;
-              committed_pending_single_hotword = false;
-            }
-            const bool blocked_single_only = !san.text.empty() && !san.has_real_non_hotword &&
-                (retracted_segment_single_hotword || pending_retraction_final || !active_trusted_real_text.empty());
-            if (san.hit_hallucination || blocked_single_only || san.text.empty()) {
-              final_seg = active_trusted_real_text;
-            } else {
-              final_seg = san.text;
-            }
-          } else if (!san.text.empty()) {
-            final_seg = san.text;
-          }
-        }
-      } else if (has_hotwords) {
-        final_seg = active_trusted_real_text;
       }
 
       const bool drop_retracted_single_committed =
@@ -368,7 +318,6 @@ void Qwen3StreamingPipeline::run_loop() {
       break;
     }
 
-    const size_t new_count = current_len - last_decoded_count;
     const size_t threshold = (last_decoded_count == 0) ? config_.initial_stride_samples : config_.step_stride_samples;
     const bool reached_segment_cap = (current_len >= config_.max_segment_samples);
     const bool reached_pause_split =
