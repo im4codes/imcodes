@@ -2432,4 +2432,125 @@ describe('QuickInputPanel structured layout, manage toggle, and copy actions', (
     expect(document.querySelector('[data-qp-section="phrase"] .qp-builtin-chips')).not.toBeNull();
     expect(localStorage.getItem('imcodes:qp:builtin-phrases-collapsed')).toBe('false');
   });
+
+  it('ignores out-of-order clipboard completions so an older copy cannot overwrite newer card feedback', async () => {
+    let resolveFirst!: () => void;
+    let resolveSecond!: () => void;
+    const writeText = vi.fn()
+      .mockImplementationOnce(() => new Promise<void>((r) => { resolveFirst = r; }))
+      .mockImplementationOnce(() => new Promise<void>((r) => { resolveSecond = r; }));
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+
+    renderPanel({
+      data: { history: [], sessionHistory: {}, commands: [], phrases: ['first phrase', 'second phrase'] },
+    });
+
+    const copyBtns = Array.from(document.querySelectorAll('[data-qp-section="phrase"] .qp-card-copy-btn')) as HTMLButtonElement[];
+    expect(copyBtns).toHaveLength(2);
+
+    // Trigger copy A (remains pending), then immediately copy B -> synchronous writeText calls keep user activation
+    fireEvent.click(copyBtns[0]!);
+    fireEvent.click(copyBtns[1]!);
+    expect(writeText).toHaveBeenCalledTimes(2);
+    expect(writeText).toHaveBeenNthCalledWith(1, 'first phrase');
+    expect(writeText).toHaveBeenNthCalledWith(2, 'second phrase');
+
+    // Second copy finishes first
+    resolveSecond();
+    await act(async () => { await Promise.resolve(); });
+    expect(copyBtns[1]!.classList.contains('is-copied')).toBe(true);
+    expect(copyBtns[0]!.classList.contains('is-copied')).toBe(false);
+
+    // Out-of-order resolution of first copy MUST NOT overwrite second card's feedback
+    resolveFirst();
+    await act(async () => { await Promise.resolve(); });
+    expect(copyBtns[1]!.classList.contains('is-copied')).toBe(true);
+    expect(copyBtns[1]!.textContent).toBe('✓');
+    expect(copyBtns[0]!.classList.contains('is-copied')).toBe(false);
+    expect(copyBtns[0]!.textContent).not.toBe('✓');
+  });
+
+  it('invalidates pending clipboard callbacks on panel close/reopen and unmount without registering new timers', async () => {
+    let resolveAfterClose!: () => void;
+    let resolveAfterUnmount!: () => void;
+    const writeText = vi.fn()
+      .mockImplementationOnce(() => new Promise<void>((r) => { resolveAfterClose = r; }))
+      .mockImplementationOnce(() => new Promise<void>((r) => { resolveAfterUnmount = r; }));
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+
+    const view = renderPanel({
+      data: { history: [], sessionHistory: {}, commands: [], phrases: ['phrase close', 'phrase unmount'] },
+    });
+
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+    // Case 1: Copy, then close & reopen before Promise resolves
+    const copyBtnClose = document.querySelectorAll('[data-qp-section="phrase"] .qp-card-copy-btn')[0] as HTMLButtonElement;
+    fireEvent.click(copyBtnClose);
+    setTimeoutSpy.mockClear();
+
+    view.rerender(
+      <QuickInputPanel
+        open={false}
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: ['phrase close', 'phrase unmount'] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+    view.rerender(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: ['phrase close', 'phrase unmount'] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    resolveAfterClose();
+    await act(async () => { await Promise.resolve(); });
+    expect(setTimeoutSpy).not.toHaveBeenCalled();
+    expect(document.querySelector('.qp-card-copy-btn.is-copied')).toBeNull();
+
+    // Case 2: Copy, then unmount before Promise resolves
+    const copyBtnUnmount = document.querySelectorAll('[data-qp-section="phrase"] .qp-card-copy-btn')[1] as HTMLButtonElement;
+    fireEvent.click(copyBtnUnmount);
+    setTimeoutSpy.mockClear();
+
+    view.unmount();
+    resolveAfterUnmount();
+    await act(async () => { await Promise.resolve(); });
+    expect(setTimeoutSpy).not.toHaveBeenCalled();
+
+    setTimeoutSpy.mockRestore();
+  });
 });

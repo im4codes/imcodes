@@ -1614,6 +1614,7 @@ export function QuickInputPanel({
   const [builtinPhrasesCollapsed, setBuiltinPhrasesCollapsed] = useState(() => readStoredBoolean(BUILTIN_PHRASES_COLLAPSED_KEY, false));
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyRequestSeqRef = useRef(0);
   const [historyPage, setHistoryPage] = useState(0);
   const [historyScope, setHistoryScope] = useState<HistoryScope>('session');
   const [historySearch, setHistorySearch] = useState('');
@@ -1794,6 +1795,7 @@ export function QuickInputPanel({
   }, [data.phrases.length, managePhrases]);
   useEffect(() => {
     if (!open) {
+      copyRequestSeqRef.current += 1;
       setManageCommands(false);
       setManagePhrases(false);
       setEditingItem(null);
@@ -1806,6 +1808,7 @@ export function QuickInputPanel({
     }
   }, [open]);
   useEffect(() => () => {
+    copyRequestSeqRef.current += 1;
     if (copiedTimerRef.current) {
       clearTimeout(copiedTimerRef.current);
       copiedTimerRef.current = null;
@@ -1930,12 +1933,15 @@ export function QuickInputPanel({
   const handleCopyItem = (kind: 'command' | 'phrase', value: string, e: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();
     const itemKey = `${kind}:${value}`;
+    const requestSeq = ++copyRequestSeqRef.current;
     copyToClipboard(
       value,
       () => {
+        if (copyRequestSeqRef.current !== requestSeq) return;
         if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
         setCopiedKey(itemKey);
         copiedTimerRef.current = setTimeout(() => {
+          if (copyRequestSeqRef.current !== requestSeq) return;
           copiedTimerRef.current = null;
           setCopiedKey((prev) => (prev === itemKey ? null : prev));
         }, 1500);

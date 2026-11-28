@@ -2337,10 +2337,14 @@ describe('styles.css regression contracts', () => {
     expect(css).toMatch(/\.btn-primary\.incognito-launch-btn\s*\{/);
   });
 
-  it('uses structured 2-col/1-col grid cards for Quick Input custom phrases/commands with opaque blurred surface and compact built-in micro-chips', () => {
+  it('uses structured 2-col/1-col grid cards for Quick Input custom phrases/commands with opaque blurred backdrop pseudo-element and compact built-in micro-chips', () => {
     const qpRule = cssWithoutComments.match(/\.qp\s*\{[^}]*\}/)?.[0] ?? '';
-    expect(qpRule).toMatch(/backdrop-filter:\s*blur\(12px\)/);
+    expect(qpRule).not.toMatch(/backdrop-filter|transform|filter|contain:/);
     expect(qpRule).toMatch(/border:\s*1px solid rgba\(56,\s*189,\s*248,\s*0\.24\)/);
+
+    const qpBeforeRule = cssWithoutComments.match(/\.qp::before\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(qpBeforeRule).toMatch(/backdrop-filter:\s*blur\(12px\)/);
+    expect(qpBeforeRule).toMatch(/rgba\(8,\s*13,\s*22,\s*0\.97\)/);
 
     const gridRule = cssWithoutComments.match(/\.qp-custom-grid\s*\{[^}]*\}/)?.[0] ?? '';
     expect(gridRule).toMatch(/display:\s*grid/);
