@@ -371,7 +371,7 @@ function readProxyConfig(env: NodeJS.ProcessEnv): ProxyConfig | null {
   const httpProxy = readEnvCaseInsensitive(env, 'HTTP_PROXY')?.trim();
   const allProxy = readEnvCaseInsensitive(env, 'ALL_PROXY')?.trim();
   const noProxy = readEnvCaseInsensitive(env, 'NO_PROXY')?.trim();
-  const resolvedHttps = httpsProxy || allProxy;
+  const resolvedHttps = httpsProxy || httpProxy || allProxy;
   const resolvedHttp = httpProxy || allProxy;
   if (!resolvedHttps && !resolvedHttp) return null;
   return {
@@ -457,6 +457,127 @@ function incomingMessageToWebResponse(res: http.IncomingMessage): Response {
   });
 }
 
+async function sendManagedNodeRequest(
+  issueRequest: (
+    onResponse: (res: http.IncomingMessage) => void,
+    onError: (err: unknown) => void,
+    registerDestroy: (fn: () => void) => void,
+  ) => void,
+  signal: AbortSignal | undefined,
+  wrapErr: (err: unknown) => Error,
+): Promise<Response> {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : new Error('aborted');
+  }
+
+  return await new Promise<Response>((resolve, reject) => {
+    let settled = false;
+    let activeRes: http.IncomingMessage | null = null;
+    const destroyHooks: Array<() => void> = [];
+
+    const destroyAll = () => {
+      for (let i = destroyHooks.length - 1; i >= 0; i -= 1) {
+        try { destroyHooks[i]!(); } catch { /* ignore */ }
+      }
+    };
+
+    const detachAbort = () => {
+      if (signal) {
+        signal.removeEventListener('abort', onAbort);
+      }
+    };
+
+    const onAbort = () => {
+      const abortErr = signal?.reason instanceof Error ? signal.reason : new Error('aborted');
+      if (activeRes && !activeRes.destroyed) {
+        try {
+          activeRes.destroy(abortErr);
+        } catch {
+          // ignore
+        }
+      }
+      destroyAll();
+      if (!settled) {
+        settled = true;
+        detachAbort();
+        reject(abortErr);
+      }
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    const onError = (err: unknown) => {
+      destroyAll();
+      if (!settled) {
+        settled = true;
+        detachAbort();
+        reject(wrapErr(err));
+      }
+    };
+
+    const onResponse = (res: http.IncomingMessage) => {
+      if (settled) {
+        try { res.destroy(); } catch { /* ignore */ }
+        return;
+      }
+      activeRes = res;
+      // Keep abort listener active until response body stream completes or closes.
+      const cleanupOnBodyFinish = () => {
+        detachAbort();
+        destroyAll();
+      };
+      res.once('end', detachAbort);
+      res.once('close', cleanupOnBodyFinish);
+      res.once('error', detachAbort);
+      settled = true;
+      resolve(incomingMessageToWebResponse(res));
+    };
+
+    issueRequest(onResponse, onError, (fn) => {
+      destroyHooks.push(fn);
+    });
+  });
+}
+
+async function fetchDirectLoopbackWithoutEnvProxy(urlStr: string, init: RequestInit): Promise<Response> {
+  const targetUrl = new URL(urlStr);
+  if (!isLoopbackHostname(targetUrl.hostname)) {
+    throw new Error(`disallowed_non_loopback_isolated_origin:${targetUrl.origin}`);
+  }
+  const isHttps = targetUrl.protocol === 'https:';
+  const transport = isHttps ? https : http;
+  const targetHost = targetUrl.hostname.replace(/^\[|\]$/g, '');
+  const targetPort = Number.parseInt(targetUrl.port || (isHttps ? '443' : '80'), 10);
+  const reqHeaders = buildHeadersObject(init.headers);
+  const directAgent = isHttps
+    ? new https.Agent({ keepAlive: false, proxyEnv: {} } as https.AgentOptions)
+    : new http.Agent({ keepAlive: false, proxyEnv: {} } as http.AgentOptions);
+
+  return await sendManagedNodeRequest(
+    (onResponse, onError, registerDestroy) => {
+      registerDestroy(() => directAgent.destroy());
+      const req = transport.request(
+        {
+          hostname: targetHost,
+          port: targetPort,
+          method: init.method ?? 'GET',
+          path: `${targetUrl.pathname}${targetUrl.search}`,
+          headers: { ...reqHeaders, host: targetUrl.host, connection: 'close' },
+          agent: directAgent,
+        },
+        onResponse,
+      );
+      registerDestroy(() => req.destroy());
+      req.on('error', onError);
+      req.end();
+    },
+    init.signal ?? undefined,
+    (err) => (err instanceof Error ? err : new Error(String(err))),
+  );
+}
+
 async function fetchViaNodeHttpProxy(urlStr: string, proxyStr: string, init: RequestInit): Promise<Response> {
   let proxyUrl: URL;
   try {
@@ -469,140 +590,115 @@ async function fetchViaNodeHttpProxy(urlStr: string, proxyStr: string, init: Req
   }
   const targetUrl = new URL(urlStr);
   const proxyIsHttps = proxyUrl.protocol === 'https:';
+  const proxyHost = proxyUrl.hostname.replace(/^\[|\]$/g, '');
   const proxyPort = Number.parseInt(proxyUrl.port || (proxyIsHttps ? '443' : '80'), 10);
+  const targetHost = targetUrl.hostname.replace(/^\[|\]$/g, '');
   const targetPort = Number.parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80'), 10);
   const proxyAuth = (proxyUrl.username || proxyUrl.password)
     ? `Basic ${Buffer.from(`${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`).toString('base64')}`
     : undefined;
   const reqHeaders = buildHeadersObject(init.headers);
-  const signal = init.signal ?? undefined;
+  const wrapProxyError = (err: unknown): Error => {
+    if (err instanceof Error && err.message.startsWith('proxy_')) return err;
+    const msg = err instanceof Error ? err.message : String(err);
+    return new Error(`proxy_error:${msg}`);
+  };
 
-  if (signal?.aborted) {
-    throw signal.reason instanceof Error ? signal.reason : new Error('aborted');
-  }
+  const proxyTransport = proxyIsHttps ? https : http;
 
-  return await new Promise<Response>((resolve, reject) => {
-    let settled = false;
-    const cleanups: Array<() => void> = [];
-    const finishErr = (err: unknown) => {
-      if (settled) return;
-      settled = true;
-      for (const fn of cleanups) {
-        try { fn(); } catch { /* ignore */ }
-      }
-      if (err instanceof Error && err.message.startsWith('proxy_')) {
-        reject(err);
-      } else {
-        const msg = err instanceof Error ? err.message : String(err);
-        reject(new Error(`proxy_error:${msg}`));
-      }
-    };
-    const finishOk = (res: http.IncomingMessage) => {
-      if (settled) return;
-      settled = true;
-      for (const fn of cleanups) {
-        try { fn(); } catch { /* ignore */ }
-      }
-      resolve(incomingMessageToWebResponse(res));
-    };
-
-    const proxyTransport = proxyIsHttps ? https : http;
-
-    if (targetUrl.protocol === 'http:') {
-      const proxyHeaders: Record<string, string> = {
-        ...reqHeaders,
-        host: targetUrl.host,
-        ...(proxyAuth ? { 'proxy-authorization': proxyAuth } : {}),
-      };
-      const req = proxyTransport.request(
-        {
-          hostname: proxyUrl.hostname.replace(/^\[|\]$/g, ''),
-          port: proxyPort,
-          method: init.method ?? 'GET',
-          path: targetUrl.toString(),
-          headers: proxyHeaders,
-          agent: false,
-        },
-        (res) => finishOk(res),
-      );
-      if (signal) {
-        const onAbort = () => {
-          req.destroy();
-          finishErr(signal.reason instanceof Error ? signal.reason : new Error('proxy_aborted'));
-        };
-        signal.addEventListener('abort', onAbort, { once: true });
-        cleanups.push(() => signal.removeEventListener('abort', onAbort));
-      }
-      req.on('error', finishErr);
-      req.end();
-      return;
-    }
-
-    const authority = `${targetUrl.hostname.includes(':') && !targetUrl.hostname.startsWith('[') ? `[${targetUrl.hostname}]` : targetUrl.hostname}:${targetPort}`;
-    const connectReq = proxyTransport.request({
-      hostname: proxyUrl.hostname.replace(/^\[|\]$/g, ''),
-      port: proxyPort,
-      method: 'CONNECT',
-      path: authority,
-      headers: {
-        host: authority,
-        ...(proxyAuth ? { 'proxy-authorization': proxyAuth } : {}),
-      },
-      agent: false,
-    });
-    if (signal) {
-      const onAbort = () => {
-        connectReq.destroy();
-        finishErr(signal.reason instanceof Error ? signal.reason : new Error('proxy_aborted'));
-      };
-      signal.addEventListener('abort', onAbort, { once: true });
-      cleanups.push(() => signal.removeEventListener('abort', onAbort));
-    }
-    connectReq.on('error', finishErr);
-    connectReq.once('connect', (connectRes, socket) => {
-      socket.on('error', finishErr);
-      if ((connectRes.statusCode ?? 0) < 200 || (connectRes.statusCode ?? 0) >= 300) {
-        socket.destroy();
-        finishErr(new Error(`proxy_connect_failed:${connectRes.statusCode ?? 0}`));
-        return;
-      }
-      const tlsSocket = tls.connect({
-        socket,
-        servername: targetUrl.hostname.replace(/^\[|\]$/g, ''),
-        rejectUnauthorized: true,
-      });
-      tlsSocket.on('error', finishErr);
-      tlsSocket.once('secureConnect', () => {
-        const req = http.request(
+  return await sendManagedNodeRequest(
+    (onResponse, onError, registerDestroy) => {
+      if (targetUrl.protocol === 'http:') {
+        const directProxyAgent = proxyIsHttps
+          ? new https.Agent({ keepAlive: false })
+          : new http.Agent({ keepAlive: false });
+        registerDestroy(() => directProxyAgent.destroy());
+        const req = proxyTransport.request(
           {
-            hostname: targetUrl.hostname.replace(/^\[|\]$/g, ''),
-            port: targetPort,
+            hostname: proxyHost,
+            port: proxyPort,
             method: init.method ?? 'GET',
-            path: `${targetUrl.pathname}${targetUrl.search}`,
+            path: targetUrl.toString(),
             headers: {
               ...reqHeaders,
               host: targetUrl.host,
+              connection: 'close',
+              ...(proxyAuth ? { 'proxy-authorization': proxyAuth } : {}),
             },
-            agent: false,
-            createConnection: () => tlsSocket,
+            agent: directProxyAgent,
           },
-          (res) => finishOk(res),
+          onResponse,
         );
-        if (signal) {
-          const onAbort = () => {
-            req.destroy();
-            tlsSocket.destroy();
-            finishErr(signal.reason instanceof Error ? signal.reason : new Error('proxy_aborted'));
-          };
-          signal.addEventListener('abort', onAbort, { once: true });
-          cleanups.push(() => signal.removeEventListener('abort', onAbort));
-        }
-        req.on('error', finishErr);
+        registerDestroy(() => req.destroy());
+        req.on('error', onError);
         req.end();
+        return;
+      }
+
+      const authority = `${targetHost.includes(':') ? `[${targetHost}]` : targetHost}:${targetPort}`;
+      const connectAgent = proxyIsHttps
+        ? new https.Agent({ keepAlive: false })
+        : new http.Agent({ keepAlive: false });
+      registerDestroy(() => connectAgent.destroy());
+      const connectReq = proxyTransport.request({
+        hostname: proxyHost,
+        port: proxyPort,
+        method: 'CONNECT',
+        path: authority,
+        headers: {
+          host: authority,
+          ...(proxyAuth ? { 'proxy-authorization': proxyAuth } : {}),
+        },
+        agent: connectAgent,
       });
-    });
-    connectReq.end();
-  });
+      registerDestroy(() => connectReq.destroy());
+      connectReq.on('error', onError);
+      connectReq.once('connect', (connectRes, socket, head) => {
+        registerDestroy(() => socket.destroy());
+        socket.on('error', onError);
+        if ((connectRes.statusCode ?? 0) < 200 || (connectRes.statusCode ?? 0) >= 300) {
+          socket.destroy();
+          onError(new Error(`proxy_connect_failed:${connectRes.statusCode ?? 0}`));
+          return;
+        }
+        if (head && head.length > 0) {
+          socket.unshift(head);
+        }
+        const tlsSocket = tls.connect({
+          socket,
+          servername: targetHost,
+        });
+        registerDestroy(() => tlsSocket.destroy());
+        tlsSocket.on('error', onError);
+        tlsSocket.once('secureConnect', () => {
+          const tunnelAgent = new http.Agent({ keepAlive: false });
+          (tunnelAgent as http.Agent & { createConnection: () => tls.TLSSocket }).createConnection = () => tlsSocket;
+          registerDestroy(() => tunnelAgent.destroy());
+          const req = http.request(
+            {
+              hostname: targetHost,
+              port: targetPort,
+              method: init.method ?? 'GET',
+              path: `${targetUrl.pathname}${targetUrl.search}`,
+              headers: {
+                ...reqHeaders,
+                host: targetUrl.host,
+                connection: 'close',
+              },
+              agent: tunnelAgent,
+            },
+            onResponse,
+          );
+          registerDestroy(() => req.destroy());
+          req.on('error', onError);
+          req.end();
+        });
+      });
+      connectReq.end();
+    },
+    init.signal ?? undefined,
+    wrapProxyError,
+  );
 }
 
 export async function createProxyAwareFetch(
@@ -611,8 +707,20 @@ export async function createProxyAwareFetch(
   opts: { isolatedTest?: boolean } = {},
 ): Promise<{ fetchFn: typeof fetch; close: () => Promise<void> }> {
   const isolatedTest = Boolean(opts.isolatedTest || parseBooleanEnv(env.IMCODES_OPENCODE_ISOLATED_TEST));
-  if (isolatedTest || fetchFn !== fetch) {
+  if (fetchFn !== fetch) {
     return { fetchFn, close: async () => {} };
+  }
+  if (isolatedTest) {
+    // Bypass Node's global fetch / NODE_USE_ENV_PROXY so isolated loopback runs never hit env proxies.
+    const isolatedDirectFetch: typeof fetch = async (input, init) => {
+      const urlStr = typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+      return await fetchDirectLoopbackWithoutEnvProxy(urlStr, init ?? {});
+    };
+    return { fetchFn: isolatedDirectFetch, close: async () => {} };
   }
   const proxyCfg = readProxyConfig(env);
   if (!proxyCfg) {
@@ -661,6 +769,7 @@ export async function fetchWithSafeRedirects(
     }
     if (res.status >= 300 && res.status < 400) {
       const location = res.headers?.get?.('location');
+      await res.body?.cancel?.().catch(() => {});
       if (!location) {
         throw new Error(`redirect_missing_location:${res.status}`);
       }
@@ -781,15 +890,11 @@ class ManagedWriteStream {
         return;
       }
       const cleanup = () => {
-        this.stream.off('finish', onFinish);
         this.stream.off('close', onClose);
         if (this.waiterReject === reject) this.waiterReject = null;
       };
-      const onFinish = () => {
-        cleanup();
-        if (this.streamErr) reject(this.streamErr);
-        else resolve();
-      };
+      // Wait for 'close' (not just 'finish') so the underlying OS write file descriptor is
+      // guaranteed closed before execFileSync / linkSync / chmodSync runs (prevents ETXTBSY).
       const onClose = () => {
         cleanup();
         if (this.streamErr) reject(this.streamErr);
@@ -799,7 +904,6 @@ class ManagedWriteStream {
         cleanup();
         reject(err);
       };
-      this.stream.once('finish', onFinish);
       this.stream.once('close', onClose);
       this.stream.end();
     });

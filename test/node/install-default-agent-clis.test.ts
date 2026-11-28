@@ -1,3 +1,4 @@
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -10,9 +11,12 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path, { join } from 'node:path';
+import { promisify } from 'node:util';
 import { gzipSync } from 'node:zlib';
 import { afterEach, describe, expect, it } from 'vitest';
 import { downloadResponseToFileWithIntegrity, validateDownloadUrl } from '../../src/node/cli-install-helpers.js';
@@ -123,7 +127,10 @@ async function startMockServer(
   const addr = server.address() as { port: number };
   return {
     url: `http://127.0.0.1:${addr.port}`,
-    close: () => new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve()))),
+    close: () => new Promise<void>((resolve, reject) => {
+      server.closeAllConnections?.();
+      server.close((err) => (err ? reject(err) : resolve()));
+    }),
   };
 }
 
@@ -926,4 +933,388 @@ describe('install-default-agent-clis', () => {
       await srv.close();
     }
   });
+
+  it('aborts hung response body after headers arrive without stalling sibling CLIs', async () => {
+    const root = makeTempDir();
+    const home = join(root, 'home');
+    const claudePkg = resolveClaudePlatformPackage({ isMusl: false })!;
+    const claudeTgz = buildTarGz([{ name: 'package/claude', content: '#!/bin/sh\necho "2.1.332"\n', mode: 0o755 }]);
+
+    const openSockets: ServerResponse[] = [];
+    const headerHangOrigin = await startMockServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.flushHeaders();
+      res.write('{'); // send headers + 1 byte, then stall body forever!
+      openSockets.push(res);
+    });
+
+    const headerHangProxy = await startMockServer((req, res) => {
+      if (req.url?.includes('opencode') || req.url?.includes('manifests')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.flushHeaders();
+        res.write('{"partial":'); // proxy sends headers immediately, hangs body forever
+        openSockets.push(res);
+        return;
+      }
+      const targetUrl = new URL(req.url!);
+      const up = httpRequest(targetUrl, { headers: req.headers }, (upRes) => {
+        res.writeHead(upRes.statusCode ?? 502, upRes.headers);
+        upRes.pipe(res);
+      });
+      up.on('error', () => res.destroy());
+      req.pipe(up);
+    });
+
+    const healthySrv = await startMockServer((req, res) => {
+      if (req.url === `/${claudePkg.startsWith('@') ? `@${encodeURIComponent(claudePkg.slice(1))}` : encodeURIComponent(claudePkg)}/latest`) {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '2.1.332', dist: { tarball: `${healthySrv.url}/claude.tgz`, integrity: sriSha512(claudeTgz) } }));
+        return;
+      }
+      if (req.url === '/claude.tgz') { res.end(claudeTgz); return; }
+      res.statusCode = 404;
+      res.end();
+    });
+
+    try {
+      // Single hung-body proxied request must abort cleanly within bounded timeout
+      const t0 = Date.now();
+      const hungRes = await installAgyCli({
+        homeDir: join(root, 'home-hung'),
+        isMusl: false,
+        env: { PATH: '', HTTP_PROXY: headerHangProxy.url },
+        agyManifestBaseUrl: headerHangOrigin.url,
+        noFallback: true,
+        metadataTimeoutMs: 140,
+      });
+      const elapsed = Date.now() - t0;
+      expect(hungRes.status).toBe('failed');
+      expect(elapsed).toBeLessThan(1_500);
+
+      // Healthy Claude sibling installs while OpenCode & Agy hang mid-body behind proxy
+      const t1 = Date.now();
+      const { results } = await installDefaultAgentClis({
+        homeDir: home,
+        isMusl: false,
+        only: ['opencode', 'claude', 'agy'],
+        env: { PATH: '', HTTP_PROXY: headerHangProxy.url },
+        registry: healthySrv.url,
+        agyManifestBaseUrl: headerHangOrigin.url,
+        noFallback: true,
+        metadataTimeoutMs: 140,
+        verifyVersion: () => '2.1.332',
+      });
+      expect(Date.now() - t1).toBeLessThan(2_000);
+      expect(results.claude?.status).toBe('installed');
+      expect(results.opencode?.status).toBe('failed');
+      expect(results.agy?.status).toBe('failed');
+    } finally {
+      for (const s of openSockets) {
+        try { s.destroy(); } catch { /* ignore */ }
+      }
+      await headerHangProxy.close();
+      await headerHangOrigin.close();
+      await healthySrv.close();
+    }
+  });
+
+  it('tunnels HTTPS via CONNECT for HTTPS_PROXY and HTTP_PROXY-only, isolates NODE_USE_ENV_PROXY, and coordinates two-process Codex publish lock', async () => {
+    const execFileAsync = promisify(execFile);
+    const root = makeTempDir();
+    const { build } = await import('esbuild');
+
+    // Transpile live src/ into an isolated directory with ZERO node_modules, preserving
+    // separate module URLs identically to the compiled desktop daemon-runtime package.
+    const strippedDir = join(root, 'stripped-runtime');
+    mkdirSync(strippedDir, { recursive: true });
+    writeFileSync(join(strippedDir, 'package.json'), JSON.stringify({ name: 'stripped-runtime', type: 'module' }));
+    await build({
+      entryPoints: [
+        join(process.cwd(), 'src', 'node', 'install-default-agent-clis.ts'),
+        join(process.cwd(), 'src', 'node', 'install-opencode-cli.ts'),
+        join(process.cwd(), 'src', 'node', 'cli-install-helpers.ts'),
+        join(process.cwd(), 'src', 'util', 'imcodes-state-dir.ts'),
+        join(process.cwd(), 'src', 'util', 'windows-daemon-lock.ts'),
+        join(process.cwd(), 'shared', 'imcodes-home-env.ts'),
+      ],
+      outdir: strippedDir,
+      outbase: process.cwd(),
+      bundle: false,
+      platform: 'node',
+      format: 'esm',
+    });
+    writeFileSync(
+      join(strippedDir, 'src', 'util', 'windows-daemon-watchdog.mjs'),
+      readFileSync(join(process.cwd(), 'src', 'util', 'windows-daemon-watchdog.mjs')),
+    );
+    const bundledDefaultPath = join(strippedDir, 'src', 'node', 'install-default-agent-clis.js');
+    const bundledOcPath = join(strippedDir, 'src', 'node', 'install-opencode-cli.js');
+
+    // Generate self-signed RSA cert for 127.0.0.1
+    const keyPath = join(root, 'srv-key.pem');
+    const certPath = join(root, 'srv-cert.pem');
+    execFileSync('openssl', [
+      'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+      '-keyout', keyPath, '-out', certPath, '-days', '1',
+      '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1',
+    ], { stdio: 'ignore' });
+
+    const codexSuffix = resolveCodexPlatformSuffix()!;
+    const codexSubVer = `0.172.0-${codexSuffix}`;
+    const targetTriple = codexSuffix === 'darwin-arm64'
+      ? 'aarch64-apple-darwin'
+      : codexSuffix === 'darwin-x64'
+        ? 'x86_64-apple-darwin'
+        : 'x86_64-unknown-linux-musl';
+    const ocPkg = resolveOpenCodePlatformPackage({ isMusl: false })!;
+    const claudePkg = resolveClaudePlatformPackage({ isMusl: false })!;
+    const agyPlatform = resolveAgyManifestPlatform({ isMusl: false })!;
+
+    const ocTgz = buildTarGz([{ name: 'package/bin/opencode', content: '#!/bin/sh\necho "2.4.2"\n', mode: 0o755 }]);
+    const codexTgz = buildTarGz([
+      { name: `package/vendor/${targetTriple}/bin/codex`, content: '#!/bin/sh\necho "0.172.0"\n', mode: 0o755 },
+      { name: `package/vendor/${targetTriple}/bin/codex-code-mode-host`, content: '#!/bin/sh\necho host\n', mode: 0o755 },
+      { name: `package/vendor/${targetTriple}/codex-path/rg`, content: 'rg', mode: 0o755 },
+      { name: `package/vendor/${targetTriple}/codex-resources/asset.txt`, content: 'asset', mode: 0o644 },
+    ]);
+    const claudeTgz = buildTarGz([{ name: 'package/claude', content: '#!/bin/sh\necho "2.1.332"\n', mode: 0o755 }]);
+    const agyBin = Buffer.from('#!/bin/sh\necho "0.9.0"\n');
+
+    let httpsHits = 0;
+    const httpsSrv = https.createServer(
+      { key: readFileSync(keyPath), cert: readFileSync(certPath) },
+      (req, res) => {
+        httpsHits += 1;
+        const base = `https://127.0.0.1:${(httpsSrv.address() as net.AddressInfo).port}`;
+        if (req.url === `/${claudePkg.startsWith('@') ? `@${encodeURIComponent(claudePkg.slice(1))}` : encodeURIComponent(claudePkg)}/latest`) {
+          res.setHeader('content-type', 'application/json');
+          res.end(JSON.stringify({ version: '2.1.332', dist: { tarball: `${base}/claude.tgz`, integrity: sriSha512(claudeTgz) } }));
+          return;
+        }
+        if (req.url === '/claude.tgz') { res.end(claudeTgz); return; }
+        res.statusCode = 404;
+        res.end();
+      },
+    );
+    await new Promise<void>((resolve) => httpsSrv.listen(0, '127.0.0.1', () => resolve()));
+    const httpsOrigin = `https://127.0.0.1:${(httpsSrv.address() as net.AddressInfo).port}`;
+
+    let connectCount = 0;
+    let proxyHttpCount = 0;
+    const activeTunnels = new Set<net.Socket>();
+    const connectProxy = await new Promise<{ url: string; close: () => Promise<void> }>((resolve) => {
+      const s = createServer((req, res) => {
+        proxyHttpCount += 1;
+        const u = new URL(req.url!);
+        const fwd = httpRequest(u, { headers: req.headers }, (up) => {
+          res.writeHead(up.statusCode ?? 502, up.headers);
+          up.pipe(res);
+        });
+        fwd.on('error', () => res.destroy());
+        req.pipe(fwd);
+      });
+      s.on('connect', (req, clientSock, head) => {
+        connectCount += 1;
+        const [host, portStr] = String(req.url).split(':');
+        const cs = clientSock as net.Socket;
+        activeTunnels.add(cs);
+        cs.once('close', () => activeTunnels.delete(cs));
+        const upstream = net.connect({ host, port: Number(portStr) || 443 }, () => {
+          cs.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          if (head && head.length > 0) upstream.write(head);
+          upstream.pipe(cs);
+          cs.pipe(upstream);
+        });
+        activeTunnels.add(upstream);
+        upstream.once('close', () => activeTunnels.delete(upstream));
+        upstream.on('error', () => cs.destroy());
+        cs.on('error', () => upstream.destroy());
+      });
+      s.listen(0, '127.0.0.1', () => {
+        const addr = s.address() as net.AddressInfo;
+        resolve({
+          url: `http://127.0.0.1:${addr.port}`,
+          close: () => new Promise((r) => {
+            for (const sock of activeTunnels) {
+              try { sock.destroy(); } catch { /* ignore */ }
+            }
+            s.closeAllConnections?.();
+            s.close(() => r());
+          }),
+        });
+      });
+    });
+
+    const httpSrv = await startMockServer((req, res) => {
+      if (req.url === `/${encodeURIComponent(ocPkg)}/latest`) {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '2.4.2', dist: { tarball: `${httpSrv.url}/oc.tgz`, integrity: sriSha512(ocTgz) } }));
+        return;
+      }
+      if (req.url === '/oc.tgz') { res.end(ocTgz); return; }
+      if (req.url === '/@openai%2Fcodex/latest') {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '0.172.0', optionalDependencies: { [`@openai/codex-${codexSuffix}`]: `npm:@openai/codex@${codexSubVer}` } }));
+        return;
+      }
+      if (req.url === `/@openai%2Fcodex/${encodeURIComponent(codexSubVer)}`) {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: codexSubVer, dist: { tarball: `${httpSrv.url}/codex.tgz`, integrity: sriSha512(codexTgz) } }));
+        return;
+      }
+      if (req.url === '/codex.tgz') { res.end(codexTgz); return; }
+      if (req.url === `/manifests/${agyPlatform}.json`) {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '0.9.0', url: `${httpSrv.url}/agy`, sha512: createHash('sha512').update(agyBin).digest('hex') }));
+        return;
+      }
+      if (req.url === '/agy') { res.end(agyBin); return; }
+      res.statusCode = 404;
+      res.end();
+    });
+
+    try {
+      // 1a. HTTPS_PROXY -> CONNECT tunnel over HTTPS origin inside stripped runtime (no node_modules!)
+      const homeHttpsProxy = join(root, 'home-https-proxy');
+      await execFileAsync(
+        process.execPath,
+        [bundledDefaultPath, '--home', homeHttpsProxy, '--only', 'claude', '--registry', httpsOrigin, '--no-fallback', '--strict'],
+        { cwd: strippedDir, env: { PATH: '', HOME: homeHttpsProxy, HTTPS_PROXY: connectProxy.url, NODE_EXTRA_CA_CERTS: certPath } },
+      );
+      expect(existsSync(join(homeHttpsProxy, '.local', 'bin', 'claude'))).toBe(true);
+      expect(connectCount).toBeGreaterThanOrEqual(2);
+      const connectsAfterHttps = connectCount;
+
+      // 1b. HTTP_PROXY only (NO HTTPS_PROXY) still tunnels HTTPS via CONNECT
+      const homeHttpOnlyProxy = join(root, 'home-http-only-proxy');
+      await execFileAsync(
+        process.execPath,
+        [bundledDefaultPath, '--home', homeHttpOnlyProxy, '--only', 'claude', '--registry', httpsOrigin, '--no-fallback', '--strict'],
+        { cwd: strippedDir, env: { PATH: '', HOME: homeHttpOnlyProxy, HTTP_PROXY: connectProxy.url, NODE_EXTRA_CA_CERTS: certPath } },
+      );
+      expect(existsSync(join(homeHttpOnlyProxy, '.local', 'bin', 'claude'))).toBe(true);
+      expect(connectCount).toBeGreaterThanOrEqual(connectsAfterHttps + 2);
+
+      // 1c. Broken HTTPS_PROXY fails closed with 0 hits to HTTPS origin
+      const hitsBeforeDead = httpsHits;
+      const homeDeadProxy = join(root, 'home-dead-proxy');
+      const deadProc = await execFileAsync(
+        process.execPath,
+        [bundledDefaultPath, '--home', homeDeadProxy, '--only', 'claude', '--registry', httpsOrigin, '--no-fallback', '--strict'],
+        { cwd: strippedDir, env: { PATH: '', HOME: homeDeadProxy, HTTPS_PROXY: 'http://127.0.0.1:9', NODE_EXTRA_CA_CERTS: certPath } },
+      ).then(() => ({ failed: false }), () => ({ failed: true }));
+      expect(deadProc.failed).toBe(true);
+      expect(httpsHits).toBe(hitsBeforeDead);
+
+      // 2. NODE_USE_ENV_PROXY=1 must NOT leak isolatedTest loopback traffic into HTTP_PROXY/HTTPS_PROXY (both installDefaultAgentClis & installOpenCodeCli)
+      const connectsBeforeIso = connectCount;
+      const httpProxyBeforeIso = proxyHttpCount;
+      const homeIsoNodeProxy = join(root, 'home-iso-node-env-proxy');
+      await execFileAsync(
+        process.execPath,
+        [bundledDefaultPath, '--home', homeIsoNodeProxy, '--only', 'codex,opencode,agy', '--registry', httpSrv.url, '--agy-manifest-base-url', httpSrv.url, '--isolated-test', '--strict'],
+        {
+          cwd: strippedDir,
+          timeout: 5_000,
+          env: {
+            PATH: '',
+            HOME: homeIsoNodeProxy,
+            NODE_USE_ENV_PROXY: '1',
+            HTTP_PROXY: connectProxy.url,
+            HTTPS_PROXY: connectProxy.url,
+          },
+        },
+      );
+      expect(existsSync(join(homeIsoNodeProxy, '.codex', 'bin', 'codex'))).toBe(true);
+      expect(existsSync(join(homeIsoNodeProxy, '.opencode', 'bin', 'opencode'))).toBe(true);
+      expect(existsSync(join(homeIsoNodeProxy, '.local', 'bin', 'agy'))).toBe(true);
+
+      const homeIsoOc = join(root, 'home-iso-oc-env-proxy');
+      await execFileAsync(
+        process.execPath,
+        [bundledOcPath, '--home', homeIsoOc, '--registry', httpSrv.url, '--isolated-test', '--strict'],
+        {
+          cwd: strippedDir,
+          timeout: 5_000,
+          env: {
+            PATH: '',
+            HOME: homeIsoOc,
+            NODE_USE_ENV_PROXY: '1',
+            HTTP_PROXY: connectProxy.url,
+            HTTPS_PROXY: connectProxy.url,
+          },
+        },
+      );
+      expect(existsSync(join(homeIsoOc, '.opencode', 'bin', 'opencode'))).toBe(true);
+      expect(connectCount).toBe(connectsBeforeIso);
+      expect(proxyHttpCount).toBe(httpProxyBeforeIso);
+
+      // 3. Two independent concurrent OS processes installing Codex into the same home:
+      //    loser must wait on .codex-publish.lock, see existing binary, and NEVER delete winner's sibling files!
+      const sharedHome = join(root, 'home-two-proc');
+      const [r1, r2] = await Promise.all([
+        execFileAsync(
+          process.execPath,
+          [bundledDefaultPath, '--home', sharedHome, '--only', 'codex', '--registry', httpSrv.url, '--no-fallback', '--strict'],
+          { cwd: strippedDir, env: { PATH: '', HOME: sharedHome } },
+        ),
+        execFileAsync(
+          process.execPath,
+          [bundledDefaultPath, '--home', sharedHome, '--only', 'codex', '--registry', httpSrv.url, '--no-fallback', '--strict'],
+          { cwd: strippedDir, env: { PATH: '', HOME: sharedHome } },
+        ),
+      ]);
+      const combinedOut = `${r1.stdout}\n${r2.stdout}`;
+      expect(combinedOut).toContain('codex:installed(');
+      expect(combinedOut).toContain('codex:existing(');
+      expect(existsSync(join(sharedHome, '.codex', 'bin', 'codex'))).toBe(true);
+      expect(existsSync(join(sharedHome, '.codex', 'bin', 'codex-code-mode-host'))).toBe(true);
+      expect(existsSync(join(sharedHome, '.codex', 'codex-path', 'rg'))).toBe(true);
+      expect(existsSync(join(sharedHome, '.codex', 'codex-resources', 'asset.txt'))).toBe(true);
+      expect(existsSync(join(sharedHome, '.codex', '.codex-publish.lock'))).toBe(false);
+
+      // 3b. Interleaved failure/success race: A stalls & fails inside sibling link while B starts concurrently;
+      //     lock ensures A rolls back cleanly before B publishes, leaving B's binary & siblings intact!
+      const raceHome = join(root, 'home-two-proc-interleave');
+      const fsMod = await import('node:fs');
+      const resA = installCodexCli({
+        homeDir: raceHome,
+        env: { PATH: '' },
+        registry: httpSrv.url,
+        noFallback: true,
+        verifyVersion: () => {
+          // Burn ~80ms in synchronous probe, then fail during sibling link after B already started downloading
+          const start = Date.now();
+          while (Date.now() - start < 80) { /* spin */ }
+          return '0.172.0';
+        },
+        linkFile: (src, dst) => {
+          if (dst.endsWith('asset.txt')) throw new Error('simulated_race_a_fail');
+          fsMod.linkSync(src, dst);
+        },
+      });
+      const resB = new Promise<Awaited<ReturnType<typeof installCodexCli>>>((resolve) => {
+        setTimeout(() => {
+          resolve(installCodexCli({
+            homeDir: raceHome,
+            env: { PATH: '' },
+            registry: httpSrv.url,
+            noFallback: true,
+            verifyVersion: () => '0.172.0',
+          }));
+        }, 20);
+      });
+      const [outA, outB] = await Promise.all([resA, resB]);
+      expect([outA.status, outB.status].sort()).toEqual(['failed', 'installed']);
+      expect(existsSync(join(raceHome, '.codex', 'bin', 'codex'))).toBe(true);
+      expect(existsSync(join(raceHome, '.codex', 'bin', 'codex-code-mode-host'))).toBe(true);
+      expect(existsSync(join(raceHome, '.codex', 'codex-path', 'rg'))).toBe(true);
+      expect(existsSync(join(raceHome, '.codex', 'codex-resources', 'asset.txt'))).toBe(true);
+    } finally {
+      await connectProxy.close();
+      httpsSrv.closeAllConnections?.();
+      await new Promise<void>((resolve) => httpsSrv.close(() => resolve()));
+      await httpSrv.close();
+    }
+  }, 30_000);
 });

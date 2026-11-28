@@ -1,15 +1,19 @@
 import {
   chmodSync,
+  closeSync,
   constants as fsConstants,
   copyFileSync,
   linkSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
   rmdirSync,
   rmSync,
+  statSync,
+  writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -55,6 +59,60 @@ const DEFAULT_VERSION_TIMEOUT_MS = 5_000;
 const MAX_CODEX_TARBALL_BYTES = 450 * 1024 * 1024;
 const MAX_CLAUDE_TARBALL_BYTES = 350 * 1024 * 1024;
 const MAX_AGY_DOWNLOAD_BYTES = 200 * 1024 * 1024;
+const CODEX_PUBLISH_LOCK_TIMEOUT_MS = 10_000;
+const CODEX_PUBLISH_LOCK_STALE_MS = 60_000;
+
+async function withExclusiveFileLock<T>(
+  lockPath: string,
+  timeoutMs: number,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    let fd: number | null = null;
+    try {
+      fd = openSync(lockPath, 'wx');
+      writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
+      closeSync(fd);
+      fd = null;
+      break;
+    } catch (err: unknown) {
+      if (fd !== null) {
+        try { closeSync(fd); } catch { /* ignore */ }
+      }
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code !== 'EEXIST') throw err;
+      try {
+        const st = lstatSync(lockPath);
+        if (st.isSymbolicLink()) {
+          throw new Error('unsafe_symlink_target:codex_publish_lock');
+        }
+        const mtime = statSync(lockPath).mtimeMs;
+        if (Date.now() - mtime > CODEX_PUBLISH_LOCK_STALE_MS) {
+          rmSync(lockPath, { force: true });
+          continue;
+        }
+      } catch (statErr: unknown) {
+        if (statErr instanceof Error && statErr.message.startsWith('unsafe_symlink_target')) {
+          throw statErr;
+        }
+      }
+      if (Date.now() >= deadline) {
+        throw new Error('codex_publish_lock_timeout');
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    try {
+      rmSync(lockPath, { force: true });
+    } catch {
+      // ignore lock release failure
+    }
+  }
+}
 
 export type DefaultAgentCliId = 'opencode' | 'codex' | 'claude' | 'agy';
 
@@ -617,74 +675,88 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
           };
         }
 
-        // Check concurrent destination binary BEFORE publishing siblings.
-        try {
-          const existingStat = lstatSync(destPath);
-          if (existingStat.isSymbolicLink()) {
-            throw new Error(`unsafe_symlink_target:${binaryName}`);
-          }
-          opts.logger?.info?.(`found concurrent codex CLI at ${destPath} — keeping existing install`);
-          return {
-            status: 'existing',
-            path: destPath,
-            version: detectedVersion || metaVersion,
-            packageName: `@openai/codex@${subVersion}`,
-            registry,
-          };
-        } catch (destStatErr: unknown) {
-          if ((destStatErr as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') {
-            throw destStatErr;
-          }
-        }
+        const publishLockPath = pathMod.join(codexBaseDir, '.codex-publish.lock');
+        const publishOutcome = await withExclusiveFileLock<InstallCliResult>(
+          publishLockPath,
+          CODEX_PUBLISH_LOCK_TIMEOUT_MS,
+          async () => {
+            // Re-check destination inside exclusive lock so concurrent installers wait for
+            // the winner to finish publishing + linking before concluding 'existing'.
+            try {
+              const existingStat = lstatSync(destPath);
+              if (existingStat.isSymbolicLink()) {
+                throw new Error(`unsafe_symlink_target:${binaryName}`);
+              }
+              opts.logger?.info?.(`found concurrent codex CLI at ${destPath} — keeping existing install`);
+              return {
+                status: 'existing',
+                path: destPath,
+                version: detectedVersion || metaVersion,
+                packageName: `@openai/codex@${subVersion}`,
+                registry,
+              };
+            } catch (destStatErr: unknown) {
+              if ((destStatErr as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') {
+                throw destStatErr;
+              }
+            }
 
-        // Publish required siblings BEFORE making the main codex binary visible; rollback any
-        // newly created siblings/directories on failure or concurrent binary publish race.
-        publishStagedDirectorySiblings(
-          stageDir,
-          codexBaseDir,
-          `bin/${binaryName}`,
-          homeDir,
-          platform,
-          linkFn,
-          createdFiles,
-          createdDirs,
+            createdFiles.length = 0;
+            createdDirs.length = 0;
+            try {
+              publishStagedDirectorySiblings(
+                stageDir,
+                codexBaseDir,
+                `bin/${binaryName}`,
+                homeDir,
+                platform,
+                linkFn,
+                createdFiles,
+                createdDirs,
+              );
+
+              let publishedAsExisting = false;
+              try {
+                linkFn(stagedBin, destPath);
+              } catch (linkErr: unknown) {
+                const code = (linkErr as NodeJS.ErrnoException | undefined)?.code;
+                if (code === 'EEXIST') {
+                  publishedAsExisting = true;
+                } else {
+                  throw linkErr;
+                }
+              }
+
+              if (publishedAsExisting) {
+                rollbackCreatedArtifacts(createdFiles, createdDirs);
+                opts.logger?.info?.(`found concurrent codex CLI at ${destPath} — keeping existing install`);
+                return {
+                  status: 'existing',
+                  path: destPath,
+                  version: detectedVersion || metaVersion,
+                  packageName: `@openai/codex@${subVersion}`,
+                  registry,
+                };
+              }
+
+              ensureExecutablePermission(destPath, platform);
+            } catch (pubErr) {
+              rollbackCreatedArtifacts(createdFiles, createdDirs);
+              throw pubErr;
+            }
+
+            const finalVersion = detectedVersion || metaVersion;
+            opts.logger?.info?.(`installed codex CLI${finalVersion ? ` (${finalVersion})` : ''} at ${destPath}`);
+            return {
+              status: 'installed',
+              path: destPath,
+              version: finalVersion,
+              packageName: `@openai/codex@${subVersion}`,
+              registry,
+            };
+          },
         );
-
-        let publishedAsExisting = false;
-        try {
-          linkFn(stagedBin, destPath);
-        } catch (linkErr: unknown) {
-          const code = (linkErr as NodeJS.ErrnoException | undefined)?.code;
-          if (code === 'EEXIST') {
-            publishedAsExisting = true;
-          } else {
-            throw linkErr;
-          }
-        }
-
-        if (publishedAsExisting) {
-          rollbackCreatedArtifacts(createdFiles, createdDirs);
-          opts.logger?.info?.(`found concurrent codex CLI at ${destPath} — keeping existing install`);
-          return {
-            status: 'existing',
-            path: destPath,
-            version: detectedVersion || metaVersion,
-            packageName: `@openai/codex@${subVersion}`,
-            registry,
-          };
-        }
-
-        ensureExecutablePermission(destPath, platform);
-
-        const finalVersion = detectedVersion || metaVersion;
-        opts.logger?.info?.(`installed codex CLI${finalVersion ? ` (${finalVersion})` : ''} at ${destPath}`);
-        return {
-          status: 'installed',
-          path: destPath,
-          version: finalVersion,
-          packageName: `@openai/codex@${subVersion}`,
-          registry,
-        };
+        return publishOutcome;
       } catch (err) {
         rollbackCreatedArtifacts(createdFiles, createdDirs);
         lastReason = err instanceof Error ? err.message : String(err);

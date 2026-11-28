@@ -3495,5 +3495,48 @@ chmod 755 "$home_arg/.codex/bin/codex" "$home_arg/.local/bin/claude"
     expect(resConc).toContain('INSTALL_OK');
     const orderLines = readFileSync(orderFile, 'utf8').trim().split('\n');
     expect(orderLines).toEqual(['DEFAULT_DONE', 'OC_DONE']);
+
+    // Verify Windows Add-InstalledCliUserPathEntries re-validates reparse-point safety before touching User PATH
+    const winPs1 = renderWindowsPhaseAInstallerPs1({ version: '2026.11.7132-dev.7022', cliWrapperContent: '@echo off\r\n' });
+    const addPathSection = winPs1.slice(
+      winPs1.indexOf('function Add-InstalledCliUserPathEntries'),
+      winPs1.indexOf('function Install-DefaultAgentClisBestEffort'),
+    );
+    expect(addPathSection).toContain("Test-WindowsCliPathsSafe 'OpenCode'");
+    expect(addPathSection).toContain("Test-WindowsCliPathsSafe 'Codex'");
+    expect(addPathSection).toContain("Test-WindowsCliPathsSafe 'Claude'");
+    expect(addPathSection).toContain("Test-WindowsCliPathsSafe 'Antigravity'");
+    expect(addPathSection).toContain('-Quiet');
+
+    // Host Windows execution test: Add-InstalledCliUserPathEntries must ignore reparse/junction .codex\bin while keeping safe siblings
+    if (process.platform === 'win32') {
+      const winRoot = makeTempDir('imcodes-win-path-junction-');
+      const fakeHome = join(winRoot, 'home');
+      const outsideCodexBin = join(winRoot, 'outside-codex-bin');
+      mkdirSync(join(fakeHome, '.codex'), { recursive: true });
+      mkdirSync(outsideCodexBin, { recursive: true });
+      writeFileSync(join(outsideCodexBin, 'codex.exe'), 'evil');
+      execFileSync('cmd.exe', ['/c', 'mklink', '/J', join(fakeHome, '.codex', 'bin'), outsideCodexBin]);
+      mkdirSync(join(fakeHome, '.local', 'bin'), { recursive: true });
+      writeFileSync(join(fakeHome, '.local', 'bin', 'agy.exe'), 'safe');
+      const psProbe = `
+        $IsolatedRoot = ''
+        $AllowSystemRoot = $true
+        $RealProfile = '${fakeHome.replace(/'/g, "''")}'
+        $recorded = @()
+        function Write-InstallerLog([string]$M) {}
+        function Add-UserPathEntry([string]$D) { $script:recorded += $D }
+        function Test-PathHasReparsePoint([string]$P) {
+          if (Test-Path -LiteralPath $P) { return [bool]((Get-Item -LiteralPath $P -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) }
+          return $false
+        }
+        ${winPs1.slice(winPs1.indexOf('function Test-WindowsCliPathsSafe'), winPs1.indexOf('function Install-DefaultAgentClisBestEffort'))}
+        Add-InstalledCliUserPathEntries '${fakeHome.replace(/'/g, "''")}'
+        $recorded -join ';'
+      `;
+      const res = execFileSync('powershell.exe', ['-NoProfile', '-Command', psProbe], { encoding: 'utf8' }).trim();
+      expect(res.toLowerCase()).not.toContain('.codex\\bin');
+      expect(res.toLowerCase()).toContain('.local\\bin');
+    }
   });
 });

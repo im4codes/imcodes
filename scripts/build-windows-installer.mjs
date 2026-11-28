@@ -1605,10 +1605,12 @@ function Format-OpenCodeLogDetail([string]$RawOutput) {
   return $clean
 }
 
-function Test-WindowsCliPathsSafe([string]$Label, [string[]]$CheckPaths) {
+function Test-WindowsCliPathsSafe([string]$Label, [string[]]$CheckPaths, [switch]$Quiet) {
   foreach ($chk in $CheckPaths) {
     if (Test-PathHasReparsePoint $chk) {
-      Write-InstallerLog ("WARNING: refusing symlink/reparse $Label target $chk; skipping $Label install (non-blocking)")
+      if (-not $Quiet) {
+        Write-InstallerLog ("WARNING: refusing symlink/reparse $Label target $chk; skipping $Label install (non-blocking)")
+      }
       return $false
     }
   }
@@ -1618,7 +1620,9 @@ function Test-WindowsCliPathsSafe([string]$Label, [string[]]$CheckPaths) {
         Assert-SafeTargetPath $chk $RealProfile -EntryMode
       }
     } catch {
-      Write-InstallerLog ("WARNING: unsafe $Label target path in isolated mode: " + $_.Exception.Message)
+      if (-not $Quiet) {
+        Write-InstallerLog ("WARNING: unsafe $Label target path in isolated mode: " + $_.Exception.Message)
+      }
       return $false
     }
   }
@@ -1627,20 +1631,25 @@ function Test-WindowsCliPathsSafe([string]$Label, [string[]]$CheckPaths) {
 
 function Add-InstalledCliUserPathEntries([string]$HomeRoot) {
   if (-not ($AllowSystemRoot -and [string]::IsNullOrWhiteSpace($IsolatedRoot))) { return }
-  $ocBinDir = Join-Path (Join-Path $HomeRoot '.opencode') 'bin'
+  $ocBaseDir = Join-Path $HomeRoot '.opencode'
+  $ocBinDir = Join-Path $ocBaseDir 'bin'
   $ocExePath = Join-Path $ocBinDir 'opencode.exe'
-  $codexBinDir = Join-Path (Join-Path $HomeRoot '.codex') 'bin'
+  $codexBaseDir = Join-Path $HomeRoot '.codex'
+  $codexBinDir = Join-Path $codexBaseDir 'bin'
   $codexExePath = Join-Path $codexBinDir 'codex.exe'
-  $localBinDir = Join-Path (Join-Path $HomeRoot '.local') 'bin'
+  $localBaseDir = Join-Path $HomeRoot '.local'
+  $localBinDir = Join-Path $localBaseDir 'bin'
   $claudeExePath = Join-Path $localBinDir 'claude.exe'
   $agyExePath = Join-Path $localBinDir 'agy.exe'
-  if (Test-Path -LiteralPath $ocExePath -PathType Leaf) {
+  if ((Test-WindowsCliPathsSafe 'OpenCode' @($ocBaseDir, $ocBinDir, $ocExePath) -Quiet) -and (Test-Path -LiteralPath $ocExePath -PathType Leaf)) {
     try { Add-UserPathEntry $ocBinDir } catch { Write-InstallerLog ("WARNING: Failed to add $ocBinDir to User PATH: " + $_.Exception.Message) }
   }
-  if (Test-Path -LiteralPath $codexExePath -PathType Leaf) {
+  if ((Test-WindowsCliPathsSafe 'Codex' @($codexBaseDir, $codexBinDir, $codexExePath) -Quiet) -and (Test-Path -LiteralPath $codexExePath -PathType Leaf)) {
     try { Add-UserPathEntry $codexBinDir } catch { Write-InstallerLog ("WARNING: Failed to add $codexBinDir to User PATH: " + $_.Exception.Message) }
   }
-  if ((Test-Path -LiteralPath $claudeExePath -PathType Leaf) -or (Test-Path -LiteralPath $agyExePath -PathType Leaf)) {
+  $claudeSafe = (Test-WindowsCliPathsSafe 'Claude' @($localBaseDir, $localBinDir, $claudeExePath) -Quiet) -and (Test-Path -LiteralPath $claudeExePath -PathType Leaf)
+  $agySafe = (Test-WindowsCliPathsSafe 'Antigravity' @($localBaseDir, $localBinDir, $agyExePath) -Quiet) -and (Test-Path -LiteralPath $agyExePath -PathType Leaf)
+  if ($claudeSafe -or $agySafe) {
     try { Add-UserPathEntry $localBinDir } catch { Write-InstallerLog ("WARNING: Failed to add $localBinDir to User PATH: " + $_.Exception.Message) }
   }
 }
