@@ -3,6 +3,26 @@ import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { WebSocket } from 'ws';
+
+const mockPgClients: FakePgClient[] = [];
+vi.mock('pg', () => ({
+  default: {
+    Client: class MockPgClient extends EventEmitter {
+      connectCalls = 0;
+      endCalls = 0;
+      queries: string[] = [];
+      constructor() {
+        super();
+        const self = this as unknown as FakePgClient;
+        self.connect = async () => { self.connectCalls += 1; };
+        self.query = async (sql: string) => { self.queries.push(sql); return { rows: [] }; };
+        self.end = async () => { self.endCalls += 1; };
+        mockPgClients.push(self);
+      }
+    },
+  },
+}));
+
 import { buildApp, setupWebSocketUpgrade } from '../src/index.js';
 import { WsBridge } from '../src/ws/bridge.js';
 import {
@@ -11,6 +31,7 @@ import {
   DAEMON_REBALANCE_WS_CLOSE_REASON,
   DaemonPodRebalancer,
   daemonPodRebalancer,
+  type PgListenerClient,
 } from '../src/ws/daemon-pod-rebalance.js';
 import { authenticateDaemonServer } from '../src/security/daemon-auth.js';
 import { sha256Hex, signJwt } from '../src/security/crypto.js';
@@ -18,7 +39,38 @@ import type { Database } from '../src/db/client.js';
 import type { Env } from '../src/env.js';
 import { USER_STATUS } from '../../shared/user-status.js';
 import { SERVER_ID_HEADER } from '../../shared/http-header-names.js';
+import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { environment as baseEnvironment, signingKey, token as daemonToken, key as apiKey, headers as daemonHeaders } from './helpers/daemon-token-env.js';
+
+interface FakePgClient extends EventEmitter, PgListenerClient {
+  connectCalls: number;
+  endCalls: number;
+  queries: string[];
+}
+
+class ControlledPgClient extends EventEmitter implements PgListenerClient {
+  connectCalls = 0;
+  endCalls = 0;
+  queries: string[] = [];
+  connectImpl: () => Promise<void> = async () => {};
+  queryImpl: (sql: string) => Promise<unknown> = async () => ({ rows: [] });
+  endImpl: () => Promise<unknown> = async () => {};
+
+  async connect(): Promise<void> {
+    this.connectCalls += 1;
+    return this.connectImpl();
+  }
+
+  async query(sql: string): Promise<unknown> {
+    this.queries.push(sql);
+    return this.queryImpl(sql);
+  }
+
+  async end(): Promise<unknown> {
+    this.endCalls += 1;
+    return this.endImpl();
+  }
+}
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -45,7 +97,7 @@ class MockWs extends EventEmitter {
     this.readyState = 3; // WebSocket.CLOSED
     this.closeCode = code;
     this.closeReason = reason;
-    this.emit('close');
+    this.emit('close', code, Buffer.from(reason ?? ''));
   }
 }
 
@@ -53,6 +105,16 @@ async function flushAsync() {
   for (let i = 0; i < 6; i++) {
     await new Promise((r) => process.nextTick(r));
   }
+}
+
+function createDeferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 function makeBridgeAuthDb(secret = 'daemon-secret'): Database {
@@ -80,10 +142,123 @@ function makeBridgeAuthDb(secret = 'daemon-secret'): Database {
   return db as unknown as Database;
 }
 
-async function connectAuthenticatedDaemon(serverId: string, secret = 'daemon-secret') {
+/**
+ * Stateful in-memory DB implementing the conditional SQL on `servers`
+ * (`last_heartbeat_at`, `status`, `connected_providers`) plus an optional hook
+ * to pause Pod A's close writes so Pod B's concurrent auth/provider writes can commit first.
+ */
+function makeStatefulServersDb(options: {
+  serverId: string;
+  secret: string;
+  sharedRow?: {
+    id: string;
+    token_hash: string;
+    owner_status: string;
+    node_role: string;
+    revoked_at: number | null;
+    user_id: string;
+    name: string;
+    status: string;
+    last_heartbeat_at: number | null;
+    connected_providers: Record<string, boolean>;
+  };
+  onOfflineExecute?: () => Promise<void>;
+  onClearProvidersExecute?: () => Promise<void>;
+}) {
+  const tokenHash = sha256Hex(options.secret);
+  const row = options.sharedRow ?? {
+    id: options.serverId,
+    token_hash: tokenHash,
+    owner_status: USER_STATUS.ACTIVE,
+    node_role: 'full',
+    revoked_at: null as number | null,
+    user_id: 'user-1',
+    name: 'srv-node',
+    status: 'offline' as string,
+    last_heartbeat_at: null as number | null,
+    connected_providers: {} as Record<string, boolean>,
+  };
+
+  function matchesHeartbeatCondition(sql: string, paramValue?: number): boolean {
+    if (sql.includes('last_heartbeat_at IS NULL OR last_heartbeat_at <=')) {
+      return row.last_heartbeat_at === null || row.last_heartbeat_at <= Number(paramValue);
+    }
+    if (sql.includes('last_heartbeat_at IS NULL')) {
+      return row.last_heartbeat_at === null;
+    }
+    return true;
+  }
+
+  const db = {
+    row,
+    queryOne: async (sql: string) => {
+      if (sql.includes('token_hash')) {
+        return { ...row };
+      }
+      if (sql.includes('SELECT last_heartbeat_at FROM servers')) {
+        return { last_heartbeat_at: row.last_heartbeat_at };
+      }
+      return null;
+    },
+    query: async () => [],
+    execute: async (sql: string, params: unknown[] = []) => {
+      if (sql.includes('UPDATE servers') && sql.includes('last_heartbeat_at = GREATEST')) {
+        const requested = Number(params[0]);
+        const nextHb = Math.max(row.last_heartbeat_at !== null ? row.last_heartbeat_at + 1 : 0, requested);
+        row.last_heartbeat_at = nextHb;
+        row.status = String(params[1]);
+        return { changes: 1 };
+      }
+      if (sql.includes('UPDATE servers') && sql.includes('SET status = $1')) {
+        if (options.onOfflineExecute) {
+          await options.onOfflineExecute();
+        }
+        const maxHb = params.length >= 3 ? Number(params[2]) : undefined;
+        if (!matchesHeartbeatCondition(sql, maxHb)) {
+          return { changes: 0 };
+        }
+        row.status = String(params[0]);
+        return { changes: 1 };
+      }
+      if (sql.includes('UPDATE servers SET connected_providers') && sql.includes("'{}'::jsonb WHERE")) {
+        if (options.onClearProvidersExecute) {
+          await options.onClearProvidersExecute();
+        }
+        const maxHb = params.length >= 2 ? Number(params[1]) : undefined;
+        if (!matchesHeartbeatCondition(sql, maxHb)) {
+          return { changes: 0 };
+        }
+        row.connected_providers = {};
+        return { changes: 1 };
+      }
+      if (sql.includes('UPDATE servers SET connected_providers = coalesce(connected_providers')) {
+        if (sql.includes('|| $1::jsonb')) {
+          const patch = JSON.parse(String(params[0])) as Record<string, boolean>;
+          row.connected_providers = { ...row.connected_providers, ...patch };
+        } else if (sql.includes('- $1')) {
+          const next = { ...row.connected_providers };
+          delete next[String(params[0])];
+          row.connected_providers = next;
+        }
+        return { changes: 1 };
+      }
+      return { changes: 1 };
+    },
+    exec: async () => {},
+    transaction: async <T>(fn: (tx: Database) => Promise<T>) => fn(db as unknown as Database),
+    close: async () => {},
+  };
+  return db as unknown as Database & { row: typeof row };
+}
+
+async function connectAuthenticatedDaemon(
+  serverId: string,
+  secret = 'daemon-secret',
+  db: Database = makeBridgeAuthDb(secret),
+) {
   const bridge = WsBridge.get(serverId);
   const daemonWs = new MockWs();
-  bridge.handleDaemonConnection(daemonWs as never, makeBridgeAuthDb(secret), {
+  bridge.handleDaemonConnection(daemonWs as never, db, {
     JWT_SIGNING_KEY: signingKey,
   } as Env);
   daemonWs.emit('message', Buffer.from(JSON.stringify({
@@ -119,6 +294,19 @@ function makeRouteEnv(serverId = 'srv-1') {
           revoked_at: null,
         };
       }
+      if (normalized.includes('from shared_context_projections')) {
+        return {
+          id: 'proj-1',
+          user_id: 'user-1',
+          origin_server_id: serverId,
+          project_id: 'proj-key',
+          summary: '',
+          content: '',
+          tags: [],
+          created_at: 1_000,
+          updated_at: 1_000,
+        };
+      }
       if (normalized.includes('from server_users') || normalized.includes('from server_members')) {
         return { role: 'owner' };
       }
@@ -152,6 +340,7 @@ function makeRouteEnv(serverId = 'srv-1') {
 
 describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
   beforeEach(async () => {
+    mockPgClients.length = 0;
     WsBridge.getAll().clear();
     await daemonPodRebalancer.stop();
   });
@@ -176,21 +365,31 @@ describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
     nowMs += 6_000;
 
     const notifies: Array<{ sql: string; params: unknown[] }> = [];
+    const pgClient = new ControlledPgClient();
     const podB = new DaemonPodRebalancer({
       podId: () => 'pod-b',
       now: () => nowMs,
+      pgClientFactory: () => pgClient,
     });
     const podA = new DaemonPodRebalancer({
       podId: () => 'pod-a',
       now: () => nowMs,
+      pgClientFactory: () => new ControlledPgClient(),
     });
 
-    podB.requestDaemonRebalance(serverId, {
+    await podB.start('postgres://pod-b.local/imcodes', {
       query: async (sql: string, params: unknown[] = []) => {
         notifies.push({ sql, params });
         return [];
       },
-    });
+    } as unknown as Database);
+    await podA.start('postgres://pod-a.local/imcodes');
+
+    // Even if Pod B's LISTEN drops temporarily, publishing via pool still succeeds while started.
+    pgClient.emit('error', new Error('listener hiccup'));
+    expect(podB.isPgListening()).toBe(false);
+
+    podB.requestDaemonRebalance(serverId);
     await flushAsync();
 
     expect(notifies).toHaveLength(1);
@@ -203,6 +402,9 @@ describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
     expect(daemonWs.closeCode).toBe(DAEMON_REBALANCE_WS_CLOSE_CODE);
     expect(daemonWs.closeReason).toBe(DAEMON_REBALANCE_WS_CLOSE_REASON);
     expect(browserWs.closed).toBe(false);
+
+    await podA.stop();
+    await podB.stop();
   });
 
   it('ignores self-notifications where requesterPodId matches local pod', async () => {
@@ -301,13 +503,15 @@ describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
       now: () => nowMs,
       publishCooldownMs: 15_000,
       maxTrackedEntries: 3,
+      pgClientFactory: () => new ControlledPgClient(),
     });
     const fakeDb = {
       query: async (_sql: string, params: unknown[] = []) => {
         emitted.push(String(params[1]));
         return [];
       },
-    };
+    } as unknown as Database;
+    await podB.start('postgres://pod-b.local/imcodes', fakeDb);
     podB.requestDaemonRebalance('s-1', fakeDb);
     podB.requestDaemonRebalance('s-1', fakeDb); // suppressed within 15s
     expect(emitted).toHaveLength(1);
@@ -319,32 +523,146 @@ describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
     podB.requestDaemonRebalance('s-3', fakeDb);
     podB.requestDaemonRebalance('s-4', fakeDb);
     expect(podB.getPublishCooldownSize()).toBe(3);
+    await podB.stop();
   });
 
-  it('degrades safely when PostgreSQL is unavailable (PGlite/embedded or failing query)', async () => {
-    const rebalancer = new DaemonPodRebalancer({ podId: () => 'pod-a' });
-    await expect(rebalancer.start(undefined)).resolves.toBeUndefined();
-    expect(rebalancer.isPgListening()).toBe(false);
+  it('never emits pg_notify when unstarted, PGlite/embedded, or after stop()', async () => {
+    const querySpy = vi.fn(async () => []);
+    const spyDb = { query: querySpy } as unknown as Database;
+    const rebalancer = new DaemonPodRebalancer({
+      podId: () => 'pod-a',
+      pgClientFactory: () => new ControlledPgClient(),
+    });
 
-    await expect(rebalancer.start('pglite://embedded')).resolves.toBeUndefined();
-    expect(rebalancer.isPgListening()).toBe(false);
+    // 1. Unstarted: even with querySpy dbOverride, zero pg_notify queries.
+    rebalancer.requestDaemonRebalance('srv-unstarted', spyDb);
+    expect(querySpy).not.toHaveBeenCalled();
 
-    // DB without .query or rejecting .query must never throw synchronously or reject unhandled.
-    expect(() => rebalancer.requestDaemonRebalance('srv-1', {} as Database)).not.toThrow();
-    expect(() => rebalancer.requestDaemonRebalance('srv-1', {
+    // 2. Absent / PGlite URL: zero pg_notify queries and no listener.
+    await expect(rebalancer.start(undefined, spyDb)).resolves.toBeUndefined();
+    expect(rebalancer.isPgListening()).toBe(false);
+    rebalancer.requestDaemonRebalance('srv-no-url', spyDb);
+    expect(querySpy).not.toHaveBeenCalled();
+
+    await expect(rebalancer.start('pglite://embedded', spyDb)).resolves.toBeUndefined();
+    expect(rebalancer.isPgListening()).toBe(false);
+    rebalancer.requestDaemonRebalance('srv-pglite', spyDb);
+    expect(querySpy).not.toHaveBeenCalled();
+
+    // 3. Started with PG -> publishes once, then after stop() -> zero queries again.
+    await rebalancer.start('postgres://pod-a.local/imcodes', spyDb);
+    rebalancer.requestDaemonRebalance('srv-pg', spyDb);
+    expect(querySpy).toHaveBeenCalledTimes(1);
+
+    await rebalancer.stop();
+    rebalancer.requestDaemonRebalance('srv-after-stop', spyDb);
+    expect(querySpy).toHaveBeenCalledTimes(1);
+
+    // 4. Failing pg_notify query inside running PG mode does not throw.
+    const failingDb = {
       query: async () => {
-        throw new Error('function pg_notify does not exist');
+        throw new Error('pg_notify temporary error');
       },
-    })).not.toThrow();
+    } as unknown as Database;
+    await rebalancer.start('postgres://pod-a.local/imcodes', failingDb);
+    expect(() => rebalancer.requestDaemonRebalance('srv-fail', failingDb)).not.toThrow();
     await flushAsync();
-    await expect(rebalancer.stop()).resolves.toBeUndefined();
+    await rebalancer.stop();
   });
 
-  it('triggers PG notify on authenticated daemon-auth, watch, session-mgmt, and never on unauthenticated or non-path requests', async () => {
-    const { env, pgNotifies } = makeRouteEnv('srv-route-1');
+  it('retires PG listener cleanly on LISTEN failure, async end rejection, timeout, in-flight stop(), and reconnects', async () => {
+    vi.useFakeTimers();
+
+    // 1. connect succeeds, LISTEN rejects -> end() called once and reconnect scheduled.
+    const clients: ControlledPgClient[] = [];
+    const rebalancer1 = new DaemonPodRebalancer({
+      podId: () => 'pod-a',
+      pgClientFactory: () => {
+        const c = new ControlledPgClient();
+        if (clients.length === 0) {
+          c.queryImpl = async () => {
+            throw new Error('LISTEN failed');
+          };
+          c.endImpl = async () => {
+            throw new Error('end() async reject should be absorbed');
+          };
+        }
+        clients.push(c);
+        return c;
+      },
+    });
+    await rebalancer1.start('postgres://pod-a.local/imcodes');
+    expect(rebalancer1.isPgListening()).toBe(false);
+    expect(clients[0]!.endCalls).toBe(1);
+
+    // Reconnect fires cleanly after initial 1000ms backoff and establishes LISTEN.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(clients).toHaveLength(2);
+    expect(rebalancer1.isPgListening()).toBe(true);
+
+    // Listener error/end retires client idempotently (even if end/error both fire) and reconnects.
+    clients[1]!.emit('error', new Error('connection reset'));
+    clients[1]!.emit('end');
+    expect(clients[1]!.endCalls).toBe(1);
+    expect(rebalancer1.isPgListening()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(clients).toHaveLength(3);
+    expect(rebalancer1.isPgListening()).toBe(true);
+    await rebalancer1.stop();
+    expect(clients[2]!.endCalls).toBe(1);
+
+    // 2. stop() racing an in-flight LISTEN -> when LISTEN later resolves, client retires and isPgListening stays false.
+    const listenDeferred = createDeferred<void>();
+    const raceClient = new ControlledPgClient();
+    raceClient.queryImpl = () => listenDeferred.promise;
+    const rebalancer2 = new DaemonPodRebalancer({
+      podId: () => 'pod-a',
+      pgClientFactory: () => raceClient,
+    });
+    const startPromise = rebalancer2.start('postgres://pod-a.local/imcodes');
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    expect(raceClient.connectCalls).toBe(1);
+    expect(raceClient.queries).toHaveLength(1);
+
+    await rebalancer2.stop();
+    expect(raceClient.endCalls).toBe(1);
+    listenDeferred.resolve();
+    await startPromise;
+    expect(rebalancer2.isPgListening()).toBe(false);
+    expect(raceClient.endCalls).toBe(1);
+
+    // 3. connect() hang hits bounded connectTimeoutMs, retires client, and retries.
+    const timeoutClients: ControlledPgClient[] = [];
+    const rebalancer3 = new DaemonPodRebalancer({
+      podId: () => 'pod-a',
+      connectTimeoutMs: 500,
+      pgClientFactory: () => {
+        const c = new ControlledPgClient();
+        if (timeoutClients.length === 0) {
+          c.connectImpl = () => new Promise<void>(() => {});
+        }
+        timeoutClients.push(c);
+        return c;
+      },
+    });
+    const timedStart = rebalancer3.start('postgres://pod-a.local/imcodes');
+    await vi.advanceTimersByTimeAsync(500);
+    await timedStart;
+    expect(timeoutClients[0]!.endCalls).toBe(1);
+    expect(rebalancer3.isPgListening()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(timeoutClients).toHaveLength(2);
+    expect(rebalancer3.isPgListening()).toBe(true);
+    await rebalancer3.stop();
+  });
+
+  it('triggers PG notify ONLY on authenticated /api/server/:serverId/... routes when PG started and never on flat or unauthenticated routes', async () => {
+    const serverId = 'srv-route-1';
+    const { env, pgNotifies } = makeRouteEnv(serverId);
+    await daemonPodRebalancer.start('postgres://pod-b.local/imcodes', env.DB);
 
     // 1. Unauthenticated HTTP request must NOT emit rebalance.
-    const unauthRes = await buildApp(env).request('/api/server/srv-route-1/timeline/history?sessionName=deck_proj_brain');
+    const unauthRes = await buildApp(env).request(`/api/server/${serverId}/timeline/history?sessionName=deck_proj_brain`);
     expect(unauthRes.status).toBe(401);
     expect(pgNotifies).toHaveLength(0);
 
@@ -361,37 +679,48 @@ describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
     expect(outboundRes.status).toBe(200);
     expect(pgNotifies).toHaveLength(0);
 
-    // 3. Path-bound daemon auth when local daemon WS is absent emits rebalance.
+    // 3. Flat routes outside /api/server/:serverId/... (session-identities, memory/sources) must NOT emit rebalance.
+    const identityRes = await buildApp(env).request(`/api/session-identities?scope=project&scopeKey=proj-1&serverId=${serverId}`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    expect(identityRes.status).toBe(409);
+    expect(pgNotifies).toHaveLength(0);
+
+    const memoryRes = await buildApp(env).request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-1&projectId=proj-key`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    expect(memoryRes.status).toBe(409);
+    expect(pgNotifies).toHaveLength(0);
+
+    // 4. Path-bound daemon auth on /api/server/:id/... when local daemon WS is absent emits rebalance.
     const daemonRouteApp = new Hono<{ Bindings: Env }>();
     daemonRouteApp.get('/api/server/:id/sessions', async (c) => {
       const authed = await authenticateDaemonServer(c, c.req.param('id'));
       return c.json({ ok: authed.ok });
     });
-    const daemonRes = await daemonRouteApp.request('/api/server/srv-route-1/sessions', {
-      headers: { Authorization: daemonHeaders.Authorization, [SERVER_ID_HEADER]: 'srv-route-1' },
+    const daemonRes = await daemonRouteApp.request(`/api/server/${serverId}/sessions`, {
+      headers: { Authorization: daemonHeaders.Authorization, [SERVER_ID_HEADER]: serverId },
     }, env);
     expect(daemonRes.status).toBe(200);
     expect(pgNotifies).toHaveLength(1);
-    expect(pgNotifies[0]!.payload.serverId).toBe('srv-route-1');
+    expect(pgNotifies[0]!.payload.serverId).toBe(serverId);
 
-    // Reset singleton cooldown and verify authenticated Watch daemon_offline route emits rebalance.
+    // 5. Authenticated Watch daemon_offline route on /api/server/:id/... emits rebalance.
     await daemonPodRebalancer.stop();
+    await daemonPodRebalancer.start('postgres://pod-b.local/imcodes', env.DB);
     const watchRes = await buildApp(env).request(
-      '/api/server/srv-route-1/timeline/history?sessionName=deck_proj_brain',
-      {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-        },
-      },
+      `/api/server/${serverId}/timeline/history?sessionName=deck_proj_brain`,
+      { headers: { Authorization: `Bearer ${apiKey}` } },
     );
     expect(watchRes.status).toBe(503);
     expect(await watchRes.json()).toEqual({ error: 'daemon_offline' });
     expect(pgNotifies).toHaveLength(2);
-    expect(pgNotifies[1]!.payload.serverId).toBe('srv-route-1');
+    expect(pgNotifies[1]!.payload.serverId).toBe(serverId);
 
-    // Reset singleton cooldown and verify authenticated /session/send when !isDaemonConnected emits rebalance.
+    // 6. Authenticated /api/server/:id/session/send when !isDaemonConnected emits rebalance.
     await daemonPodRebalancer.stop();
-    const sendRes = await buildApp(env).request('/api/server/srv-route-1/session/send', {
+    await daemonPodRebalancer.start('postgres://pod-b.local/imcodes', env.DB);
+    const sendRes = await buildApp(env).request(`/api/server/${serverId}/session/send`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -401,13 +730,14 @@ describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
     });
     expect(sendRes.status).toBe(200);
     expect(pgNotifies).toHaveLength(3);
-    expect(pgNotifies[2]!.payload.serverId).toBe('srv-route-1');
+    expect(pgNotifies[2]!.payload.serverId).toBe(serverId);
 
-    // When daemon IS connected locally on this pod, authenticateDaemonServer must NOT emit rebalance.
+    // 7. When daemon IS connected locally on this pod, authenticateDaemonServer must NOT emit rebalance.
     await daemonPodRebalancer.stop();
-    await connectAuthenticatedDaemon('srv-route-1', daemonToken);
-    await daemonRouteApp.request('/api/server/srv-route-1/sessions', {
-      headers: { Authorization: daemonHeaders.Authorization, [SERVER_ID_HEADER]: 'srv-route-1' },
+    await daemonPodRebalancer.start('postgres://pod-b.local/imcodes', env.DB);
+    await connectAuthenticatedDaemon(serverId, daemonToken);
+    await daemonRouteApp.request(`/api/server/${serverId}/sessions`, {
+      headers: { Authorization: daemonHeaders.Authorization, [SERVER_ID_HEADER]: serverId },
     }, env);
     expect(pgNotifies).toHaveLength(3);
   });
@@ -415,6 +745,7 @@ describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
   it('triggers PG notify on authenticated browser WS upgrade when local daemon is disconnected', async () => {
     const serverId = 'srv-ws-upgrade-1';
     const { env, pgNotifies } = makeRouteEnv(serverId);
+    await daemonPodRebalancer.start('postgres://pod-b.local/imcodes', env.DB);
     const httpServer: HttpServer = createServer();
     setupWebSocketUpgrade(httpServer, env);
 
@@ -458,5 +789,86 @@ describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
     } finally {
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     }
+  });
+
+  it('prevents delayed Pod A 1012 close DB cleanup from overwriting newer Pod B online and provider status, while still marking un-reconnected servers offline', async () => {
+    const serverId = 'srv-handoff-race';
+    const offlineGate = createDeferred<void>();
+    const clearGate = createDeferred<void>();
+    let gatePodAWrites = false;
+
+    const dbA = makeStatefulServersDb({
+      serverId,
+      secret: 'secret',
+      onOfflineExecute: async () => {
+        if (gatePodAWrites) await offlineGate.promise;
+      },
+      onClearProvidersExecute: async () => {
+        if (gatePodAWrites) await clearGate.promise;
+      },
+    });
+    // Separate pool/connection handle on Pod B mutating the SAME underlying server row without Pod A's close-write gate.
+    const dbB = makeStatefulServersDb({
+      serverId,
+      secret: 'secret',
+      sharedRow: dbA.row,
+    });
+
+    // Simulate Pod A auth at t=1000 and Pod B auth ALSO observing t=1000 (worst-case same-ms clock).
+    let nowMs = 1_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
+
+    const bridgeA = WsBridge.get(serverId);
+    const wsA = new MockWs();
+    bridgeA.handleDaemonConnection(wsA as never, dbA, { JWT_SIGNING_KEY: signingKey } as Env);
+    wsA.emit('message', Buffer.from(JSON.stringify({ type: 'auth', serverId, token: 'secret' })));
+    await flushAsync();
+    expect(dbA.row.status).toBe('online');
+    const hbA = dbA.row.last_heartbeat_at!;
+
+    // Advance age past 5s and trigger 1012 rebalance on Pod A while delaying A's DB close writes.
+    nowMs = 7_000;
+    gatePodAWrites = true;
+    expect(bridgeA.rebalanceDaemonConnection(5_000, 'pod-b', nowMs)).toBe(true);
+    expect(wsA.closeCode).toBe(DAEMON_REBALANCE_WS_CLOSE_CODE);
+    expect(bridgeA.isDaemonConnected()).toBe(false);
+
+    // Clear Pod A's in-memory singleton map so bridgeB models a distinct Pod B process instance.
+    WsBridge.getAll().delete(serverId);
+
+    // Pod B authenticates the reconnected daemon (even if Pod B's clock read hbA = 1000) & sets provider status.
+    nowMs = hbA;
+    const bridgeB = WsBridge.get(serverId);
+    const wsB = new MockWs();
+    bridgeB.handleDaemonConnection(wsB as never, dbB, { JWT_SIGNING_KEY: signingKey } as Env);
+    wsB.emit('message', Buffer.from(JSON.stringify({ type: 'auth', serverId, token: 'secret' })));
+    await flushAsync();
+    wsB.emit('message', Buffer.from(JSON.stringify({
+      type: TRANSPORT_MSG.PROVIDER_STATUS,
+      providerId: 'claude-code',
+      connected: true,
+    })));
+    await flushAsync();
+    expect(dbA.row.status).toBe('online');
+    expect(dbA.row.last_heartbeat_at).toBeGreaterThan(hbA);
+    expect(dbA.row.connected_providers).toEqual({ 'claude-code': true });
+
+    // Release Pod A's delayed offline / provider-clear DB writes; DB row must stay online with providers intact.
+    gatePodAWrites = false;
+    clearGate.resolve();
+    offlineGate.resolve();
+    await flushAsync();
+
+    expect(dbA.row.status).toBe('online');
+    expect(dbA.row.connected_providers).toEqual({ 'claude-code': true });
+
+    // Un-reconnected close (no Pod C takes over): closing wsB cleanly marks DB offline & clears providers.
+    const prevHbB = dbA.row.last_heartbeat_at!;
+    nowMs = prevHbB + 10_000;
+    expect(bridgeB.rebalanceDaemonConnection(5_000, 'pod-c', nowMs)).toBe(true);
+    await flushAsync();
+
+    expect(dbA.row.status).toBe('offline');
+    expect(dbA.row.connected_providers).toEqual({});
   });
 });

@@ -1571,7 +1571,9 @@ async function main() {
   );
   await machineGroupInvalidation.start();
   await globalTaskHub.start(envConfig.DATABASE_URL, db);
-  await daemonPodRebalancer.start(envConfig.DATABASE_URL, db);
+  // Listener setup runs asynchronously with bounded connect/LISTEN timeouts so
+  // startup HTTP readiness is never delayed if the dedicated LISTEN socket stalls.
+  void daemonPodRebalancer.start(envConfig.DATABASE_URL, db);
   await Promise.all([
     remoteVoiceHub.refreshServerSharedProviders(db),
     remoteVoiceHub.refreshServerAsrServices(db, env),

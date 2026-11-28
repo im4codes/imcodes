@@ -537,35 +537,84 @@ export async function patchServerSharedContextMemorySettings(
   return parseSharedContextRuntimeConfigRow(row?.shared_context_runtime_config);
 }
 
+export interface ServerPresenceCondition {
+  /** Apply only if servers.last_heartbeat_at is NULL or <= this timestamp. */
+  maxLastHeartbeatAt?: number | null;
+}
+
 export async function updateServerHeartbeat(
   db: Database,
   id: string,
   daemonVersion?: string | null,
   controlledCapabilities?: readonly string[],
   runtimeArch?: string | null,
-): Promise<void> {
-  // COALESCE, so an older node that does not report one keeps whatever the row
-  // already holds rather than having it erased.
+  heartbeatAt = Date.now(),
+): Promise<number> {
+  let sql: string;
+  let params: unknown[];
+  // COALESCE preserves older capabilities/arch; GREATEST ensures monotonic
+  // last_heartbeat_at across pods even within the same millisecond or minor skew.
   if (controlledCapabilities !== undefined) {
-    await db.execute(
-      `UPDATE servers
-          SET last_heartbeat_at = $1, status = $2, daemon_version = COALESCE($3, daemon_version),
-              controlled_capabilities = $4::jsonb, arch = COALESCE($6, arch)
-        WHERE id = $5`,
-      [
-        Date.now(), 'online', daemonVersion ?? null,
-        JSON.stringify(controlledCapabilities), id, runtimeArch ?? null,
-      ],
-    );
+    sql = `UPDATE servers
+              SET last_heartbeat_at = GREATEST(COALESCE(last_heartbeat_at + 1, 0), $1),
+                  status = $2,
+                  daemon_version = COALESCE($3, daemon_version),
+                  controlled_capabilities = $4::jsonb,
+                  arch = COALESCE($6, arch)
+            WHERE id = $5`;
+    params = [
+      heartbeatAt, 'online', daemonVersion ?? null,
+      JSON.stringify(controlledCapabilities), id, runtimeArch ?? null,
+    ];
   } else if (daemonVersion) {
-    await db.execute('UPDATE servers SET last_heartbeat_at = $1, status = $2, daemon_version = $3 WHERE id = $4', [Date.now(), 'online', daemonVersion, id]);
+    sql = `UPDATE servers
+              SET last_heartbeat_at = GREATEST(COALESCE(last_heartbeat_at + 1, 0), $1),
+                  status = $2,
+                  daemon_version = $3
+            WHERE id = $4`;
+    params = [heartbeatAt, 'online', daemonVersion, id];
   } else {
-    await db.execute('UPDATE servers SET last_heartbeat_at = $1, status = $2 WHERE id = $3', [Date.now(), 'online', id]);
+    sql = `UPDATE servers
+              SET last_heartbeat_at = GREATEST(COALESCE(last_heartbeat_at + 1, 0), $1),
+                  status = $2
+            WHERE id = $3`;
+    params = [heartbeatAt, 'online', id];
   }
+
+  await db.execute(sql, params);
+  if (typeof (db as Partial<Database>).queryOne === 'function') {
+    const row = await db.queryOne<{ last_heartbeat_at?: number | string | null }>(
+      'SELECT last_heartbeat_at FROM servers WHERE id = $1',
+      [id],
+    );
+    const stored = row?.last_heartbeat_at != null ? Number(row.last_heartbeat_at) : NaN;
+    return Number.isFinite(stored) ? stored : heartbeatAt;
+  }
+  return heartbeatAt;
 }
 
-export async function updateServerStatus(db: Database, id: string, status: string): Promise<void> {
-  await db.execute('UPDATE servers SET status = $1 WHERE id = $2', [status, id]);
+export async function updateServerStatus(
+  db: Database,
+  id: string,
+  status: string,
+  condition?: ServerPresenceCondition,
+): Promise<boolean> {
+  if (condition && condition.maxLastHeartbeatAt !== undefined) {
+    if (condition.maxLastHeartbeatAt === null || condition.maxLastHeartbeatAt <= 0) {
+      const res = await db.execute(
+        'UPDATE servers SET status = $1 WHERE id = $2 AND last_heartbeat_at IS NULL',
+        [status, id],
+      );
+      return (res?.changes ?? 1) > 0;
+    }
+    const res = await db.execute(
+      'UPDATE servers SET status = $1 WHERE id = $2 AND (last_heartbeat_at IS NULL OR last_heartbeat_at <= $3)',
+      [status, id, condition.maxLastHeartbeatAt],
+    );
+    return (res?.changes ?? 1) > 0;
+  }
+  const res = await db.execute('UPDATE servers SET status = $1 WHERE id = $2', [status, id]);
+  return (res?.changes ?? 1) > 0;
 }
 
 export async function updateProviderStatus(db: Database, serverId: string, providerId: string, connected: boolean): Promise<void> {
@@ -582,7 +631,25 @@ export async function updateProviderStatus(db: Database, serverId: string, provi
   }
 }
 
-export async function clearProviderStatus(db: Database, serverId: string): Promise<void> {
+export async function clearProviderStatus(
+  db: Database,
+  serverId: string,
+  condition?: ServerPresenceCondition,
+): Promise<void> {
+  if (condition && condition.maxLastHeartbeatAt !== undefined) {
+    if (condition.maxLastHeartbeatAt === null || condition.maxLastHeartbeatAt <= 0) {
+      await db.execute(
+        `UPDATE servers SET connected_providers = '{}'::jsonb WHERE id = $1 AND last_heartbeat_at IS NULL`,
+        [serverId],
+      );
+      return;
+    }
+    await db.execute(
+      `UPDATE servers SET connected_providers = '{}'::jsonb WHERE id = $1 AND (last_heartbeat_at IS NULL OR last_heartbeat_at <= $2)`,
+      [serverId, condition.maxLastHeartbeatAt],
+    );
+    return;
+  }
   await db.execute(`UPDATE servers SET connected_providers = '{}'::jsonb WHERE id = $1`, [serverId]);
 }
 

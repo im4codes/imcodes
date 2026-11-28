@@ -2331,6 +2331,7 @@ export class WsBridge {
   private daemonNodeRole: NodeRole = NODE_ROLE.FULL;
   private authenticated = false;
   private daemonAuthenticatedAt = 0;
+  private rebalanceClosedWs = new WeakSet<WebSocket>();
   /** Current daemon generation has completed durable route reconciliation. */
   private remoteDesktopAuthorityReadyGeneration: number | null = null;
   private daemonVersion: string | null = null;
@@ -2413,10 +2414,15 @@ export class WsBridge {
           normalizedVersion,
           options?.controlledCapabilities,
           options?.runtimeArch,
+          now,
         )
-      : updateServerHeartbeat(db, this.serverId, normalizedVersion);
+      : updateServerHeartbeat(db, this.serverId, normalizedVersion, undefined, undefined, now);
 
-    writePromise.catch((err) => {
+    writePromise.then((storedHeartbeatAt) => {
+      if (this.daemonGeneration === connectionGeneration && this.lastHeartbeatDbWriteAt > 0) {
+        this.lastHeartbeatDbWriteAt = Math.max(this.lastHeartbeatDbWriteAt, storedHeartbeatAt);
+      }
+    }).catch((err) => {
       if (this.daemonGeneration === connectionGeneration && this.lastHeartbeatDbWriteAt === now) {
         this.lastHeartbeatDbWriteAt = prevWriteAt;
         this.lastHeartbeatDbVersion = prevVersion;
@@ -7292,6 +7298,13 @@ export class WsBridge {
         this.remoteDesktopNodeContextCache = null;
         this.remoteDesktopNodeContextLastUnavailableGeneration = null;
         this.remoteDesktopNodeContextInFlight = null;
+        const lastRecordedHeartbeatAt = this.lastHeartbeatDbWriteAt;
+        const isRebalanceClose = this.rebalanceClosedWs.delete(ws);
+        const presenceCondition = lastRecordedHeartbeatAt > 0
+          ? { maxLastHeartbeatAt: lastRecordedHeartbeatAt }
+          : isRebalanceClose
+            ? { maxLastHeartbeatAt: null }
+            : undefined;
         this.resetHeartbeatDbPersistenceState('offline');
         if (disconnectedOwnerUserId) {
           this.failDisconnectedCapabilityOperations(db, disconnectedOwnerUserId);
@@ -7305,15 +7318,17 @@ export class WsBridge {
         this.remoteDesktopRouter.suspendDaemonGeneration(connectionGeneration);
         this.openspecAutoDeliverProjectionCache.clearActive();
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
-        void clearProviderStatus(db, this.serverId).catch(() => {});
-        updateServerStatus(db, this.serverId, 'offline').catch((err) =>
-          logger.error({ err }, 'Failed to mark server offline'),
-        );
-        if (!wasControlled) {
-          void globalTaskHub.notifyServerState(db, this.serverId, false).catch((err) =>
-            logger.warn({ err, serverId: this.serverId }, 'Global task server offline notify failed'),
-          );
-        }
+        void clearProviderStatus(db, this.serverId, presenceCondition).catch(() => {});
+        void updateServerStatus(db, this.serverId, 'offline', presenceCondition)
+          .then((applied) => {
+            if (applied && !wasControlled) {
+              return globalTaskHub.notifyServerState(db, this.serverId, false).catch((err) =>
+                logger.warn({ err, serverId: this.serverId }, 'Global task server offline notify failed'),
+              );
+            }
+            return undefined;
+          })
+          .catch((err) => logger.error({ err }, 'Failed to mark server offline'));
 
         // ── Ack reliability: start grace window, don't yet announce offline ──
         // If daemon reconnects within RECONNECT_GRACE_MS, we replay inflight
@@ -14591,10 +14606,12 @@ export class WsBridge {
     );
     try {
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        this.rebalanceClosedWs.add(ws);
         ws.close(DAEMON_REBALANCE_WS_CLOSE_CODE, DAEMON_REBALANCE_WS_CLOSE_REASON);
         return true;
       }
     } catch (err) {
+      this.rebalanceClosedWs.delete(ws);
       logger.warn({ serverId: this.serverId, err }, 'Failed closing daemon WS during rebalance');
     }
     return false;

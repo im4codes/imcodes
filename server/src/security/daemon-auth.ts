@@ -126,7 +126,14 @@ export async function authenticateDaemonServer<E extends { Bindings: Env }>(
 
   enforceDaemonTokenRoute(c.req, row.id, nodeRole);
 
-  if (serverId && typeof WsBridge.find === 'function' && !WsBridge.find(row.id)?.isDaemonConnected()) {
+  const serverPathPrefix = `/api/server/${row.id}`;
+  const isConsistentHashServerPath = c.req.path === serverPathPrefix || c.req.path.startsWith(`${serverPathPrefix}/`);
+  if (
+    serverId
+    && isConsistentHashServerPath
+    && typeof WsBridge.find === 'function'
+    && !WsBridge.find(row.id)?.isDaemonConnected()
+  ) {
     daemonPodRebalancer.requestDaemonRebalance(row.id, c.env.DB);
   }
 

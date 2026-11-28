@@ -23,7 +23,6 @@ import { requireAuth } from '../security/authorization.js';
 import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { WsBridge } from '../ws/bridge.js';
-import { daemonPodRebalancer } from '../ws/daemon-pod-rebalance.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import { buildMemoryProjectionFallbackSource } from '../../../shared/memory-projection-source-fallback.js';
 import { cleanMemoryProjectId } from '../../../shared/memory-project-scope.js';
@@ -247,7 +246,6 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
 
   const bridge = WsBridge.get(serverId);
   if (!bridge.isDaemonConnected()) {
-    daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
     const fallback = buildProjectionFallbackPayload(projectionId, projectionRow, serverId);
     if (fallback) return c.json(fallback);
     // Match the daemon-offline contract the file-transfer / Watch API
@@ -280,7 +278,6 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
       return fallback ? c.json(fallback) : c.json({ error: 'daemon_offline' }, 409);
     }
     if (message === 'daemon_offline' || message === 'daemon_disconnected' || message === 'daemon_error') {
-      daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
       const fallback = buildProjectionFallbackPayload(projectionId, projectionRow, serverId);
       return fallback ? c.json(fallback) : c.json({ error: 'daemon_offline' }, 409);
     }
