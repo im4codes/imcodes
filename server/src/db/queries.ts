@@ -544,23 +544,31 @@ export async function updateServerHeartbeat(
   controlledCapabilities?: readonly string[],
   runtimeArch?: string | null,
 ): Promise<void> {
-  // COALESCE, so an older node that does not report one keeps whatever the row
-  // already holds rather than having it erased.
+  const heartbeatAt = Date.now();
+  // COALESCE preserves older capabilities/arch; guarding with
+  // last_heartbeat_at <= $1 ensures a delayed heartbeat write from an older
+  // pod/socket never overwrites a newer pod's fresher heartbeat or metadata.
   if (controlledCapabilities !== undefined) {
     await db.execute(
       `UPDATE servers
           SET last_heartbeat_at = $1, status = $2, daemon_version = COALESCE($3, daemon_version),
               controlled_capabilities = $4::jsonb, arch = COALESCE($6, arch)
-        WHERE id = $5`,
+        WHERE id = $5 AND (last_heartbeat_at IS NULL OR last_heartbeat_at <= $1)`,
       [
-        Date.now(), 'online', daemonVersion ?? null,
+        heartbeatAt, 'online', daemonVersion ?? null,
         JSON.stringify(controlledCapabilities), id, runtimeArch ?? null,
       ],
     );
   } else if (daemonVersion) {
-    await db.execute('UPDATE servers SET last_heartbeat_at = $1, status = $2, daemon_version = $3 WHERE id = $4', [Date.now(), 'online', daemonVersion, id]);
+    await db.execute(
+      'UPDATE servers SET last_heartbeat_at = $1, status = $2, daemon_version = $3 WHERE id = $4 AND (last_heartbeat_at IS NULL OR last_heartbeat_at <= $1)',
+      [heartbeatAt, 'online', daemonVersion, id],
+    );
   } else {
-    await db.execute('UPDATE servers SET last_heartbeat_at = $1, status = $2 WHERE id = $3', [Date.now(), 'online', id]);
+    await db.execute(
+      'UPDATE servers SET last_heartbeat_at = $1, status = $2 WHERE id = $3 AND (last_heartbeat_at IS NULL OR last_heartbeat_at <= $1)',
+      [heartbeatAt, 'online', id],
+    );
   }
 }
 

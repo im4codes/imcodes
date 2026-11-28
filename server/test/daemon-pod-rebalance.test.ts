@@ -163,8 +163,10 @@ function makeStatefulServersDb(options: {
     status: string;
     last_heartbeat_at: number | null;
     connected_providers: Record<string, boolean>;
+    auditLogs: number;
   };
   onHeartbeatQuery?: () => Promise<void>;
+  onCronOfflineExecute?: () => Promise<void>;
 }) {
   const tokenHash = sha256Hex(options.secret);
   const row = options.sharedRow ?? {
@@ -178,6 +180,7 @@ function makeStatefulServersDb(options: {
     status: 'offline' as string,
     last_heartbeat_at: null as number | null,
     connected_providers: {} as Record<string, boolean>,
+    auditLogs: 0,
   };
 
   const db = {
@@ -199,11 +202,19 @@ function makeStatefulServersDb(options: {
       return [];
     },
     execute: async (sql: string, params: unknown[] = []) => {
-      if (sql.includes('UPDATE servers SET last_heartbeat_at')) {
+      if (sql.includes('UPDATE servers SET') && sql.includes('last_heartbeat_at = $1')) {
         if (options.onHeartbeatQuery) {
           await options.onHeartbeatQuery();
         }
-        row.last_heartbeat_at = Number(params[0]);
+        const incomingHb = Number(params[0]);
+        if (
+          sql.includes('last_heartbeat_at IS NULL OR last_heartbeat_at <= $1')
+          && row.last_heartbeat_at !== null
+          && row.last_heartbeat_at > incomingHb
+        ) {
+          return { changes: 0 };
+        }
+        row.last_heartbeat_at = incomingHb;
         row.status = String(params[1]);
         return { changes: 1 };
       }
@@ -212,7 +223,22 @@ function makeStatefulServersDb(options: {
         return { changes: 1 };
       }
       if (sql.includes("UPDATE servers SET status = 'offline' WHERE id = $1")) {
+        if (options.onCronOfflineExecute) {
+          await options.onCronOfflineExecute();
+        }
+        if (sql.includes("AND status = 'online'")) {
+          const cutoff = Number(params[1]);
+          if (row.status !== 'online' || (row.last_heartbeat_at !== null && row.last_heartbeat_at >= cutoff)) {
+            return { changes: 0 };
+          }
+        }
         row.status = 'offline';
+        return { changes: 1 };
+      }
+      if (sql.includes('INSERT INTO audit_log')) {
+        if ('auditLogs' in row) {
+          (row as { auditLogs: number }).auditLogs += 1;
+        }
         return { changes: 1 };
       }
       if (sql.includes('UPDATE servers SET connected_providers') && sql.includes("'{}'::jsonb WHERE")) {
@@ -840,21 +866,53 @@ describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
     hbGateA.resolve();
     await flushAsync();
 
-    // Pod A's 1012 rebalance close must NOT emit offline status, provider clear, or globalTaskHub offline notify.
+    // Pod A's 1012 rebalance close & delayed heartbeat must NOT overwrite Pod B's online status, fresher heartbeat, or providers.
     expect(dbA.row.status).toBe('online');
+    expect(dbA.row.last_heartbeat_at).toBe(7_050);
     expect(dbA.row.connected_providers).toEqual({ 'claude-code': true });
     expect(notifySpy.mock.calls.some(([, sid, online]) => sid === serverId && online === false)).toBe(false);
 
-    // 4. Un-reconnected 1012 close: if a server closed via 1012 never reconnects anywhere,
-    // healthCheckCron marks it offline once its heartbeat expires (> 10 minutes).
+    // 4. healthCheckCron race: cron reads stale row (7_050 < cutoff), Pod B reconnects & updates heartbeat to 620_000
+    // before cron's UPDATE executes; cron UPDATE must match 0 rows and emit 0 audit events.
+    nowMs = 620_000;
+    const cronEntered = createDeferred<void>();
+    const cronGate = createDeferred<void>();
+    const dbCron = makeStatefulServersDb({
+      serverId,
+      secret: 'secret',
+      sharedRow: dbA.row,
+      onCronOfflineExecute: async () => {
+        cronEntered.resolve();
+        await cronGate.promise;
+      },
+    });
+    const cronRacePromise = healthCheckCron({ DB: dbCron } as unknown as Env);
+    await cronEntered.promise;
+
+    // Pod B receives reconnect & writes fresh heartbeat 620_000 + provider status while cron UPDATE is in-flight.
+    WsBridge.getAll().delete(serverId);
+    const { bridge: bridgeCronB } = await connectAuthenticatedDaemon(serverId, 'secret', dbB);
+    expect(dbA.row.last_heartbeat_at).toBe(620_000);
+    expect(dbA.row.status).toBe('online');
+    cronGate.resolve();
+    await cronRacePromise;
+
+    expect(dbA.row.status).toBe('online');
+    expect(dbA.row.last_heartbeat_at).toBe(620_000);
+    expect(dbA.row.connected_providers).toEqual({ 'claude-code': true });
+    expect(dbA.row.auditLogs).toBe(0);
+
+    // 5. Un-reconnected 1012 close: if a server closed via 1012 never reconnects anywhere,
+    // healthCheckCron marks it offline once its heartbeat expires (> 10 minutes) and writes 1 audit record.
     nowMs += 10_000;
-    expect(bridgeB.rebalanceDaemonConnection(5_000, 'pod-c', nowMs)).toBe(true);
+    expect(bridgeCronB.rebalanceDaemonConnection(5_000, 'pod-c', nowMs)).toBe(true);
     await flushAsync();
     expect(dbA.row.status).toBe('online'); // not prematurely marked offline by rebalance close
 
     nowMs += 10 * 60 * 1000 + 1; // past HEARTBEAT_TIMEOUT_MS (10 minutes)
     await healthCheckCron({ DB: dbB } as unknown as Env);
     expect(dbA.row.status).toBe('offline');
+    expect(dbA.row.auditLogs).toBe(1);
 
     // 5. Normal non-rebalance socket close still marks status offline, clears providers, and emits global offline notify immediately.
     WsBridge.getAll().delete(serverId);

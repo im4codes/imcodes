@@ -15,13 +15,17 @@ export async function healthCheckCron(env: Env): Promise<void> {
     [cutoff],
   );
 
+  let markedOffline = 0;
   for (const server of staleServers) {
-    logger.info({ serverId: server.id, serverName: server.name }, 'Server heartbeat timeout — marking offline');
-
-    await env.DB.execute(
-      "UPDATE servers SET status = 'offline' WHERE id = $1",
-      [server.id],
+    const result = await env.DB.execute(
+      "UPDATE servers SET status = 'offline' WHERE id = $1 AND status = 'online' AND (last_heartbeat_at IS NULL OR last_heartbeat_at < $2)",
+      [server.id, cutoff],
     );
+    const changes = (result as { changes?: number } | undefined)?.changes ?? 1;
+    if (changes <= 0) continue;
+
+    markedOffline += 1;
+    logger.info({ serverId: server.id, serverName: server.name }, 'Server heartbeat timeout — marking offline');
 
     await logAudit(
       {
@@ -34,5 +38,5 @@ export async function healthCheckCron(env: Env): Promise<void> {
     );
   }
 
-  logger.info({ markedOffline: staleServers.length }, 'Health check cron complete');
+  logger.info({ markedOffline }, 'Health check cron complete');
 }

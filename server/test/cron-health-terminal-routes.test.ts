@@ -53,8 +53,16 @@ describe('healthCheckCron', () => {
       [expect.any(Number)],
     );
     expect(execute).toHaveBeenCalledTimes(2);
-    expect(execute).toHaveBeenNthCalledWith(1, "UPDATE servers SET status = 'offline' WHERE id = $1", ['srv-1']);
-    expect(execute).toHaveBeenNthCalledWith(2, "UPDATE servers SET status = 'offline' WHERE id = $1", ['srv-2']);
+    expect(execute).toHaveBeenNthCalledWith(
+      1,
+      "UPDATE servers SET status = 'offline' WHERE id = $1 AND status = 'online' AND (last_heartbeat_at IS NULL OR last_heartbeat_at < $2)",
+      ['srv-1', expect.any(Number)],
+    );
+    expect(execute).toHaveBeenNthCalledWith(
+      2,
+      "UPDATE servers SET status = 'offline' WHERE id = $1 AND status = 'online' AND (last_heartbeat_at IS NULL OR last_heartbeat_at < $2)",
+      ['srv-2', expect.any(Number)],
+    );
     expect(logAuditMock).toHaveBeenCalledWith(
       {
         userId: 'user-1',
