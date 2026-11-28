@@ -390,7 +390,7 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(android).toContain(`notifyListeners("${STREAMING_SPEECH_TTS_STATE_EVENT}"`);
     const iosInfoPlist = await readFile(new URL('../../web/ios/App/App/Info.plist', import.meta.url), 'utf8');
     expect(iosInfoPlist).toContain('<string>remote-notification</string>');
-    expect(iosInfoPlist).toContain('<string>audio</string>');
+    expect(iosInfoPlist).not.toContain('<string>audio</string>');
     expect(ios).toContain('enum TtsBackgroundLifecyclePolicy');
     expect(ios).toContain('allowWarmHold && audioSessionActive');
     const didEnterBackgroundBody = ios.slice(ios.indexOf('func didEnterBackground('), ios.indexOf('func engineConfigurationChanged('));
