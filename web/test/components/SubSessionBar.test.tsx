@@ -1569,25 +1569,55 @@ describe('SubSessionBar', () => {
       fireEvent.touchEnd(first);
       expect(vibrate).not.toHaveBeenCalled();
 
-      // Long-press activation -> medium (20ms), swap onto sub-b -> light (10ms) once even with jitter over sub-b, then sub-c -> light (10ms)
+      // Long-press activation -> medium (20ms), swap onto sub-b -> light (10ms) once even with jitter over sub-b, then sub-c -> light (10ms), drop commit -> success (18ms)
       fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
       act(() => { vi.advanceTimersByTime(401); });
-      expect(vibrate).toHaveBeenCalledTimes(1);
-      expect(vibrate).toHaveBeenLastCalledWith(20);
+      expect(vibrate.mock.calls).toEqual([[20]]);
 
       currentOver = second;
       fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
       fireEvent.touchMove(first, { touches: [{ clientX: 22, clientY: 10 }] });
-      expect(vibrate).toHaveBeenCalledTimes(2);
-      expect(vibrate).toHaveBeenLastCalledWith(10);
+      expect(vibrate.mock.calls).toEqual([[20], [10]]);
 
       currentOver = third;
       fireEvent.touchMove(first, { touches: [{ clientX: 40, clientY: 10 }] });
-      expect(vibrate).toHaveBeenCalledTimes(3);
-      expect(vibrate).toHaveBeenLastCalledWith(10);
+      expect(vibrate.mock.calls).toEqual([[20], [10], [10]]);
 
       fireEvent.touchEnd(first);
-      expect(vibrate).toHaveBeenCalledTimes(3);
+      expect(vibrate.mock.calls).toEqual([[20], [10], [10], [18]]);
+
+      // Dragging >8px without swapping (order unchanged) does NOT emit success on drop
+      vibrate.mockClear();
+      currentOver = first;
+      fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(401); });
+      fireEvent.touchMove(first, { touches: [{ clientX: 25, clientY: 10 }] });
+      fireEvent.touchEnd(first);
+      expect(vibrate.mock.calls).toEqual([[20]]);
+
+      // Swapping and then swapping back to original order does NOT emit success on drop
+      vibrate.mockClear();
+      const draggedCard = view.container.querySelector('[data-sub-id="sub-b"]') as HTMLElement;
+      const targetCard = view.container.querySelector('[data-sub-id="sub-c"]') as HTMLElement;
+      currentOver = targetCard;
+      fireEvent.touchStart(draggedCard, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(401); });
+      fireEvent.touchMove(draggedCard, { touches: [{ clientX: 25, clientY: 10 }] }); // swaps sub-b (idx 0) with sub-c (idx 1) -> [sub-c, sub-b, sub-a]
+      currentOver = draggedCard;
+      fireEvent.touchMove(draggedCard, { touches: [{ clientX: 15, clientY: 10 }] }); // resets lastSwapOverId
+      currentOver = targetCard;
+      fireEvent.touchMove(draggedCard, { touches: [{ clientX: 20, clientY: 10 }] }); // swaps back -> [sub-b, sub-c, sub-a]
+      fireEvent.touchEnd(draggedCard);
+      expect(vibrate.mock.calls).toEqual([[20], [10], [10]]);
+
+      // touchCancel after swap does NOT emit success
+      vibrate.mockClear();
+      currentOver = second;
+      fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(401); });
+      fireEvent.touchMove(first, { touches: [{ clientX: 25, clientY: 10 }] });
+      fireEvent.touchCancel(first);
+      expect(vibrate.mock.calls).toEqual([[20], [10]]);
 
       // Safe no-op when navigator.vibrate is unavailable
       Object.defineProperty(navigator, 'vibrate', { configurable: true, value: undefined });

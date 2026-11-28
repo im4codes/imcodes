@@ -905,7 +905,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     startY: number;
     moved: boolean;
     lastSwapOverId: string | null;
-  }>({ id: null, active: false, startX: 0, startY: 0, moved: false, lastSwapOverId: null });
+    initialOrder: string[] | null;
+  }>({ id: null, active: false, startX: 0, startY: 0, moved: false, lastSwapOverId: null, initialOrder: null });
   const expandedTouchRef = useRef<{
     id: string | null;
     startX: number;
@@ -1409,6 +1410,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       td.lastSwapOverId = null;
       getEntryGestureController(id).cancelTouchSequence();
       const initialOrder = orderedSessionsRef.current.map((s) => s.id);
+      td.initialOrder = initialOrder;
       dragOrderRef.current = initialOrder;
       setDragOrder(initialOrder);
       const btn = el.querySelector(`[data-sub-id="${id}"]`) as HTMLElement | null;
@@ -1461,6 +1463,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       td.active = false;
       td.moved = false;
       td.lastSwapOverId = null;
+      td.initialOrder = null;
       td.startX = 0;
       td.startY = 0;
     };
@@ -1477,7 +1480,18 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }
         el.style.overflowX = '';
         getEntryGestureController(td.id).cancelTouchSequence();
-        if (moved && dragOrderRef.current) syncOrderToServer(dragOrderRef.current);
+        if (moved && dragOrderRef.current) {
+          syncOrderToServer(dragOrderRef.current);
+          const initialOrder = td.initialOrder;
+          const orderChanged = Boolean(
+            initialOrder
+            && dragOrderRef.current.length === initialOrder.length
+            && dragOrderRef.current.some((id, idx) => id !== initialOrder[idx]),
+          );
+          if (orderChanged) {
+            triggerHaptic('success', 18);
+          }
+        }
       } else if (endedId && moved) {
         getEntryGestureController(endedId).cancelTouchSequence();
       } else if (endedId) {
@@ -1521,6 +1535,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       td.id = null;
       td.active = false;
       td.moved = false;
+      td.lastSwapOverId = null;
+      td.initialOrder = null;
       el.removeEventListener('touchstart', onStart);
       el.removeEventListener('touchmove', onMove);
       el.removeEventListener('touchend', onEnd);

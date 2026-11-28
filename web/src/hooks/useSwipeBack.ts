@@ -4,9 +4,20 @@
  */
 import { useEffect, useRef } from 'preact/hooks';
 import type { RefObject } from 'preact';
+import { triggerHaptic } from '../util/haptics.js';
 
 const EDGE_THRESHOLD = 30;
 const SWIPE_MIN_DISTANCE = 80;
+
+function findTouch(list: TouchList, id: number | null): Touch | null {
+  if (list.length === 0) return null;
+  if (id === null) return list[0] ?? null;
+  for (let i = 0; i < list.length; i++) {
+    const item = list[i];
+    if (item && item.identifier === id) return item;
+  }
+  return null;
+}
 
 export function useSwipeBack(onBack: (() => void) | null | undefined): RefObject<HTMLDivElement> {
   const ref = useRef<HTMLDivElement>(null);
@@ -19,6 +30,8 @@ export function useSwipeBack(onBack: (() => void) | null | undefined): RefObject
     let startX = 0;
     let startY = 0;
     let tracking = false;
+    let armed = false;
+    let activeTouchId: number | null = null;
 
     function createOverlay(y: number) {
       // SVG wave
@@ -88,6 +101,13 @@ export function useSwipeBack(onBack: (() => void) | null | undefined): RefObject
 
       // Color intensifies as you pull further
       const triggered = progress >= 1;
+      if (!armed && triggered) {
+        armed = true;
+        triggerHaptic('medium', 16);
+      } else if (armed && !triggered) {
+        armed = false;
+        triggerHaptic('light', 10);
+      }
       parts.path.setAttribute('fill',
         triggered ? 'rgba(52, 211, 153, 0.3)' : `rgba(99, 102, 241, ${0.15 + progress * 0.2})`);
 
@@ -122,24 +142,47 @@ export function useSwipeBack(onBack: (() => void) | null | undefined): RefObject
       setTimeout(() => { s.remove(); a.remove(); }, 300);
     }
 
+    function cancelTracking() {
+      if (!tracking) return;
+      tracking = false;
+      armed = false;
+      activeTouchId = null;
+      cleanup(false);
+    }
+
     const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length !== 1) {
+        cancelTracking();
+        return;
+      }
       const touch = e.touches[0];
+      if (!touch) return;
       if (touch.clientX <= EDGE_THRESHOLD) {
+        cancelTracking();
         startX = touch.clientX;
         startY = touch.clientY;
         tracking = true;
+        armed = false;
+        activeTouchId = typeof touch.identifier === 'number' ? touch.identifier : null;
         parts = createOverlay(touch.clientY);
       }
     };
 
     const onTouchMove = (e: TouchEvent) => {
       if (!tracking) return;
-      const touch = e.touches[0];
+      if (e.touches.length !== 1) {
+        cancelTracking();
+        return;
+      }
+      const touch = findTouch(e.touches, activeTouchId);
+      if (!touch) {
+        cancelTracking();
+        return;
+      }
       const dx = touch.clientX - startX;
       const dy = Math.abs(touch.clientY - startY);
       if (dy > dx * 1.2 && dx < 30) {
-        tracking = false;
-        cleanup(false);
+        cancelTracking();
         return;
       }
       update(Math.max(0, dx), touch.clientY);
@@ -147,22 +190,44 @@ export function useSwipeBack(onBack: (() => void) | null | undefined): RefObject
 
     const onTouchEnd = (e: TouchEvent) => {
       if (!tracking) return;
+      if (e.touches.length > 0) {
+        cancelTracking();
+        return;
+      }
+      const touch = findTouch(e.changedTouches, activeTouchId);
       tracking = false;
-      const touch = e.changedTouches[0];
+      armed = false;
+      activeTouchId = null;
+      if (!touch) {
+        cleanup(false);
+        return;
+      }
       const dx = touch.clientX - startX;
       const dy = Math.abs(touch.clientY - startY);
       const triggered = dx >= SWIPE_MIN_DISTANCE && dx > dy * 1.5;
       cleanup(triggered);
-      if (triggered) onBack();
+      if (triggered) {
+        triggerHaptic('success', 18);
+        onBack();
+      }
+    };
+
+    const onTouchCancel = () => {
+      cancelTracking();
     };
 
     el.addEventListener('touchstart', onTouchStart, { passive: true });
     el.addEventListener('touchmove', onTouchMove, { passive: true });
     el.addEventListener('touchend', onTouchEnd, { passive: true });
+    el.addEventListener('touchcancel', onTouchCancel, { passive: true });
     return () => {
+      tracking = false;
+      armed = false;
+      activeTouchId = null;
       el.removeEventListener('touchstart', onTouchStart);
       el.removeEventListener('touchmove', onTouchMove);
       el.removeEventListener('touchend', onTouchEnd);
+      el.removeEventListener('touchcancel', onTouchCancel);
       if (parts) { parts.svg.remove(); parts.arrow.remove(); parts = null; }
     };
   }, [onBack]);

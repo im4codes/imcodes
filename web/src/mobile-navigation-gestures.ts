@@ -396,6 +396,10 @@ export class TwoFingerSwipeTracker {
   private activeNotified = false;
   private lastCommittedDirection: MobileNavigationDirection | null = null;
   private lastCommittedStep = 0;
+  private lastFeedbackDirection: MobileNavigationDirection | null = null;
+  private lastFeedbackAction: MobileNavigationAction | null = null;
+  private lastFeedbackStep = 0;
+  private lastFeedbackArmed = false;
   private lastTrigger: MobileNavigationTrigger | null = null;
   private readonly doc?: Document;
   private readonly canTrack: (target: EventTarget | null | undefined) => boolean;
@@ -498,6 +502,72 @@ export class TwoFingerSwipeTracker {
     this.lastCommittedStep = 0;
   }
 
+  private clearFeedbackSnapshot(): void {
+    this.lastFeedbackDirection = null;
+    this.lastFeedbackAction = null;
+    this.lastFeedbackStep = 0;
+    this.lastFeedbackArmed = false;
+  }
+
+  private recordFeedbackSnapshot(progress: MobileNavigationGestureProgress | null): void {
+    if (!progress) {
+      this.clearFeedbackSnapshot();
+      return;
+    }
+    this.lastFeedbackDirection = progress.direction;
+    this.lastFeedbackAction = progress.action;
+    this.lastFeedbackStep = progress.step;
+    this.lastFeedbackArmed = progress.armed;
+  }
+
+  private emitStateTransitionHaptic(progress: MobileNavigationGestureProgress | null): void {
+    if (!progress) return;
+    const mode = progress.mode ?? 'long_press';
+
+    if (mode === 'direct_horizontal') {
+      const prevArmed = this.lastFeedbackArmed;
+      const prevAction = this.lastFeedbackAction;
+      const nextArmed = progress.armed;
+      const nextAction = progress.action;
+      const directionFlipped = Boolean(
+        prevAction
+        && nextAction
+        && prevAction !== nextAction
+        && progress.maxSteps > 0,
+      );
+
+      if (!prevArmed && nextArmed) {
+        triggerHaptic('medium', 16);
+      } else if (prevArmed && !nextArmed) {
+        triggerHaptic('light', 10);
+      } else if (directionFlipped) {
+        triggerHaptic(nextArmed ? 'medium' : 'selection', nextArmed ? 16 : 12);
+      } else if (prevAction === null && nextAction !== null && progress.maxSteps > 0) {
+        triggerHaptic('light', 10);
+      }
+
+      this.recordFeedbackSnapshot(progress);
+      return;
+    }
+
+    const prevStep = this.lastFeedbackStep;
+    const prevDir = this.lastFeedbackDirection;
+    const nextStep = progress.step;
+    const nextDir = progress.direction;
+
+    if (nextStep >= 1 && (prevStep === 0 || (prevDir !== null && nextDir !== prevDir))) {
+      triggerHaptic('medium', 16);
+    } else if (prevStep >= 1 && nextStep >= 1 && nextStep !== prevStep) {
+      triggerHaptic('selection', 12);
+    } else if (prevStep >= 1 && nextStep === 0) {
+      triggerHaptic('light', 10);
+    } else if (nextStep === 0 && nextDir !== null && nextDir !== prevDir && progress.maxSteps > 0) {
+      triggerHaptic('light', 10);
+    }
+
+    this.recordFeedbackSnapshot(progress);
+  }
+
   private findTouchById(
     touches: ArrayLike<TouchPointSnapshot> | undefined,
     identifier: number | null,
@@ -546,6 +616,7 @@ export class TwoFingerSwipeTracker {
     this.clearPendingOneFinger();
     this.phase = phase;
     this.clearTrackedPoints();
+    this.clearFeedbackSnapshot();
     this.snapshotLockedTouches(event);
     this.emitProgress(null);
     if (phase === 'locked_out') {
@@ -775,6 +846,7 @@ export class TwoFingerSwipeTracker {
     this.clearPendingOneFinger();
     this.phase = 'idle';
     this.clearTrackedPoints();
+    this.clearFeedbackSnapshot();
     this.lockedTouches.clear();
     this.emitProgress(null);
     this.setActive(false);
@@ -864,7 +936,16 @@ export class TwoFingerSwipeTracker {
         this.phase = 'direct_horizontal';
         this.setActive(true);
         const evaluation = this.evaluateTrackedState(true);
-        this.emitProgress(evaluation.progress);
+        const initialProgress = evaluation.progress;
+        if (initialProgress) {
+          if (initialProgress.armed) {
+            triggerHaptic('medium', 16);
+          } else if (initialProgress.action && initialProgress.maxSteps > 0) {
+            triggerHaptic('light', 10);
+          }
+        }
+        this.recordFeedbackSnapshot(initialProgress);
+        this.emitProgress(initialProgress);
         return null;
       }
 
@@ -915,6 +996,7 @@ export class TwoFingerSwipeTracker {
         triggerHaptic('medium', 20);
       }
       const evaluation = this.evaluateTrackedState();
+      this.recordFeedbackSnapshot(evaluation.progress);
       this.emitProgress(evaluation.progress);
       return null;
     }
@@ -940,6 +1022,7 @@ export class TwoFingerSwipeTracker {
     }
     this.updateTrackedPositions(event.touches);
     const evaluation = this.evaluateTrackedState(this.phase === 'direct_horizontal');
+    this.emitStateTransitionHaptic(evaluation.progress);
     this.emitProgress(evaluation.progress);
     return null;
   }
@@ -982,6 +1065,7 @@ export class TwoFingerSwipeTracker {
       };
       this.lastTrigger = trigger;
       this.reset();
+      triggerHaptic('success', 18);
       return trigger;
     }
 

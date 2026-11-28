@@ -138,44 +138,176 @@ describe('mobile-navigation-gestures', () => {
     expect(progressEvents.at(-1)).toBeNull();
   });
 
-  it('triggers medium haptic once when 1-finger long-press actually enters drag tracking, not on arming alone or direct swipe', () => {
+  it('triggers distinct edge-triggered haptics across long-press and direct horizontal state transitions, coalesced per frame', () => {
     vi.useFakeTimers();
     const vibrate = vi.fn(() => true);
     const originalVibrateDesc = Object.getOwnPropertyDescriptor(navigator, 'vibrate');
     Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
 
     try {
-      const tracker = new TwoFingerSwipeTracker({ viewportHeight: 667 });
+      const tracker = new TwoFingerSwipeTracker({ viewportHeight: 844 });
 
-      // Long-press timer reaching long_press_ready without drag must NOT vibrate
+      // 1) Long-press timer reaching long_press_ready without drag must NOT vibrate
       tracker.onTouchStart({ touches: [{ identifier: 1, clientX: 160, clientY: 300 }] });
       vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
       expect(vibrate).not.toHaveBeenCalled();
 
-      // Moving past dragStartPx transitions long_press_ready -> tracking and vibrates once
+      // Drag past dragStartPx into unarmed step=0 -> medium (20ms) once
       tracker.onTouchMove({
         touches: [{ identifier: 1, clientX: 160 + MOBILE_LONG_PRESS_DRAG_START_PX + 4, clientY: 300 }],
       });
-      expect(vibrate).toHaveBeenCalledTimes(1);
-      expect(vibrate).toHaveBeenCalledWith(20);
+      expect(vibrate.mock.calls).toEqual([[20]]);
 
-      // Additional moves and release do not repeat vibrate
-      tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 230, clientY: 300 }] });
-      tracker.evaluateTouchEnd({
+      // Moving further while staying unarmed in same direction does not repeat
+      tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 196, clientY: 300 }] });
+      expect(vibrate.mock.calls).toEqual([[20]]);
+
+      // Cross step=1 threshold (56px) -> medium (16ms); staying in step=1 does not repeat
+      tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 224, clientY: 300 }] }); // dx=64
+      tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 230, clientY: 300 }] }); // dx=70
+      expect(vibrate.mock.calls).toEqual([[20], [16]]);
+
+      // Cross step=2 (100px) -> selection (12ms), step=3 (144px) -> selection (12ms)
+      tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 266, clientY: 300 }] }); // dx=106 -> step 2
+      tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 310, clientY: 300 }] }); // dx=150 -> step 3
+      expect(vibrate.mock.calls).toEqual([[20], [16], [12], [12]]);
+
+      // Jitter inside step-3 hysteresis (>= 144 - 8 = 136px) does not buzz
+      tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 298, clientY: 300 }] }); // dx=138 -> still step 3
+      expect(vibrate.mock.calls).toEqual([[20], [16], [12], [12]]);
+
+      // Drop back to step=2 (< 136px) -> selection (12ms)
+      tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 290, clientY: 300 }] }); // dx=130 -> step 2
+      expect(vibrate.mock.calls).toEqual([[20], [16], [12], [12], [12]]);
+
+      // Pull back inside primary threshold (< 48px, step 2 -> 0) -> light (10ms)
+      tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 190, clientY: 300 }] }); // dx=30 -> step 0
+      expect(vibrate.mock.calls).toEqual([[20], [16], [12], [12], [12], [10]]);
+
+      // Change direction while unarmed (right -> up) -> light (10ms), then arm up -> medium (16ms), release -> success (18ms)
+      tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 160, clientY: 270 }] }); // dy=-30 -> up, step 0
+      tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 160, clientY: 230 }] }); // dy=-70 -> up, step 1
+      expect(tracker.evaluateTouchEnd({
         touches: [],
-        changedTouches: [{ identifier: 1, clientX: 230, clientY: 300 }],
-      });
-      expect(vibrate).toHaveBeenCalledTimes(1);
+        changedTouches: [{ identifier: 1, clientX: 160, clientY: 230 }],
+      })).toEqual({ action: 'serverPrev', step: 1 });
+      expect(vibrate.mock.calls).toEqual([[20], [16], [12], [12], [12], [10], [10], [16], [18]]);
 
-      // Direct horizontal swipe without long-press does NOT vibrate
+      // 2) Single-frame jump from long_press_ready directly to step=2 emits ONLY ONE haptic (20ms), then success on release
       vibrate.mockClear();
-      tracker.onTouchStart({ touches: [{ identifier: 2, clientX: 160, clientY: 300 }] });
-      tracker.onTouchMove({ touches: [{ identifier: 2, clientX: 230, clientY: 300 }] });
-      tracker.evaluateTouchEnd({
+      tracker.onTouchStart({ touches: [{ identifier: 2, clientX: 160, clientY: 400 }] });
+      vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
+      tracker.onTouchMove({ touches: [{ identifier: 2, clientX: 160, clientY: 280 }] }); // dy=-120 -> step 2
+      expect(vibrate.mock.calls).toEqual([[20]]);
+      expect(tracker.evaluateTouchEnd({
         touches: [],
-        changedTouches: [{ identifier: 2, clientX: 230, clientY: 300 }],
+        changedTouches: [{ identifier: 2, clientX: 160, clientY: 280 }],
+      })).toEqual({ action: 'serverPrev', step: 2 });
+      expect(vibrate.mock.calls).toEqual([[20], [18]]);
+
+      // 3) Disarmed release, touchcancel, multi-finger lockout, and unavailable direction (maxSteps=0) emit NO commit/arm haptics
+      vibrate.mockClear();
+      tracker.onTouchStart({ touches: [{ identifier: 3, clientX: 160, clientY: 300 }] });
+      vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
+      tracker.onTouchMove({ touches: [{ identifier: 3, clientX: 160, clientY: 270 }] }); // tracking start (20)
+      tracker.onTouchEnd({ touches: [], changedTouches: [{ identifier: 3, clientX: 160, clientY: 270 }] }); // disarmed -> no 18
+      expect(vibrate.mock.calls).toEqual([[20]]);
+
+      vibrate.mockClear();
+      tracker.onTouchStart({ touches: [{ identifier: 4, clientX: 160, clientY: 300 }] });
+      vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
+      tracker.onTouchMove({ touches: [{ identifier: 4, clientX: 160, clientY: 220 }] }); // tracking start (20)
+      tracker.onTouchCancel(); // cancel -> no 18
+      expect(vibrate.mock.calls).toEqual([[20]]);
+
+      vibrate.mockClear();
+      const lockedTracker = new TwoFingerSwipeTracker({
+        viewportHeight: 844,
+        getAvailableSteps: () => 0,
       });
+      lockedTracker.onTouchStart({ touches: [{ identifier: 5, clientX: 160, clientY: 300 }] });
+      vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
+      lockedTracker.onTouchMove({ touches: [{ identifier: 5, clientX: 180, clientY: 300 }] }); // tracking start (20)
+      lockedTracker.onTouchMove({ touches: [{ identifier: 5, clientX: 250, clientY: 300 }] }); // maxSteps=0 -> no arm haptic
+      lockedTracker.onTouchMove({ touches: [{ identifier: 5, clientX: 160, clientY: 210 }] }); // maxSteps=0 -> no dir/arm haptic
+      expect(lockedTracker.evaluateTouchEnd({ touches: [] })).toBeNull();
+      expect(vibrate.mock.calls).toEqual([[20]]);
+
+      // 4) Direct horizontal swipe inside .chat-view: engage -> arm -> disarm -> flip -> arm -> commit; vertical scroll & maxSteps=0 silent
+      const chatPane = document.createElement('div');
+      chatPane.className = 'chat-view';
+      document.body.appendChild(chatPane);
+
+      const directTracker = new TwoFingerSwipeTracker({
+        viewportWidth: 390,
+        canTrack: () => true,
+        getAvailableSteps: (dir) => (dir === 'up' || dir === 'down' ? 0 : 1),
+      });
+
+      // Normal vertical scroll inside .chat-view -> ZERO haptics
+      vibrate.mockClear();
+      directTracker.onTouchStart({ touches: [{ identifier: 10, clientX: 200, clientY: 300, target: chatPane }] });
+      directTracker.onTouchMove({ touches: [{ identifier: 10, clientX: 200, clientY: 200, target: chatPane }] });
+      directTracker.evaluateTouchEnd({ touches: [], changedTouches: [{ identifier: 10, clientX: 200, clientY: 200, target: chatPane }] });
       expect(vibrate).not.toHaveBeenCalled();
+
+      // Unavailable horizontal target -> ZERO haptics
+      const blockedDirect = new TwoFingerSwipeTracker({
+        viewportWidth: 390,
+        getAvailableSteps: () => 0,
+      });
+      blockedDirect.onTouchStart({ touches: [{ identifier: 11, clientX: 280, clientY: 300, target: chatPane }] });
+      blockedDirect.onTouchMove({ touches: [{ identifier: 11, clientX: 120, clientY: 300, target: chatPane }] });
+      blockedDirect.evaluateTouchEnd({ touches: [], changedTouches: [{ identifier: 11, clientX: 120, clientY: 300, target: chatPane }] });
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Full direct horizontal lifecycle: engage (10) -> arm (16) -> disarm (10) -> flip unarmed (12) -> arm (16) -> commit (18)
+      directTracker.onTouchStart({ touches: [{ identifier: 12, clientX: 200, clientY: 300, target: chatPane }] });
+      directTracker.onTouchMove({ touches: [{ identifier: 12, clientX: 170, clientY: 300, target: chatPane }] }); // dx=-30 -> engage light (10)
+      directTracker.onTouchMove({ touches: [{ identifier: 12, clientX: 80, clientY: 300, target: chatPane }] }); // dx=-120 -> arm medium (16)
+      directTracker.onTouchMove({ touches: [{ identifier: 12, clientX: 140, clientY: 300, target: chatPane }] }); // dx=-60 -> disarm light (10)
+      directTracker.onTouchMove({ touches: [{ identifier: 12, clientX: 240, clientY: 300, target: chatPane }] }); // dx=+40 -> flip tabPrev selection (12)
+      directTracker.onTouchMove({ touches: [{ identifier: 12, clientX: 320, clientY: 300, target: chatPane }] }); // dx=+120 -> arm medium (16)
+      expect(directTracker.evaluateTouchEnd({
+        touches: [],
+        changedTouches: [{ identifier: 12, clientX: 320, clientY: 300, target: chatPane }],
+      })).toEqual({ action: 'tabPrev', step: 1 });
+      expect(vibrate.mock.calls).toEqual([[10], [16], [10], [12], [16], [18]]);
+
+      // Single-frame jump straight into armed direct_horizontal emits ONLY ONE medium (16ms), then success (18ms) on release
+      vibrate.mockClear();
+      directTracker.onTouchStart({ touches: [{ identifier: 13, clientX: 280, clientY: 300, target: chatPane }] });
+      directTracker.onTouchMove({ touches: [{ identifier: 13, clientX: 140, clientY: 300, target: chatPane }] }); // dx=-140 -> armed immediately
+      expect(vibrate.mock.calls).toEqual([[16]]);
+      expect(directTracker.evaluateTouchEnd({
+        touches: [],
+        changedTouches: [{ identifier: 13, clientX: 140, clientY: 300, target: chatPane }],
+      })).toEqual({ action: 'tabNext', step: 1 });
+      expect(vibrate.mock.calls).toEqual([[16], [18]]);
+
+      // Safe no-op when navigator.vibrate is missing or throws
+      Object.defineProperty(navigator, 'vibrate', {
+        configurable: true,
+        value: () => { throw new Error('blocked'); },
+      });
+      expect(() => {
+        directTracker.onTouchStart({ touches: [{ identifier: 14, clientX: 280, clientY: 300, target: chatPane }] });
+        directTracker.onTouchMove({ touches: [{ identifier: 14, clientX: 140, clientY: 300, target: chatPane }] });
+        directTracker.evaluateTouchEnd({
+          touches: [],
+          changedTouches: [{ identifier: 14, clientX: 140, clientY: 300, target: chatPane }],
+        });
+      }).not.toThrow();
+
+      Object.defineProperty(navigator, 'vibrate', { configurable: true, value: undefined });
+      expect(() => {
+        directTracker.onTouchStart({ touches: [{ identifier: 15, clientX: 280, clientY: 300, target: chatPane }] });
+        directTracker.onTouchMove({ touches: [{ identifier: 15, clientX: 140, clientY: 300, target: chatPane }] });
+        directTracker.evaluateTouchEnd({
+          touches: [],
+          changedTouches: [{ identifier: 15, clientX: 140, clientY: 300, target: chatPane }],
+        });
+      }).not.toThrow();
     } finally {
       if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
       else delete (navigator as unknown as Record<string, unknown>).vibrate;

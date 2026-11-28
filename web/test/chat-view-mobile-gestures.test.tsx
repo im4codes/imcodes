@@ -182,7 +182,7 @@ describe('ChatView mobile navigation gesture isolation', () => {
       });
       expect(actions).toEqual(['serverNext']);
       expect(container.querySelector('.chat-scroll-btn')).toBeNull();
-      expect(vibrate).toHaveBeenCalledTimes(1);
+      expect(vibrate.mock.calls).toEqual([[20], [18]]);
     } finally {
       detach();
       if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
@@ -315,16 +315,16 @@ describe('ChatView mobile navigation gesture isolation', () => {
       expect(container.querySelector('.chat-sel-menu')).toBeNull();
       expect(vibrate).not.toHaveBeenCalled();
 
-      // Dragging same touch past nav threshold then triggers standalone navigation haptic once (20ms)
+      // Dragging same touch past nav threshold triggers standalone navigation haptic once (20ms), then success (18ms) on release
       act(() => {
         dispatchTouch(bubble, 'touchmove', [{ identifier: 1, clientX: 140, clientY: 260, target: bubble }]);
+        expect(vibrate.mock.calls).toEqual([[20]]);
         dispatchTouch(bubble, 'touchend', []);
       });
       expect(actions).toEqual(['serverNext']);
-      expect(vibrate).toHaveBeenCalledTimes(1);
-      expect(vibrate).toHaveBeenCalledWith(20);
+      expect(vibrate.mock.calls).toEqual([[20], [18]]);
 
-      // 2. Subsequent touch with same identifier=1 outside bubble triggers standalone nav haptic once on drag
+      // 2. Subsequent touch with same identifier=1 outside bubble triggers standalone nav haptic once on drag, then success on release
       vibrate.mockClear();
       act(() => {
         dispatchTouch(chatContainer, 'touchstart', [{ identifier: 1, clientX: 140, clientY: 180, target: chatContainer }]);
@@ -333,11 +333,11 @@ describe('ChatView mobile navigation gesture isolation', () => {
       expect(vibrate).not.toHaveBeenCalled();
       act(() => {
         dispatchTouch(chatContainer, 'touchmove', [{ identifier: 1, clientX: 140, clientY: 260, target: chatContainer }]);
+        expect(vibrate.mock.calls).toEqual([[20]]);
         dispatchTouch(chatContainer, 'touchend', []);
       });
       expect(actions).toEqual(['serverNext', 'serverNext']);
-      expect(vibrate).toHaveBeenCalledTimes(1);
-      expect(vibrate).toHaveBeenCalledWith(20);
+      expect(vibrate.mock.calls).toEqual([[20], [18]]);
     } finally {
       detach();
       if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
