@@ -401,9 +401,10 @@ describe('OpenCodeSdkProvider', () => {
     const cancelling = provider.cancel(route).then(() => { settled = true; });
     await vi.waitFor(() => expect(harness.client.session.interrupt).toHaveBeenCalledTimes(1));
 
-    // Delayed prompt execution terminals (and unrelated/auto compaction) before and after 150ms MUST NOT confirm /compact stop!
+    // Delayed prompt execution terminals and unkeyed/auto compaction before and after 150ms MUST NOT confirm /compact stop!
     harness.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1' } });
     harness.queue.push({ type: 'session.compaction.ended', data: { sessionID: 'oc-session-1', reason: 'auto' } });
+    harness.queue.push({ type: 'session.compacted', data: { sessionID: 'oc-session-1' } });
     await new Promise((resolve) => setTimeout(resolve, 220));
     expect(settled).toBe(false);
     expect(errors).toEqual([]);

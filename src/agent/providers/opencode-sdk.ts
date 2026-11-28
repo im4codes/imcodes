@@ -3938,7 +3938,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       | { kind: 'session-idle' }
       | { kind: 'session-error' }
       | { kind: 'prompt-terminal'; correlatedRetry: boolean }
-      | { kind: 'compact-terminal'; compactKind: 'ended' | 'failed' | 'legacy_compacted'; data?: Record<string, any> }
+      | { kind: 'compact-terminal'; compactKind: 'ended' | 'failed'; data?: Record<string, any> }
       | { kind: 'reclaim' },
   ): boolean {
     switch (signal.kind) {
@@ -3968,7 +3968,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       | { kind: 'session-idle' }
       | { kind: 'session-error' }
       | { kind: 'prompt-terminal'; correlatedRetry: boolean }
-      | { kind: 'compact-terminal'; compactKind: 'ended' | 'failed' | 'legacy_compacted'; data?: Record<string, any> }
+      | { kind: 'compact-terminal'; compactKind: 'ended' | 'failed'; data?: Record<string, any> }
       | { kind: 'reclaim' },
   ): boolean {
     const observer = this.cancelTerminalObservers.get(state);
@@ -3991,7 +3991,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   private isMatchingManualCompactionEvent(
     state: OpenCodeSessionState,
     data: Record<string, any> | undefined,
-    kind: 'ended' | 'failed' | 'legacy_compacted',
+    _kind: 'ended' | 'failed',
   ): boolean {
     const cancelledCompact = this.cancelledCompactRequests.get(state);
     const ctx = (!state.cancelled && state.compacting && state.compactRequest)
@@ -4000,9 +4000,6 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         ? cancelledCompact.compactRequest
         : null;
     if (!ctx) return false;
-    if (kind === 'legacy_compacted') {
-      return !ctx.sawV2Compaction;
-    }
     if (data?.reason !== 'manual') return false;
     const eventInputId = safeString(data?.inputID);
     if (eventInputId) return eventInputId === ctx.inputId;
@@ -5003,8 +5000,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.compacted':
-        // Standalone legacy v1 compaction compatibility event (never overrides an active v2 compaction flow).
-        this.recordStopProof(state, { kind: 'compact-terminal', compactKind: 'legacy_compacted', data });
+        // Standalone legacy v1 compaction compatibility event (non-cancelled completion path only; never stop proof).
         if (state.compacting && !state.cancelled && !state.compactRequest?.sawV2Compaction) {
           this.completeCompactOnce(state, event.type);
         }

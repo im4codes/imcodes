@@ -1599,17 +1599,13 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     signal:
       | { kind: 'session-idle' }
       | { kind: 'session-error' }
-      | { kind: 'prompt-terminal' }
-      | { kind: 'compact-terminal' }
       | { kind: 'reclaim' },
   ): boolean {
     const observer = this.cancelTerminalObservers.get(state);
-    const target = this.activeStopCancelTarget(state, observer);
+    this.activeStopCancelTarget(state, observer);
     const matches = signal.kind === 'reclaim'
       || signal.kind === 'session-idle'
-      || signal.kind === 'session-error'
-      || (signal.kind === 'prompt-terminal' && target === 'prompt')
-      || (signal.kind === 'compact-terminal' && target === 'compact');
+      || signal.kind === 'session-error';
     if (!matches) return false;
     if (
       observer
@@ -2115,7 +2111,6 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
         return;
       case 'message.updated':
         if (this.processMessage(state, event.properties?.info)) {
-          this.recordStopProof(state, { kind: 'prompt-terminal' });
           this.completeOnce(state, 'message.updated');
         }
         return;
@@ -2153,7 +2148,6 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
         return;
       }
       case 'session.compacted':
-        this.recordStopProof(state, { kind: 'compact-terminal' });
         if (state.compacting && !state.cancelled) {
           this.completeCompactOnce(state, 'session.compacted');
         }

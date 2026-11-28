@@ -1131,9 +1131,12 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     const hungAbortSignals: AbortSignal[] = [];
     const closedServers: string[] = [];
     const hungPromptCalls: string[] = [];
+    const hungSummarizeCalls: string[] = [];
     const hungQueues = new Map<number, ReturnType<typeof createAsyncQueue<Record<string, any>>>>();
     const hungChildren = new Map<number, InstanceType<typeof EventEmitter> & { exitCode: number | null; signalCode: string | null }>();
     let hangAbortMode = true;
+    let hangSummarizeMode = false;
+    let releaseHungSummarize: (() => void) | null = null;
     let closeRejectForIdx: number | null = null;
     let omitChildExitForIdx: number | null = null;
     let hungSeq = 0;
@@ -1160,6 +1163,13 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
             promptAsync: vi.fn(async () => {
               hungPromptCalls.push(tag);
               return { data: undefined };
+            }),
+            summarize: vi.fn(async () => {
+              hungSummarizeCalls.push(tag);
+              if (hangSummarizeMode) {
+                await new Promise<void>((res) => { releaseHungSummarize = res; });
+              }
+              return { data: true };
             }),
             abort: vi.fn(async (_opts: any, reqOpts?: { signal?: AbortSignal }) => {
               if (reqOpts?.signal) hungAbortSignals.push(reqOpts.signal);
@@ -1194,8 +1204,10 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     });
     const pHungAbort = new OpenCodeSdkProvider();
     const hungDeltas: Array<{ sid: string; text: string }> = [];
+    const hungCompletes: string[] = [];
     const hungErrors: Array<{ sid: string; code: string }> = [];
     pHungAbort.onDelta((sid, d) => hungDeltas.push({ sid, text: d.delta }));
+    pHungAbort.onComplete((sid) => hungCompletes.push(sid));
     pHungAbort.onError((sid, e) => hungErrors.push({ sid, code: e.code }));
     await pHungAbort.connect({ binaryPath: v1Bin } as any);
     const hungA = await pHungAbort.createSession({ sessionKey: 'v1-hung-a', cwd: root });
@@ -1322,8 +1334,56 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
       properties: { sessionID: 'shared-hung-abort-ses' },
     });
     await vi.waitFor(async () => {
-      await pHungAbort.send(hungRetry, 'busy before end');
+      await pHungAbort.send(hungRetry, 'busy before compact cancel');
     });
+    const completesBeforeB5d = hungCompletes.length;
+    hungQueues.get(6)!.push({
+      type: 'message.updated',
+      properties: { info: { id: 'msg-b5d-pre', sessionID: 'shared-hung-abort-ses', role: 'assistant' } },
+    });
+    hungQueues.get(6)!.push({
+      type: 'message.part.updated',
+      properties: { part: { id: 'prt-b5d-pre', sessionID: 'shared-hung-abort-ses', messageID: 'msg-b5d-pre', type: 'text', text: 'ready' } },
+    });
+    hungQueues.get(6)!.push({
+      type: 'session.idle',
+      properties: { sessionID: 'shared-hung-abort-ses' },
+    });
+    await vi.waitFor(() => expect(hungCompletes.length).toBeGreaterThan(completesBeforeB5d));
+
+    // B5d: Cancelling manual /compact in v1 while summarize and abort are hung MUST ignore unkeyed
+    // `session.compacted` (identical between auto and manual compaction in v1) and settle once on `session.idle`.
+    hangSummarizeMode = true;
+    const summarizeCallsBefore = hungSummarizeCalls.length;
+    const compactTurn = pHungAbort.send(hungRetry, '/compact').catch(() => {});
+    await vi.waitFor(() => expect(hungSummarizeCalls.length).toBeGreaterThan(summarizeCallsBefore));
+    let compactCancelSettled = false;
+    const errCountBeforeCompactCancel = hungErrors.length;
+    const compactCancelPending = pHungAbort.cancel(hungRetry).then(() => { compactCancelSettled = true; });
+    hungQueues.get(6)!.push({
+      type: 'session.compacted',
+      properties: { sessionID: 'shared-hung-abort-ses' },
+    });
+    await new Promise((res) => setTimeout(res, 220));
+    expect(compactCancelSettled).toBe(false);
+    expect(hungErrors.slice(errCountBeforeCompactCancel)).toEqual([]);
+    await expect(pHungAbort.send(hungRetry, 'overlap during v1 compact cancel')).rejects.toMatchObject({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: expect.stringContaining('already busy'),
+    });
+    hungQueues.get(6)!.push({
+      type: 'session.idle',
+      properties: { sessionID: 'shared-hung-abort-ses' },
+    });
+    await compactCancelPending;
+    expect(compactCancelSettled).toBe(true);
+    expect(hungErrors.slice(errCountBeforeCompactCancel)).toEqual([
+      expect.objectContaining({ sid: hungRetry, code: PROVIDER_ERROR_CODES.CANCELLED }),
+    ]);
+    hangSummarizeMode = false;
+    releaseHungSummarize?.();
+    await compactTurn;
+    await pHungAbort.send(hungRetry, 'after v1 compact cancel');
 
     // B3: `endSession` on busy route with hung `session.abort` finishes promptly AND still runs child close!
     const endT0 = Date.now();
