@@ -313,26 +313,31 @@ describe('QuickInputPanel — 别名 tab', () => {
     ]);
   });
 
-  it('satisfies CSS contract: .qp-alias-items uses flex-wrap: wrap row flow, .qp-pill.qp-alias-item overrides .qp-pill-custom, and mobile uses min(180px, calc(100vw - 110px))', () => {
+  it('satisfies CSS contract: .qp-alias-items uses 5-column CSS grid on desktop and 3-column on mobile, no ;; prefix, and adaptive mobile cell height', () => {
     const cssPath = resolve(__dirname, '../src/styles.css');
     const cssContent = readFileSync(cssPath, 'utf-8');
 
-    // .qp-alias-items must use horizontal wrapping flex flow
-    expect(cssContent).toMatch(/\.qp-alias-items\s*\{[^}]*display:\s*flex/);
-    expect(cssContent).toMatch(/\.qp-alias-items\s*\{[^}]*flex-direction:\s*row/);
-    expect(cssContent).toMatch(/\.qp-alias-items\s*\{[^}]*flex-wrap:\s*wrap/);
+    // .qp-alias-items must use equal-width CSS Grid (5 columns on desktop)
+    expect(cssContent).toMatch(/\.qp-alias-items\s*\{[^}]*display:\s*grid/);
+    expect(cssContent).toMatch(/\.qp-alias-items\s*\{[^}]*grid-template-columns:\s*repeat\(5,\s*minmax\(0,\s*1fr\)\)/);
 
-    // .qp-pill.qp-alias-item compound selector (0,2,0) must override .qp-pill-custom (0,1,0)
-    // with 8px radius, cyan border, and translucent background
-    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*width:\s*auto/);
-    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*display:\s*inline-flex/);
+    // Mobile media query must use 3 equal-width columns and adaptive taller cells
+    expect(cssContent).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-alias-items\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+    expect(cssContent).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-pill\.qp-alias-item\s*\{[^}]*flex-direction:\s*column/);
+    expect(cssContent).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-pill\.qp-alias-item\s*\{[^}]*min-height:\s*56px/);
+    expect(cssContent).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-pill\.qp-alias-item\s+\.qp-pill-text\s*\{[^}]*white-space:\s*normal/);
+
+    // .qp-pill.qp-alias-item compound selector (0,2,0) overrides .qp-pill-custom (0,1,0)
+    // fills each grid cell with 100% width, min-width: 0, 8px radius, cyan border, and translucent background
+    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*width:\s*100%/);
+    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*min-width:\s*0/);
     expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*border-radius:\s*8px/);
     expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*border:\s*1px solid rgba\(125,211,252,0\.18\)/);
     expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*background:\s*rgba\(15,23,42,0\.72\)/);
-    expect(cssContent).not.toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*(?<![a-z-])width:\s*100%/);
 
-    // Mobile media query must cap text width at min(180px, calc(100vw - 110px)) to prevent 390px expansion
-    expect(cssContent).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-pill\.qp-alias-item\s+\.qp-pill-text\s*\{[^}]*max-width:\s*min\(180px,\s*calc\(100vw\s*-\s*110px\)\)/);
+    // No redundant ';;' prefix pseudo-element on buttons
+    expect(cssContent).not.toContain('.qp-pill.qp-alias-item .qp-pill-text::before');
+    expect(cssContent).not.toMatch(/\.qp-alias-item[^}]*content:\s*['"];;['"]/);
 
     // Quick tab .qp-pill-custom preserves default 999px pill border-radius
     expect(cssContent).toMatch(/\.qp-pill-custom\s*\{[^}]*border-radius:\s*999px/);
