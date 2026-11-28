@@ -2238,20 +2238,111 @@ describe('KimiV2Provider', () => {
     }
   });
 
-  it('registers cwd in base kimi.json preserving metadata/no credentials and fails closed on strictResume when resume fails', async () => {
-    const tmpDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-wd-sync-')));
+  it('cleans up orphaned preset child/config/stale state when strictResume fails, while keeping concurrent bound sessions intact', async () => {
+    const tmpDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-fail-cleanup-')));
+    const baseShareDir = path.join(tmpDir, 'base-share');
+    mkdirSync(baseShareDir, { recursive: true });
+    const origShareEnv = process.env.KIMI_SHARE_DIR;
+    process.env.KIMI_SHARE_DIR = baseShareDir;
+    const { existsSync } = await import('node:fs');
+
+    try {
+      const llm = {
+        provider: 'glm5.3',
+        providerType: 'anthropic' as const,
+        baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+        apiKey: 'secret-fail-key',
+        model: 'glm-5.3-flash',
+        contextWindow: 1_000_000,
+        models: [{ id: 'glm-5.3-flash', contextWindow: 1_000_000 }],
+      };
+
+      // 1) Lone preset session failing strictResume MUST kill its child, delete shareDir, and roll back stale state
+      const connFail1 = makeMockConn({
+        resumeSession: vi.fn(async () => { throw new RequestError(-32002, 'Session not found'); }),
+        newSession: vi.fn(async () => ({ sessionId: 'should-not-create' })),
+      });
+      state.connQueue.push(connFail1);
+      const provider1 = new KimiV2Provider();
+      await provider1.connect({});
+      await expect(provider1.createSession({
+        sessionKey: 'sess-fail-preset',
+        cwd: tmpDir,
+        agentId: 'glm-5.3-flash',
+        resumeId: 'missing-preset-1',
+        strictResume: true,
+        kimiLlm: llm,
+      })).rejects.toThrow();
+
+      expect(connFail1.newSession).not.toHaveBeenCalled();
+      expect(provider1.getSessionDiagnostics('sess-fail-preset')).toBeNull();
+      const failedShareDir = (mockSpawn.mock.calls.at(-1)![2] as { env: NodeJS.ProcessEnv }).env.KIMI_SHARE_DIR!;
+      expect(existsSync(failedShareDir)).toBe(false);
+      expect(mockKillProcessTree).toHaveBeenCalledWith(state.children.at(-1)!, { ownsProcessGroup: true });
+
+      // 2) Same preset route with an active bound session MUST NOT kill the active session when another create fails
+      mockKillProcessTree.mockClear();
+      const connAlive = makeMockConn({
+        newSession: vi.fn(async () => ({ sessionId: 'acp-alive-1' })),
+        resumeSession: vi.fn(async () => { throw new RequestError(-32002, 'Missing second session'); }),
+      });
+      state.connQueue.push(connAlive);
+      const provider2 = new KimiV2Provider();
+      await provider2.connect({});
+      await provider2.createSession({
+        sessionKey: 'sess-alive',
+        cwd: tmpDir,
+        agentId: 'glm-5.3-flash',
+        kimiLlm: llm,
+      });
+      const aliveShareDir = (mockSpawn.mock.calls.at(-1)![2] as { env: NodeJS.ProcessEnv }).env.KIMI_SHARE_DIR!;
+      await expect(provider2.createSession({
+        sessionKey: 'sess-fail-second',
+        cwd: tmpDir,
+        agentId: 'glm-5.3-flash',
+        resumeId: 'missing-second-2',
+        strictResume: true,
+        kimiLlm: llm,
+      })).rejects.toThrow();
+
+      expect(provider2.getSessionDiagnostics('sess-fail-second')).toBeNull();
+      expect(provider2.getSessionDiagnostics('sess-alive')?.connected).toBe(true);
+      expect(existsSync(aliveShareDir)).toBe(true);
+      expect(mockKillProcessTree).not.toHaveBeenCalled();
+
+      await provider1.disconnect();
+      await provider2.disconnect();
+      expect(existsSync(aliveShareDir)).toBe(false);
+    } finally {
+      if (origShareEnv !== undefined) {
+        process.env.KIMI_SHARE_DIR = origShareEnv;
+      } else {
+        delete process.env.KIMI_SHARE_DIR;
+      }
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps base kimi.json read-only, uses isolated metadata view for default resume, and fails closed on corrupt metadata', async () => {
+    const tmpDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-wd-view-')));
     const projCwd = path.join(tmpDir, 'never-seen-cwd');
     mkdirSync(projCwd, { recursive: true });
     const baseShareDir = path.join(tmpDir, 'base-share');
-    mkdirSync(baseShareDir, { recursive: true });
-    writeFileSync(
-      path.join(baseShareDir, 'kimi.json'),
-      JSON.stringify({
-        extraOwnerField: 'keep-me',
-        work_dirs: [{ path: '/existing/other', kaos: 'local', last_session_id: 'other-sess-9' }],
-      }),
-      { mode: 0o600 },
-    );
+    mkdirSync(path.join(baseShareDir, 'credentials'), { recursive: true });
+    writeFileSync(path.join(baseShareDir, 'credentials', 'kimi-code.json'), '{"access_token":"default-oauth"}', { mode: 0o600 });
+    writeFileSync(path.join(baseShareDir, 'config.toml'), 'default_model = "kimi-k2.5"\n', { mode: 0o600 });
+    const originalBaseMetaRaw = JSON.stringify({
+      extraOwnerField: 'keep-me',
+      work_dirs: [{ path: '/existing/other', kaos: 'local', last_session_id: 'other-sess-9' }],
+    });
+    const baseKimiJson = path.join(baseShareDir, 'kimi.json');
+    writeFileSync(baseKimiJson, originalBaseMetaRaw, { mode: 0o600 });
+
+    const { createHash } = await import('node:crypto');
+    const { existsSync, lstatSync } = await import('node:fs');
+    const pathMd5 = createHash('md5').update(projCwd, 'utf8').digest('hex');
+    mkdirSync(path.join(baseShareDir, 'sessions', pathMd5, 'kimi-shared-1'), { recursive: true });
+    writeFileSync(path.join(baseShareDir, 'sessions', pathMd5, 'kimi-shared-1', 'context.jsonl'), '{}\n');
 
     const origShareEnv = process.env.KIMI_SHARE_DIR;
     process.env.KIMI_SHARE_DIR = baseShareDir;
@@ -2281,20 +2372,11 @@ describe('KimiV2Provider', () => {
         },
       });
 
-      const baseMeta = JSON.parse(readFileSync(path.join(baseShareDir, 'kimi.json'), 'utf8')) as {
-        extraOwnerField?: string;
-        work_dirs?: Array<{ path: string; kaos: string; last_session_id: string | null }>;
-      };
-      expect(baseMeta.extraOwnerField).toBe('keep-me');
-      expect(baseMeta.work_dirs).toEqual([
-        { path: '/existing/other', kaos: 'local', last_session_id: 'other-sess-9' },
-        { path: projCwd, kaos: 'local', last_session_id: null },
-      ]);
-      const { existsSync } = await import('node:fs');
-      expect(existsSync(path.join(baseShareDir, 'config.toml'))).toBe(false);
-      expect(readFileSync(path.join(baseShareDir, 'kimi.json'), 'utf8')).not.toContain('never-write-to-base-kimi');
+      // Shared base kimi.json & config.toml remain 100% untouched by preset launch
+      expect(readFileSync(baseKimiJson, 'utf8')).toBe(originalBaseMetaRaw);
+      expect(readFileSync(path.join(baseShareDir, 'config.toml'), 'utf8')).toBe('default_model = "kimi-k2.5"\n');
 
-      // Clearing back to default with strictResume succeeds on the same native id
+      // Clearing back to default with strictResume uses an isolated metadata view preserving base entries + default credentials
       await provider.endSession('sess-preset');
       await provider.createSession({
         sessionKey: 'sess-default-restored',
@@ -2307,8 +2389,27 @@ describe('KimiV2Provider', () => {
         cwd: projCwd,
         mcpServers: expect.any(Array),
       });
+      expect(readFileSync(baseKimiJson, 'utf8')).toBe(originalBaseMetaRaw);
 
-      // Strict resume MUST fail loudly and NEVER fall back to newSession when session is missing
+      const viewShareDir = (mockSpawn.mock.calls.at(-1)![2] as { env: NodeJS.ProcessEnv }).env.KIMI_SHARE_DIR!;
+      expect(viewShareDir).not.toBe(baseShareDir);
+      const viewMeta = JSON.parse(readFileSync(path.join(viewShareDir, 'kimi.json'), 'utf8')) as {
+        extraOwnerField?: string;
+        work_dirs?: Array<{ path: string; kaos: string; last_session_id: string | null }>;
+      };
+      expect(viewMeta.extraOwnerField).toBe('keep-me');
+      expect(viewMeta.work_dirs).toEqual([
+        { path: '/existing/other', kaos: 'local', last_session_id: 'other-sess-9' },
+        { path: projCwd, kaos: 'local', last_session_id: null },
+      ]);
+      expect(lstatSync(path.join(viewShareDir, 'credentials')).isSymbolicLink()).toBe(true);
+      expect(lstatSync(path.join(viewShareDir, 'sessions')).isSymbolicLink()).toBe(true);
+      expect(readFileSync(path.join(viewShareDir, 'config.toml'), 'utf8')).toBe('default_model = "kimi-k2.5"\n');
+
+      await provider.endSession('sess-default-restored');
+      expect(existsSync(viewShareDir)).toBe(false);
+
+      // Strict resume fails loudly and never falls back to newSession when session is missing
       const providerFail = new KimiV2Provider();
       await providerFail.connect({});
       await expect(providerFail.createSession({
@@ -2319,8 +2420,35 @@ describe('KimiV2Provider', () => {
       })).rejects.toThrow();
       expect(connDefaultFail.newSession).not.toHaveBeenCalled();
 
+      // Corrupt/malformed base kimi.json MUST fail explicitly and remain intact (never overwritten with {})
+      writeFileSync(baseKimiJson, '{broken-json', { mode: 0o600 });
+      const providerCorrupt = new KimiV2Provider();
+      await providerCorrupt.connect({});
+      await expect(providerCorrupt.createSession({
+        sessionKey: 'sess-corrupt-default',
+        cwd: projCwd,
+        resumeId: 'kimi-shared-1',
+        strictResume: true,
+      })).rejects.toThrow(/metadata index/i);
+      await expect(providerCorrupt.createSession({
+        sessionKey: 'sess-corrupt-preset',
+        cwd: projCwd,
+        agentId: 'glm-5.3-flash',
+        kimiLlm: {
+          provider: 'glm5.3',
+          providerType: 'anthropic',
+          baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+          apiKey: 'never-write-to-base-kimi',
+          model: 'glm-5.3-flash',
+          contextWindow: 1_000_000,
+          models: [{ id: 'glm-5.3-flash', contextWindow: 1_000_000 }],
+        },
+      })).rejects.toThrow(/metadata index/i);
+      expect(readFileSync(baseKimiJson, 'utf8')).toBe('{broken-json');
+
       await provider.disconnect();
       await providerFail.disconnect();
+      await providerCorrupt.disconnect();
     } finally {
       if (origShareEnv !== undefined) {
         process.env.KIMI_SHARE_DIR = origShareEnv;

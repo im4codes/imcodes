@@ -13,7 +13,9 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -733,6 +735,40 @@ export class KimiV2Provider implements TransportProvider {
     this.providerConfig = config;
   }
 
+  private readKimiMetadataStrict(kimiJsonPath: string): {
+    root: Record<string, unknown>;
+    entries: Array<Record<string, unknown>>;
+  } {
+    if (!existsSync(kimiJsonPath)) {
+      return { root: {}, entries: [] };
+    }
+    let rawText: string;
+    try {
+      rawText = readFileSync(kimiJsonPath, 'utf8');
+    } catch (err) {
+      throw new Error(`Failed to read Kimi metadata index (${kimiJsonPath}): ${err instanceof Error ? err.message : String(err)}`);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch (err) {
+      throw new Error(`Failed to parse Kimi metadata index (${kimiJsonPath}): ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`Invalid Kimi metadata index (${kimiJsonPath}): expected JSON object`);
+    }
+    const root = { ...(parsed as Record<string, unknown>) };
+    if (root.work_dirs !== undefined && !Array.isArray(root.work_dirs)) {
+      throw new Error(`Invalid Kimi metadata index (${kimiJsonPath}): work_dirs must be an array`);
+    }
+    const entries = Array.isArray(root.work_dirs)
+      ? root.work_dirs
+          .filter((e): e is Record<string, unknown> => Boolean(e && typeof e === 'object' && !Array.isArray(e) && typeof (e as { path?: unknown }).path === 'string' && ((e as { path: string }).path).length > 0))
+          .map((e) => ({ ...e }))
+      : [];
+    return { root, entries };
+  }
+
   private computeConnectionDescriptor(sessionConfig?: SessionConfig): {
     env: NodeJS.ProcessEnv;
     bin: ResolvedExecutable;
@@ -742,6 +778,7 @@ export class KimiV2Provider implements TransportProvider {
     envKey: string;
     routeKey: string;
     baseShareDir: string;
+    defaultResumeViewCwd?: string;
   } {
     const env = this.buildSpawnEnv(sessionConfig);
     const bin = this.resolveBinaryCommand(env);
@@ -750,8 +787,29 @@ export class KimiV2Provider implements TransportProvider {
     const presetKey = computeKimiLlmKey(kimiLlm);
     const baseShareDir = env.KIMI_SHARE_DIR?.trim() || path.join(os.homedir(), '.kimi');
     const envKey = `${env.KIMI_API_KEY ?? ''}\0${env.KIMI_CODE_HOME ?? ''}\0${env.KIMI_CLI_PATH ?? ''}\0${env.KIMI_SHARE_DIR ?? ''}\0${presetKey}`;
-    const routeKey = presetKey ? `preset:${envKey}` : '__default__';
-    return { env, bin, fingerprint, kimiLlm, presetKey, envKey, routeKey, baseShareDir };
+
+    let defaultResumeViewCwd: string | undefined;
+    if (!kimiLlm && !sessionConfig?.fresh && isNonEmptyString(sessionConfig?.resumeId) && isNonEmptyString(sessionConfig?.cwd)) {
+      const canonicalCwd = normalizeTransportCwd(canonicalizeTransportCwd(sessionConfig.cwd));
+      if (canonicalCwd) {
+        const pathMd5 = createHash('md5').update(canonicalCwd, 'utf8').digest('hex');
+        const sessionDir = path.join(baseShareDir, 'sessions', pathMd5);
+        if (existsSync(sessionDir)) {
+          const { entries } = this.readKimiMetadataStrict(path.join(baseShareDir, 'kimi.json'));
+          const alreadyRegistered = entries.some((e) => (e.kaos === undefined || e.kaos === 'local') && e.path === canonicalCwd);
+          if (!alreadyRegistered) {
+            defaultResumeViewCwd = canonicalCwd;
+          }
+        }
+      }
+    }
+
+    const routeKey = presetKey
+      ? `preset:${envKey}`
+      : defaultResumeViewCwd
+        ? `default-view:${envKey}\0${defaultResumeViewCwd}`
+        : '__default__';
+    return { env, bin, fingerprint, kimiLlm, presetKey, envKey, routeKey, baseShareDir, defaultResumeViewCwd };
   }
 
   private getOrCreateConnectionEntry(routeKey: string, envKey: string, presetKey: string, baseShareDir: string): KimiConnectionEntry {
@@ -908,37 +966,21 @@ export class KimiV2Provider implements TransportProvider {
     }
   }
 
-  private ensureWorkDirRegisteredInKimiJson(
+  private writePrivateKimiMetadataFile(
     kimiJsonPath: string,
     workDirs: string[],
-    options: { seedFromPath?: string; createIfMissing?: boolean } = {},
+    options: { seedFromPath?: string } = {},
   ): string[] {
-    let root: Record<string, unknown> = {};
-    let entries: Array<Record<string, unknown>> = [];
     const targetExists = existsSync(kimiJsonPath);
     const sourcePath = targetExists ? kimiJsonPath : options.seedFromPath;
-    if (sourcePath && existsSync(sourcePath)) {
-      try {
-        const parsed = JSON.parse(readFileSync(sourcePath, 'utf8')) as unknown;
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          root = { ...(parsed as Record<string, unknown>) };
-          if (Array.isArray(root.work_dirs)) {
-            entries = root.work_dirs
-              .filter((e): e is Record<string, unknown> => Boolean(e && typeof e === 'object' && !Array.isArray(e) && typeof (e as { path?: unknown }).path === 'string' && ((e as { path: string }).path).length > 0))
-              .map((e) => ({ ...e }));
-          }
-        }
-      } catch {
-        /* ignore unreadable or malformed kimi.json */
-      }
-    }
+    const { root, entries } = sourcePath ? this.readKimiMetadataStrict(sourcePath) : { root: {}, entries: [] };
 
     const existingPaths = new Set<string>(
       entries
         .filter((e) => (e.kaos === undefined || e.kaos === 'local') && typeof e.path === 'string')
         .map((e) => e.path as string),
     );
-    let changed = !targetExists && Boolean(options.createIfMissing);
+    let changed = !targetExists;
     for (const wd of workDirs) {
       if (!wd || existingPaths.has(wd)) continue;
       existingPaths.add(wd);
@@ -947,27 +989,24 @@ export class KimiV2Provider implements TransportProvider {
     }
 
     if (changed) {
-      mkdirSync(path.dirname(kimiJsonPath), { recursive: true, mode: 0o700 });
-      writeFileSync(kimiJsonPath, JSON.stringify({ ...root, work_dirs: entries }), { mode: 0o600 });
-      chmodSync(kimiJsonPath, 0o600);
+      const dir = path.dirname(kimiJsonPath);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const tmpPath = path.join(dir, `.kimi.json.tmp-${process.pid}-${Date.now()}`);
+      writeFileSync(tmpPath, JSON.stringify({ ...root, work_dirs: entries }), { mode: 0o600 });
+      chmodSync(tmpPath, 0o600);
+      renameSync(tmpPath, kimiJsonPath);
     }
     return entries.map((e) => e.path).filter((p): p is string => typeof p === 'string' && p.length > 0);
   }
 
   private writePresetWorkDirsMetadata(entry: KimiConnectionEntry, shareDir: string, baseShareDir: string | null, workDirs: string[]): void {
     const baseKimiJson = baseShareDir ? path.join(baseShareDir, 'kimi.json') : undefined;
-    const registered = this.ensureWorkDirRegisteredInKimiJson(
+    // Never write to shared baseShareDir/kimi.json; seed the private view read-only from it.
+    const registered = this.writePrivateKimiMetadataFile(
       path.join(shareDir, 'kimi.json'),
       workDirs,
-      { seedFromPath: baseKimiJson, createIfMissing: true },
+      { seedFromPath: baseKimiJson },
     );
-    if (baseKimiJson && workDirs.length > 0) {
-      try {
-        this.ensureWorkDirRegisteredInKimiJson(baseKimiJson, workDirs, { createIfMissing: true });
-      } catch {
-        /* ignore if base share dir is read-only */
-      }
-    }
     for (const p of registered) entry.activePresetWorkDirs.add(p);
   }
 
@@ -976,32 +1015,14 @@ export class KimiV2Provider implements TransportProvider {
     const normalized = normalizeTransportCwd(canonicalizeTransportCwd(cwd));
     if (!shareDir || !normalized || entry.activePresetWorkDirs.has(normalized)) return;
     try {
-      this.ensureWorkDirRegisteredInKimiJson(path.join(shareDir, 'kimi.json'), [normalized], { createIfMissing: true });
-      if (entry.baseShareDir) {
-        this.ensureWorkDirRegisteredInKimiJson(path.join(entry.baseShareDir, 'kimi.json'), [normalized], { createIfMissing: true });
-      }
+      this.writePrivateKimiMetadataFile(path.join(shareDir, 'kimi.json'), [normalized]);
       entry.activePresetWorkDirs.add(normalized);
     } catch {
-      /* ignore metadata update failure */
+      /* ignore metadata update failure in private view */
     }
   }
 
-  private ensureDefaultWorkDirRegisteredForResume(entry: KimiConnectionEntry, cwd: string): void {
-    const baseShareDir = entry.baseShareDir;
-    const normalized = normalizeTransportCwd(canonicalizeTransportCwd(cwd));
-    if (!baseShareDir || !normalized) return;
-    try {
-      const pathMd5 = createHash('md5').update(normalized, 'utf8').digest('hex');
-      const sessionDir = path.join(baseShareDir, 'sessions', pathMd5);
-      if (!existsSync(sessionDir)) return;
-      this.ensureWorkDirRegisteredInKimiJson(path.join(baseShareDir, 'kimi.json'), [normalized], { createIfMissing: true });
-    } catch {
-      /* ignore if base share dir is read-only or unavailable */
-    }
-  }
-
-  private preparePresetShareDir(entry: KimiConnectionEntry, llm: KimiLlmConfig, spawnEnv: NodeJS.ProcessEnv, workDirs: string[]): string {
-    const baseShareDir = spawnEnv.KIMI_SHARE_DIR?.trim() || path.join(os.homedir(), '.kimi');
+  private allocateIsolatedShareDir(entry: KimiConnectionEntry): string {
     const shareDir = mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-share-'));
     chmodSync(shareDir, 0o700);
     const exitCleanup = () => {
@@ -1015,26 +1036,68 @@ export class KimiV2Provider implements TransportProvider {
     this.presetShareExitCleanups.set(shareDir, exitCleanup);
     entry.activePresetShareDir = shareDir;
     entry.activePresetWorkDirs.clear();
+    return shareDir;
+  }
+
+  private prepareDefaultResumeMetadataView(entry: KimiConnectionEntry, baseShareDir: string, cwd: string): string {
+    const viewDir = this.allocateIsolatedShareDir(entry);
+    try {
+      if (existsSync(baseShareDir)) {
+        for (const item of readdirSync(baseShareDir)) {
+          if (item === 'kimi.json' || item === 'logs') continue;
+          const srcPath = path.join(baseShareDir, item);
+          const dstPath = path.join(viewDir, item);
+          try {
+            const st = statSync(srcPath);
+            symlinkSync(srcPath, dstPath, st.isDirectory() ? (process.platform === 'win32' ? 'junction' : 'dir') : 'file');
+          } catch {
+            /* ignore dangling or unreadable entries */
+          }
+        }
+      }
+      this.writePresetWorkDirsMetadata(entry, viewDir, baseShareDir, [cwd]);
+      return viewDir;
+    } catch (err) {
+      this.cleanupPresetShareDir(viewDir, entry);
+      throw err;
+    }
+  }
+
+  private preparePresetShareDir(entry: KimiConnectionEntry, llm: KimiLlmConfig, spawnEnv: NodeJS.ProcessEnv, workDirs: string[]): string {
+    const baseShareDir = spawnEnv.KIMI_SHARE_DIR?.trim() || path.join(os.homedir(), '.kimi');
+    const shareDir = this.allocateIsolatedShareDir(entry);
 
     try {
-      const baseSessionsDir = path.join(baseShareDir, 'sessions');
-      mkdirSync(baseSessionsDir, { recursive: true });
-      symlinkSync(baseSessionsDir, path.join(shareDir, 'sessions'), process.platform === 'win32' ? 'junction' : 'dir');
-    } catch {
-      /* ignore if host home sessions dir is non-writable in tests */
-    }
-
-    this.writePresetWorkDirsMetadata(entry, shareDir, baseShareDir, workDirs);
-
-    const credsDir = path.join(shareDir, 'credentials');
-    mkdirSync(credsDir, { recursive: true, mode: 0o700 });
-    chmodSync(credsDir, 0o700);
-    const baseCredPath = path.join(baseShareDir, 'credentials', 'kimi-code.json');
-    const targetCredPath = path.join(credsDir, 'kimi-code.json');
-    if (existsSync(baseCredPath)) {
       try {
-        symlinkSync(baseCredPath, targetCredPath);
+        const baseSessionsDir = path.join(baseShareDir, 'sessions');
+        mkdirSync(baseSessionsDir, { recursive: true });
+        symlinkSync(baseSessionsDir, path.join(shareDir, 'sessions'), process.platform === 'win32' ? 'junction' : 'dir');
       } catch {
+        /* ignore if host home sessions dir is non-writable in tests */
+      }
+
+      this.writePresetWorkDirsMetadata(entry, shareDir, baseShareDir, workDirs);
+
+      const credsDir = path.join(shareDir, 'credentials');
+      mkdirSync(credsDir, { recursive: true, mode: 0o700 });
+      chmodSync(credsDir, 0o700);
+      const baseCredPath = path.join(baseShareDir, 'credentials', 'kimi-code.json');
+      const targetCredPath = path.join(credsDir, 'kimi-code.json');
+      if (existsSync(baseCredPath)) {
+        try {
+          symlinkSync(baseCredPath, targetCredPath);
+        } catch {
+          writeFileSync(targetCredPath, JSON.stringify({
+            access_token: 'imcodes-preset-local',
+            refresh_token: '',
+            expires_at: 0,
+            scope: '',
+            token_type: 'Bearer',
+            expires_in: 0,
+          }), { mode: 0o600 });
+        }
+      } else {
+        // kimi acp checks credentials/kimi-code.json even when config uses a third-party provider api_key.
         writeFileSync(targetCredPath, JSON.stringify({
           access_token: 'imcodes-preset-local',
           refresh_token: '',
@@ -1043,24 +1106,17 @@ export class KimiV2Provider implements TransportProvider {
           token_type: 'Bearer',
           expires_in: 0,
         }), { mode: 0o600 });
+        chmodSync(targetCredPath, 0o600);
       }
-    } else {
-      // kimi acp checks credentials/kimi-code.json even when config uses a third-party provider api_key.
-      writeFileSync(targetCredPath, JSON.stringify({
-        access_token: 'imcodes-preset-local',
-        refresh_token: '',
-        expires_at: 0,
-        scope: '',
-        token_type: 'Bearer',
-        expires_in: 0,
-      }), { mode: 0o600 });
-      chmodSync(targetCredPath, 0o600);
-    }
 
-    const configPath = path.join(shareDir, 'config.toml');
-    writeFileSync(configPath, buildKimiPresetConfigToml(llm), { mode: 0o600 });
-    chmodSync(configPath, 0o600);
-    return shareDir;
+      const configPath = path.join(shareDir, 'config.toml');
+      writeFileSync(configPath, buildKimiPresetConfigToml(llm), { mode: 0o600 });
+      chmodSync(configPath, 0o600);
+      return shareDir;
+    } catch (err) {
+      this.cleanupPresetShareDir(shareDir, entry);
+      throw err;
+    }
   }
 
   private async teardownConnectionEntry(
@@ -1114,7 +1170,7 @@ export class KimiV2Provider implements TransportProvider {
   }
 
   private async ensureConnected(sessionConfig?: SessionConfig): Promise<{ entry: KimiConnectionEntry; connection: AcpClientConnection }> {
-    const { env, bin, fingerprint, kimiLlm, presetKey, envKey, routeKey, baseShareDir } = this.computeConnectionDescriptor(sessionConfig);
+    const { env, bin, fingerprint, kimiLlm, presetKey, envKey, routeKey, baseShareDir, defaultResumeViewCwd } = this.computeConnectionDescriptor(sessionConfig);
     const entry = this.getOrCreateConnectionEntry(routeKey, envKey, presetKey, baseShareDir);
 
     // Coalesce concurrent connect attempts for the SAME connection route; wait before recycling if config/binary changed.
@@ -1166,6 +1222,9 @@ export class KimiV2Provider implements TransportProvider {
       if (kimiLlm) {
         const knownCwds = [cwd, ...Array.from(this.sessions.values()).filter((s) => s.boundEnvKey === routeKey || computeKimiLlmKey(s.kimiLlm) === presetKey).map((s) => s.cwd)];
         createdPresetShareDir = this.preparePresetShareDir(entry, kimiLlm, spawnEnv, knownCwds);
+        spawnEnv.KIMI_SHARE_DIR = createdPresetShareDir;
+      } else if (defaultResumeViewCwd) {
+        createdPresetShareDir = this.prepareDefaultResumeMetadataView(entry, baseShareDir, defaultResumeViewCwd);
         spawnEnv.KIMI_SHARE_DIR = createdPresetShareDir;
       }
 
@@ -1560,8 +1619,6 @@ export class KimiV2Provider implements TransportProvider {
     if (needsNativeBind) {
       if (state.kimiLlm) {
         this.ensurePresetWorkDirInMetadata(entry, state.cwd);
-      } else if (state.providerSessionId) {
-        this.ensureDefaultWorkDirRegisteredForResume(entry, state.cwd);
       }
       // Reset per-connection session negotiation before binding on this connection.
       state.sessionUsesConfigOptions = false;
@@ -1786,6 +1843,7 @@ export class KimiV2Provider implements TransportProvider {
     this.sessions.set(routeId, state);
 
     const previousEntry = existing ? this.getSessionConnectionEntry(existing) : undefined;
+    const previousBoundAcpId = prior?.providerSessionId;
     this.acquireConnectionUse(entry);
     try {
       await this.ensureSessionReady(state, entry, connection, { allowFresh: !config.strictResume });
@@ -1797,8 +1855,27 @@ export class KimiV2Provider implements TransportProvider {
         }
       }
     } catch (err) {
-      if (!prior && !state.providerSessionId) {
-        this.sessions.delete(routeId);
+      if (!prior) {
+        this.unbindSession(routeId);
+        if (state.providerSessionId && this.acpToRoute.get(state.providerSessionId) === routeId) {
+          this.acpToRoute.delete(state.providerSessionId);
+        }
+      } else {
+        if (state.providerSessionId && state.providerSessionId !== previousBoundAcpId && this.acpToRoute.get(state.providerSessionId) === routeId) {
+          this.acpToRoute.delete(state.providerSessionId);
+        }
+        this.sessions.set(routeId, prior);
+        if (previousBoundAcpId) {
+          this.acpToRoute.set(previousBoundAcpId, routeId);
+        }
+      }
+      if (
+        (entry.activePresetShareDir !== null || Boolean(config.strictResume))
+        && this.countSessionsOnEntry(entry.routeKey) === 0
+        && entry.inFlightOps <= 1
+        && !this.hasActiveTurnsOnEntry(entry.routeKey, entry.generation)
+      ) {
+        entry.teardownWhenIdle = true;
       }
       throw err;
     } finally {
@@ -1818,6 +1895,7 @@ export class KimiV2Provider implements TransportProvider {
         cwd: state.cwd,
         env: state.env,
         kimiLlm: state.kimiLlm,
+        resumeId: state.providerSessionId || undefined,
       });
       connectedEntry = entry;
       this.acquireConnectionUse(entry);
@@ -2106,6 +2184,7 @@ export class KimiV2Provider implements TransportProvider {
         cwd: state.cwd,
         env: state.env,
         kimiLlm: state.kimiLlm,
+        resumeId: state.providerSessionId || undefined,
       });
       boundEntry = entry;
       this.acquireConnectionUse(entry);
