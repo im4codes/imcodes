@@ -6,7 +6,12 @@ import { resolveAuth } from '../security/authorization.js';
 import { describeActionPayload, gateMachineAction } from '../security/machine-action-gate.js';
 import { recordMachineActionAuthorized } from '../security/machine-exec-audit.js';
 import logger from '../util/logger.js';
-import { isSharedOrContributedServer, isWholeServerShareUser } from '../security/server-share-boundary.js';
+import {
+  getServerPrivateDeviceBlock,
+  isPrivateDeviceBlockedForActorOnSource,
+  isSharedOrContributedServer,
+  isWholeServerShareUser,
+} from '../security/server-share-boundary.js';
 import {
   listAccessibleControlledMachines,
   resolveMachineTargetServerId,
@@ -131,7 +136,9 @@ async function resolveEndpointServer(
         ok: false,
         status: gate.status,
         reason,
-        error: `access denied for controlled node "${rawRef}": ${gate.reason}`,
+        error: gate.reason === MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST
+          ? MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST
+          : `access denied for controlled node "${rawRef}": ${gate.reason}`,
       };
     }
     return {
@@ -162,6 +169,20 @@ async function resolveEndpointServer(
       status: 403,
       reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
       error: `access denied for node "${rawRef}"`,
+    };
+  }
+  if (await isPrivateDeviceBlockedForActorOnSource(db, {
+    sourceServerId: auth.sourceServerId,
+    actingUserId: auth.operational.delegatedActorUserId ?? auth.operational.userId,
+    targetServerId: row.id,
+    targetOwnerUserId: row.user_id,
+    now: auth.now,
+  })) {
+    return {
+      ok: false,
+      status: 403,
+      reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
+      error: MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST,
     };
   }
   const ownerRow = await db.queryOne<{ status: string | null }>(
@@ -362,6 +383,7 @@ export function createPortForwardRoutes(
     }
     const effectiveActorUserId = caller.operational.delegatedActorUserId ?? caller.userId;
     const rawNode = c.req.query('node');
+    const actingUserId = caller.operational.delegatedActorUserId ?? caller.userId;
     let filterServerId: string | undefined;
     if (rawNode) {
       const ref = validatePortForwardNodeRef(rawNode);
@@ -373,8 +395,53 @@ export function createPortForwardRoutes(
       } else {
         filterServerId = (await resolveMachineTargetServerId(c.env.DB, ref)) ?? ref;
       }
+      if (
+        filterServerId
+        && await isPrivateDeviceBlockedForActorOnSource(c.env.DB, {
+          sourceServerId: caller.sourceServerId,
+          actingUserId,
+          targetServerId: filterServerId,
+          now: caller.now,
+        })
+      ) {
+        return c.json({
+          ok: false,
+          reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
+          error: MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST,
+        }, 403);
+      }
     }
-    const tunnels = await router.listTunnels(effectiveActorUserId, filterServerId);
+    let tunnels = await router.listTunnels(effectiveActorUserId, filterServerId);
+    if (tunnels.length > 0 && await getServerPrivateDeviceBlock(c.env.DB, caller.sourceServerId, actingUserId)) {
+      const checks = new Map<string, boolean>();
+      const visible: typeof tunnels = [];
+      for (const t of tunnels) {
+        let listenBlocked = checks.get(t.listenServerId);
+        if (listenBlocked === undefined) {
+          listenBlocked = await isPrivateDeviceBlockedForActorOnSource(c.env.DB, {
+            sourceServerId: caller.sourceServerId,
+            actingUserId,
+            targetServerId: t.listenServerId,
+            now: caller.now,
+          });
+          checks.set(t.listenServerId, listenBlocked);
+        }
+        let targetBlocked = checks.get(t.targetServerId);
+        if (targetBlocked === undefined) {
+          targetBlocked = await isPrivateDeviceBlockedForActorOnSource(c.env.DB, {
+            sourceServerId: caller.sourceServerId,
+            actingUserId,
+            targetServerId: t.targetServerId,
+            now: caller.now,
+          });
+          checks.set(t.targetServerId, targetBlocked);
+        }
+        if (!listenBlocked && !targetBlocked) {
+          visible.push(t);
+        }
+      }
+      tunnels = visible;
+    }
     return c.json({ ok: true, tunnels });
   });
 

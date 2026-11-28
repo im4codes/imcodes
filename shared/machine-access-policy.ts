@@ -71,6 +71,8 @@ export const MACHINE_DENIAL_REASON = {
   EXEC_DISABLED: 'exec_disabled',
   /** The actor can operate the device but holds no execute grant (for example a direct participant without the grant). */
   EXECUTE_NOT_GRANTED: 'execute_not_granted',
+  /** The actor blocked this source host from accessing their own unshared private devices. */
+  PRIVATE_DEVICE_BLOCKED_FOR_HOST: 'private_device_blocked_for_host',
   /** The action is unknown to this table. */
   UNKNOWN_ACTION: 'unknown_action',
 } as const;

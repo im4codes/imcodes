@@ -19,6 +19,13 @@ import {
 import { resolveServerMembershipRole, resolveServerRole } from '../security/authorization.js';
 import { resolveControlledMachineManagementAccess } from '../share/machine-access.js';
 import { isSharedOrContributedServer } from '../security/daemon-scope.js';
+import {
+  canManageOwnPrivateDevicePolicy,
+  getServerPrivateDeviceBlock,
+  listServerPrivateDeviceBlocksForUser,
+  setServerPrivateDeviceBlock,
+} from '../security/server-share-boundary.js';
+import { logAudit } from '../security/audit.js';
 import { resolveSharedMachineAuthority } from '../share/shared-machine-authority.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { WsBridge } from '../ws/bridge.js';
@@ -448,6 +455,11 @@ function buildRemoteMemoryResponse(
 serverRoutes.get('/', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const dbServers = await getFullServersByUserId(c.env.DB, userId);
+  const blockedServerIds = await listServerPrivateDeviceBlocksForUser(
+    c.env.DB,
+    userId,
+    dbServers.map((s) => s.id),
+  );
 
   const servers = dbServers.map((s) => {
     let lastHeartbeatAt = s.last_heartbeat_at;
@@ -468,10 +480,47 @@ serverRoutes.get('/', requireAuth(), async (c) => {
       daemonVersion: s.daemon_version,
       latestDaemonVersion: process.env.APP_VERSION ?? null,
       createdAt: s.created_at,
+      blockMyPrivateDevices: blockedServerIds.has(s.id),
     };
   });
 
   return c.json({ servers });
+});
+
+// GET /api/server/:id/my-private-device-policy — read caller's own self-protection toggle on a host
+serverRoutes.get('/:id/my-private-device-policy', requireAuth({ refuseDaemonCredential: true }), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id') ?? '';
+  if (!serverId) return c.json({ error: 'invalid_server_id' }, 400);
+  if (!await canManageOwnPrivateDevicePolicy(c.env.DB, serverId, userId, Date.now())) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  const blockPrivateDevices = await getServerPrivateDeviceBlock(c.env.DB, serverId, userId);
+  return c.json({ ok: true, serverId, blockPrivateDevices });
+});
+
+// PATCH /api/server/:id/my-private-device-policy — update ONLY caller's own self-protection toggle on a host
+serverRoutes.patch('/:id/my-private-device-policy', requireAuth({ refuseDaemonCredential: true }), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id') ?? '';
+  if (!serverId) return c.json({ error: 'invalid_server_id' }, 400);
+  const body = await c.req.json().catch(() => null);
+  const parsed = z.object({ blockPrivateDevices: z.boolean() }).strict().safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const now = Date.now();
+  if (!await canManageOwnPrivateDevicePolicy(c.env.DB, serverId, userId, now)) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  await setServerPrivateDeviceBlock(c.env.DB, serverId, userId, parsed.data.blockPrivateDevices, now);
+  const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
+  await logAudit({
+    userId,
+    serverId,
+    action: 'server.private_device_policy.update',
+    details: { blockPrivateDevices: parsed.data.blockPrivateDevices },
+    ip,
+  }, c.env.DB);
+  return c.json({ ok: true, serverId, blockPrivateDevices: parsed.data.blockPrivateDevices });
 });
 
 // PATCH /api/server/:id/name — rename a server (authenticated user must own the server)

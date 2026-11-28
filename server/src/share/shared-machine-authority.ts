@@ -1,7 +1,11 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { Database } from '../db/client.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
-import { isSharedOrContributedServer, isWholeServerShareUser } from '../security/server-share-boundary.js';
+import {
+  isPrivateDeviceBlockedForActorOnSource,
+  isSharedOrContributedServer,
+  isWholeServerShareUser,
+} from '../security/server-share-boundary.js';
 import { isUserStatusActive } from '../../../shared/user-status.js';
 import {
   TURN_AUTHORITY_TOKEN_PREFIX,
@@ -713,10 +717,23 @@ export async function admitMachineAction(
   });
   // Source session/project authority has already been verified. Resolve the
   // actor's own target, never an intersection with the source owner's fleet.
+  const actingUserId = delegatedActorUserId ?? operational.userId;
   const target = await resolveControlledMachineOperatorAccess(
-    db, delegatedActorUserId ?? operational.userId, input.targetServerId, input.now,
+    db, actingUserId, input.targetServerId, input.now,
   );
   if (!target) return deny(MACHINE_DENIAL_REASON.NO_ACCESS, null);
+  if (
+    input.authenticatedSourceServerId
+    && await isPrivateDeviceBlockedForActorOnSource(db, {
+      sourceServerId: input.authenticatedSourceServerId,
+      actingUserId,
+      targetServerId: target.id,
+      targetOwnerUserId: target.user_id,
+      now: input.now,
+    })
+  ) {
+    return deny(MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST, target.access_source);
+  }
   const decision = evaluateMachineAction({
     accessRole: target.access_role,
     accessSource: target.access_source,

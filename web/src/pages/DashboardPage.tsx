@@ -26,6 +26,7 @@ interface Props {
   openingSharedEntryId: string | null;
   onOpenSharedEntry: (entry: SharedEntrySummary) => void;
   onRefreshSharedEntries: () => void;
+  onTogglePrivateDeviceBlock?: (serverId: string, blockPrivateDevices: boolean) => Promise<void> | void;
 }
 
 interface ServerInfo {
@@ -61,6 +62,7 @@ export function DashboardPage({
   openingSharedEntryId,
   onOpenSharedEntry,
   onRefreshSharedEntries,
+  onTogglePrivateDeviceBlock,
 }: Props) {
   const { t } = useTranslation();
   const [servers, setServers] = useState<ServerInfo[]>(externalServers ?? []);
@@ -208,6 +210,7 @@ export function DashboardPage({
                     openingEntryId={openingSharedEntryId}
                     onOpen={onOpenSharedEntry}
                     onRefresh={onRefreshSharedEntries}
+                    onTogglePrivateDeviceBlock={onTogglePrivateDeviceBlock}
                   />
                 )}
                 {showGettingStarted && (

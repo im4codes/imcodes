@@ -62,6 +62,7 @@ import { isControlledNodeId } from '../../../shared/controlled-node-identity.js'
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { listActorOperableMachineAccess, resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
 import { isSharedOrContributedServer } from '../security/daemon-scope.js';
+import { findSharedOrContributedServerIds, getServerPrivateDeviceBlock } from '../security/server-share-boundary.js';
 import {
   CONTROLLED_NODE_UPGRADE_STATUS,
   DAEMON_UPGRADE_DELIVERY_STATUS,
@@ -84,6 +85,7 @@ export const machinesRoutes = new Hono<{
 
 interface ControlledRow {
   id: string;
+  user_id: string;
   node_id: string | null;
   team_ids: string[] | null;
   team_names: string[] | null;
@@ -127,6 +129,7 @@ export async function listControlledMachines(
   nowMs: number,
   /** A shared-session participant driving the owner's agent: only machines they can operate themselves are listed. */
   delegatedActorUserId?: string,
+  options?: { sourceServerId?: string },
 ): Promise<{ machines: (MachineSummary & {
   nodeId: string;
   refName: string;
@@ -145,9 +148,19 @@ export async function listControlledMachines(
   // the whole machine list as malformed.
   hostServerId?: string;
 })[]; overLimit: boolean }> {
-  const rows: ControlledRow[] = delegatedActorUserId
+  const actingUserId = delegatedActorUserId ?? userId;
+  let rows: ControlledRow[] = delegatedActorUserId
     ? [...(await listActorOperableMachineAccess(db, delegatedActorUserId, nowMs, MACHINE_LIST_MAX_ITEMS + 1)).values()]
     : await listAccessibleControlledMachines(db, userId, nowMs, MACHINE_LIST_MAX_ITEMS + 1);
+  if (options?.sourceServerId && await getServerPrivateDeviceBlock(db, options.sourceServerId, actingUserId)) {
+    const ownedTargetIds = rows
+      .filter((r) => r.user_id === actingUserId && r.id !== options.sourceServerId)
+      .map((r) => r.id);
+    if (ownedTargetIds.length > 0) {
+      const sharedIds = await findSharedOrContributedServerIds(db, ownedTargetIds, nowMs);
+      rows = rows.filter((r) => r.user_id !== actingUserId || r.id === options.sourceServerId || sharedIds.has(r.id));
+    }
+  }
   // The bound is on the authenticated actual actor's fleet, not the source owner's.
   const overLimit = rows.length > MACHINE_LIST_MAX_ITEMS;
   const page = rows.slice(0, MACHINE_LIST_MAX_ITEMS);
@@ -298,6 +311,7 @@ export async function listControlledMachines(
 machinesRoutes.get('/', requireAuth(), async (c) => {
   let userId = c.get('userId' as never) as string;
   let delegatedActorUserId: string | undefined;
+  let sourceServerId: string | undefined;
   const now = Date.now();
   // Browser discovery is also the bounded, resumable provisioning seam for an
   // Owner whose remote-desktop node predates canonical host identity. This is
@@ -306,7 +320,7 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
   const authenticatedDaemon = c.get('nodeRole') === NODE_ROLE.FULL
     && typeof c.get('authServerId') === 'string';
   if (authenticatedDaemon) {
-    const sourceServerId = c.get('authServerId') as string;
+    sourceServerId = c.get('authServerId') as string;
     const operational = await resolveMachineOperationalUser(c.env.DB, {
       token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
       signingKey: c.env.JWT_SIGNING_KEY,
@@ -329,7 +343,13 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
       now,
     });
   }
-  const { machines, overLimit } = await listControlledMachines(c.env.DB, userId, now, delegatedActorUserId);
+  const { machines, overLimit } = await listControlledMachines(
+    c.env.DB,
+    userId,
+    now,
+    delegatedActorUserId,
+    authenticatedDaemon ? { sourceServerId } : undefined,
+  );
   if (overLimit) {
     return c.json({ error: 'machine_list_over_limit', maxItems: MACHINE_LIST_MAX_ITEMS }, 413);
   }

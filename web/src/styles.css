@@ -730,6 +730,17 @@ html.native-ios-mac .chat-dl-btn {
 .share-role-select { min-width: 104px; padding: 5px 7px; border: 1px solid rgba(125,211,252,0.18); border-radius: 6px; background: #0b1220; color: #dbeafe; font: inherit; font-size: 11px; }
 .share-revoke-btn { padding: 5px 8px; border: 1px solid rgba(248,113,113,0.35); border-radius: 6px; background: rgba(127,29,29,0.22); color: #fecaca; font: inherit; font-size: 11px; cursor: pointer; }
 .share-revoke-btn:disabled, .share-role-select:disabled { opacity: 0.55; cursor: not-allowed; }
+.share-private-device-toggle { display: flex; align-items: flex-start; gap: 9px; padding: 9px 10px; border: 1px solid rgba(125,211,252,0.18); border-radius: 8px; background: rgba(15,23,42,0.52); color: #e2e8f0; cursor: pointer; min-width: 0; }
+.share-private-device-toggle input { margin: 2px 0 0; flex-shrink: 0; accent-color: var(--chrome-accent); }
+.share-private-device-toggle-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.share-private-device-toggle-title { font-size: 12px; font-weight: 700; color: #f1f5f9; line-height: 1.35; overflow-wrap: break-word; }
+.share-private-device-toggle-help { font-size: 11px; color: #94a3b8; line-height: 1.4; overflow-wrap: break-word; }
+.shared-private-policy-list { display: flex; flex-direction: column; gap: 5px; margin-top: 7px; padding-top: 7px; border-top: 1px solid rgba(125,211,252,0.12); }
+.shared-private-policy-row { display: flex; align-items: flex-start; gap: 7px; padding: 5px 6px; border-radius: 6px; background: rgba(15,23,42,0.45); color: #cbd5e1; font-size: 11px; line-height: 1.35; cursor: pointer; min-width: 0; }
+.shared-private-policy-row input { margin: 2px 0 0; flex-shrink: 0; accent-color: var(--chrome-accent); }
+.shared-private-policy-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.shared-private-policy-label { overflow-wrap: break-word; color: #e2e8f0; font-weight: 600; }
+.shared-private-policy-server { font-size: 10px; color: #94a3b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .shared-entries-panel { margin: 10px 12px 4px; padding: 9px; border: 1px solid rgba(125,211,252,0.13); border-radius: 8px; background: rgba(15,23,42,0.38); }
 .shared-entries-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; color: #e2e8f0; font-size: 12px; font-weight: 800; }
 .shared-entries-heading { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }

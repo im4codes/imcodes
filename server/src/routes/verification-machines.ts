@@ -13,6 +13,13 @@ import {
   type VerificationMachineCursor,
 } from '../db/verification-machine-queries.js';
 import { listControlledMachines } from './machines.js';
+import { listAccessibleControlledMachines, resolveMachineTargetServerId } from '../share/machine-access.js';
+import {
+  findSharedOrContributedServerIds,
+  getServerPrivateDeviceBlock,
+  isPrivateDeviceBlockedForActorOnSource,
+} from '../security/server-share-boundary.js';
+import { MACHINE_LIST_MAX_ITEMS } from '../../../shared/remote-exec.js';
 import { aliasExistsById } from '../db/alias-queries.js';
 import {
   VERIFICATION_MACHINE_KINDS,
@@ -94,11 +101,38 @@ function decodeCursor(raw: string): VerificationMachineCursor | null {
   }
 }
 
+async function resolveBlockedControlledTargets(
+  db: Env['DB'],
+  sourceServerId: string | undefined,
+  userId: string,
+  now: number,
+): Promise<string[]> {
+  if (!sourceServerId || !await getServerPrivateDeviceBlock(db, sourceServerId, userId)) {
+    return [];
+  }
+  const rows = await listAccessibleControlledMachines(db, userId, now, MACHINE_LIST_MAX_ITEMS + 1);
+  const ownedOtherIds = rows
+    .filter((row) => row.user_id === userId && row.id !== sourceServerId)
+    .map((row) => row.id);
+  if (ownedOtherIds.length === 0) return [];
+  const sharedIds = await findSharedOrContributedServerIds(db, ownedOtherIds, now);
+  const blocked: string[] = [];
+  for (const row of rows) {
+    if (row.user_id === userId && row.id !== sourceServerId && !sharedIds.has(row.id)) {
+      if (row.node_id) blocked.push(row.node_id);
+      blocked.push(row.id);
+    }
+  }
+  return blocked;
+}
+
 verificationMachineRoutes.get('/', async (c) => {
   const projectKey = c.req.query('projectKey')?.trim() || undefined;
   const includeAllProjects = c.req.query('includeAllProjects') === '1'
     || c.req.query('includeAllProjects') === 'true';
   const userId = c.get('effectiveActorUserId') ?? (c.get('userId' as never) as string);
+  const authServerId = c.get('authServerId' as never) as string | undefined;
+  const excludedControlledTargets = await resolveBlockedControlledTargets(c.env.DB, authServerId, userId, Date.now());
   if (includeAllProjects) {
     const rawCursor = c.req.query('cursor');
     const cursor = rawCursor === undefined ? null : decodeCursor(rawCursor);
@@ -121,13 +155,14 @@ verificationMachineRoutes.get('/', async (c) => {
       projectKey,
       limit,
       cursor,
+      excludedControlledTargets,
     });
     return c.json({
       profiles: page.profiles,
       ...(page.nextCursor ? { nextCursor: encodeCursor(page.nextCursor) } : {}),
     });
   }
-  const profiles = await listVerificationMachines(c.env.DB, userId, projectKey);
+  const profiles = await listVerificationMachines(c.env.DB, userId, projectKey, { excludedControlledTargets });
   if (profiles.length > VERIFICATION_MACHINE_LIMITS.MAX_ITEMS) {
     return c.json({ error: 'verification_machine_list_over_limit' }, 413);
   }
@@ -148,6 +183,7 @@ verificationMachineRoutes.put('/', async (c) => {
   const targetReason = verificationMachineTargetError(kind, body.target);
   if (targetReason) return c.json({ error: targetReason }, 400);
   const userId = c.get('effectiveActorUserId') ?? (c.get('userId' as never) as string);
+  const authServerId = c.get('authServerId' as never) as string | undefined;
   const id = body.id === undefined ? randomHex(16) : body.id;
   if (!isVerificationMachineId(id)) return c.json({ error: 'verification_machine_id_invalid' }, 400);
   const existing = await getVerificationMachine(c.env.DB, userId, id);
@@ -156,9 +192,23 @@ verificationMachineRoutes.put('/', async (c) => {
   }
   if (kind === VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE) {
     const target = normalizeVerificationMachineTarget(String(body.target));
-    const { machines } = await listControlledMachines(c.env.DB, userId, Date.now());
+    const now = Date.now();
+    const { machines } = await listControlledMachines(c.env.DB, userId, now);
     if (!machines.some((machine) => machine.nodeId === target)) {
       return c.json({ error: 'verification_machine_target_unauthorized' }, 403);
+    }
+    const targetServerId = await resolveMachineTargetServerId(c.env.DB, target);
+    if (
+      authServerId
+      && targetServerId
+      && await isPrivateDeviceBlockedForActorOnSource(c.env.DB, {
+        sourceServerId: authServerId,
+        actingUserId: userId,
+        targetServerId,
+        now,
+      })
+    ) {
+      return c.json({ error: 'private_device_blocked_for_host', reason: 'private_device_blocked_for_host' }, 403);
     }
   } else {
     const target = normalizeVerificationMachineTarget(String(body.target));
@@ -209,7 +259,8 @@ verificationMachineRoutes.delete('/:id', async (c) => {
 verificationMachineRoutes.post('/:id/verification', async (c) => {
   // Only a full daemon can attest a real-machine probe. A browser may manage
   // registrations, but it must never be able to forge a "verified" result.
-  if (!c.get('authServerId')) return c.json({ error: 'verification_machine_daemon_required' }, 403);
+  const authServerId = c.get('authServerId' as never) as string | undefined;
+  if (!authServerId) return c.json({ error: 'verification_machine_daemon_required' }, 403);
   const id = c.req.param('id');
   if (!isVerificationMachineId(id)) return c.json({ error: 'verification_machine_id_invalid' }, 400);
   const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
@@ -218,9 +269,26 @@ verificationMachineRoutes.post('/:id/verification', async (c) => {
     ? body.status as (typeof VERIFICATION_MACHINE_STATUS_LIST)[number]
     : null;
   if (!status) return c.json({ error: 'verification_machine_status_invalid' }, 400);
+  const userId = c.get('userId' as never) as string;
+  const existing = await getVerificationMachine(c.env.DB, userId, id);
+  if (!existing) return c.json({ error: 'verification_machine_not_found' }, 404);
+  if (existing.kind === VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE) {
+    const targetServerId = await resolveMachineTargetServerId(c.env.DB, existing.target);
+    if (
+      targetServerId
+      && await isPrivateDeviceBlockedForActorOnSource(c.env.DB, {
+        sourceServerId: authServerId,
+        actingUserId: userId,
+        targetServerId,
+        now: Date.now(),
+      })
+    ) {
+      return c.json({ error: 'private_device_blocked_for_host', reason: 'private_device_blocked_for_host' }, 403);
+    }
+  }
   const profile = await recordVerificationMachineStatus(
     c.env.DB,
-    c.get('effectiveActorUserId') ?? (c.get('userId' as never) as string),
+    userId,
     id,
     status,
   );

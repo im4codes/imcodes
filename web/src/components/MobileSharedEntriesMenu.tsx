@@ -8,6 +8,7 @@ interface Props {
   openingEntryId?: string | null;
   onOpen: (entry: SharedEntrySummary) => void;
   onRefresh: () => void;
+  onTogglePrivateDeviceBlock?: (serverId: string, blockPrivateDevices: boolean) => Promise<void> | void;
 }
 
 export function MobileSharedEntriesMenu({
@@ -17,6 +18,7 @@ export function MobileSharedEntriesMenu({
   openingEntryId = null,
   onOpen,
   onRefresh,
+  onTogglePrivateDeviceBlock,
 }: Props) {
   return (
     <div class="mobile-server-menu-shared">
@@ -27,6 +29,7 @@ export function MobileSharedEntriesMenu({
         openingEntryId={openingEntryId}
         onOpen={onOpen}
         onRefresh={onRefresh}
+        onTogglePrivateDeviceBlock={onTogglePrivateDeviceBlock}
       />
     </div>
   );

@@ -6,7 +6,7 @@ import type { Database } from '../db/client.js';
 import { randomHex, signJwt } from '../security/crypto.js';
 import { requireAuth, resolveServerMembershipRole } from '../security/authorization.js';
 import { evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
-import { pauseRevokedSharedCronJobs } from '../security/server-share-boundary.js';
+import { listServerPrivateDeviceBlocksForUser, pauseRevokedSharedCronJobs } from '../security/server-share-boundary.js';
 import { getDbSessionsByServer, getSubSessionsByServer } from '../db/queries.js';
 import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import { WsBridge } from '../ws/bridge.js';
@@ -107,7 +107,11 @@ function fallbackTargetLabel(share: Awaited<ReturnType<typeof listActiveSharesFo
   return shareTargetSessionName(share.target) ?? share.target.subSessionId;
 }
 
-async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<typeof listActiveSharesForUser>>[number]) {
+async function recipientShareEntry(
+  db: Env['DB'],
+  share: Awaited<ReturnType<typeof listActiveSharesForUser>>[number],
+  blockMyPrivateDevices = false,
+) {
   let serverName: string | null = null;
   let targetLabel: string | null = null;
   let serverStatus: string | null = null;
@@ -191,6 +195,7 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     expiresAt: share.expiresAt,
     serverStatus: serverStatus ?? null,
     lastHeartbeatAt: lastHeartbeatAt ?? null,
+    blockMyPrivateDevices,
     ...(sessionState ? { sessionState } : {}),
     ...(agentType ? { agentType } : {}),
     ...(parentSessionName ? { parentSessionName } : {}),
@@ -271,7 +276,14 @@ async function auditShareLifecycle(c: Context<{ Bindings: Env; Variables: { user
 tabSharingRoutes.get('/shares', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const shares = await listActiveSharesForUser(c.env.DB, userId, Date.now());
-  const entries = await Promise.all(shares.map((share) => recipientShareEntry(c.env.DB, share)));
+  const blockedServerIds = await listServerPrivateDeviceBlocksForUser(
+    c.env.DB,
+    userId,
+    shares.map((share) => share.serverId),
+  );
+  const entries = await Promise.all(
+    shares.map((share) => recipientShareEntry(c.env.DB, share, blockedServerIds.has(share.serverId))),
+  );
   return c.json({ shares: entries.filter((entry) => entry !== null) });
 });
 

@@ -1381,6 +1381,32 @@ export async function revokeShare(serverId: string, shareId: string): Promise<Sh
   return normalizeShareGrantSummary(res.share);
 }
 
+export interface MyPrivateDevicePolicyResponse {
+  ok: boolean;
+  serverId: string;
+  blockPrivateDevices: boolean;
+}
+
+export async function getMyServerPrivateDevicePolicy(serverId: string): Promise<MyPrivateDevicePolicyResponse> {
+  return apiFetch<MyPrivateDevicePolicyResponse>(
+    `/api/server/${encodeURIComponent(serverId)}/my-private-device-policy`,
+    { method: 'GET' },
+  );
+}
+
+export async function updateMyServerPrivateDevicePolicy(
+  serverId: string,
+  blockPrivateDevices: boolean,
+): Promise<MyPrivateDevicePolicyResponse> {
+  return apiFetch<MyPrivateDevicePolicyResponse>(
+    `/api/server/${encodeURIComponent(serverId)}/my-private-device-policy`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ blockPrivateDevices }),
+    },
+  );
+}
+
 export interface SharedEntrySummary {
   id: string;
   serverId: string;
@@ -1392,6 +1418,7 @@ export interface SharedEntrySummary {
   serverStatus?: string | null;
   lastHeartbeatAt?: number | null;
   statusObservedAt?: number | null;
+  blockMyPrivateDevices?: boolean;
   sessionState?: string | null;
   agentType?: string | null;
   parentSessionName?: string | null;
@@ -1437,6 +1464,7 @@ export function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary 
     statusObservedAt: typeof raw.statusObservedAt === 'number' && Number.isFinite(raw.statusObservedAt)
       ? raw.statusObservedAt
       : (typeof raw.lastHeartbeatAt === 'number' && Number.isFinite(raw.lastHeartbeatAt) ? raw.lastHeartbeatAt : null),
+    ...(typeof raw.blockMyPrivateDevices === 'boolean' ? { blockMyPrivateDevices: raw.blockMyPrivateDevices } : {}),
     ...(sessionState ? { sessionState } : {}),
     ...(agentType ? { agentType } : {}),
     ...(parentSessionName ? { parentSessionName } : {}),

@@ -238,6 +238,11 @@
     },
     "create": "Añadir colaborador",
     "creating": "Añadiendo...",
+    "privateDeviceBlock": {
+      "label": "Bloquear acceso a mis dispositivos privados no compartidos",
+      "help": "Al activarlo, incluso tus propios mensajes en esta máquina no autorizarán el acceso a tus dispositivos personales no compartidos (solo afecta a tu cuenta).",
+      "shortHelp": "Solo protege tus dispositivos no compartidos en {{server}}"
+    },
     "scope": {
       "current": "Ámbito de colaboración"
     },

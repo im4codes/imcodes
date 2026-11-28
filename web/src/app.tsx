@@ -389,7 +389,7 @@ import {
 } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
-import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, SharedOpenTimeoutError, listManagedSharesForServer, type SharedEntrySummary, getApiBaseUrl } from './api.js';
+import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, SharedOpenTimeoutError, listManagedSharesForServer, updateMyServerPrivateDevicePolicy, type SharedEntrySummary, getApiBaseUrl } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { recordPerfRender } from './perf-render-debug.js';
 import { isExpandedMobileViewport, isMobileDevice, subscribeDeviceLayoutChange } from './mobile-device.js';
@@ -2856,6 +2856,15 @@ function InternalMainApp() {
     return runDiscovery;
   }, [auth]);
   refreshSharedEntriesRef.current = refreshSharedEntries;
+
+  const handleToggleSharedPrivateDeviceBlock = useCallback(async (serverId: string, blockPrivateDevices: boolean) => {
+    const res = await updateMyServerPrivateDevicePolicy(serverId, blockPrivateDevices);
+    setSharedEntries((prev) => prev.map((entry) => (
+      entry.serverId === serverId
+        ? { ...entry, blockMyPrivateDevices: res.blockPrivateDevices }
+        : entry
+    )));
+  }, []);
 
   useEffect(() => {
     if (!auth) return;
@@ -11879,6 +11888,7 @@ function InternalMainApp() {
               openingEntryId={openingSharedEntryId}
               onOpen={(entry) => void handleOpenSharedEntry(entry)}
               onRefresh={() => void refreshSharedEntries()}
+              onTogglePrivateDeviceBlock={handleToggleSharedPrivateDeviceBlock}
             />
             {/* Session tree — hidden via the ⊞ list toggle above */}
             {!mobileHideTabBar && <SessionTree
@@ -12088,6 +12098,7 @@ function InternalMainApp() {
                 openingSharedEntryId={openingSharedEntryId}
                 onOpenSharedEntry={(entry) => void handleOpenSharedEntry(entry)}
                 onRefreshSharedEntries={() => void refreshSharedEntries()}
+                onTogglePrivateDeviceBlock={handleToggleSharedPrivateDeviceBlock}
               />
             </Suspense>
           </div>
@@ -12205,6 +12216,7 @@ function InternalMainApp() {
                               setShowMobileServerMenu(false);
                             }}
                             onRefresh={() => void refreshSharedEntries()}
+                            onTogglePrivateDeviceBlock={handleToggleSharedPrivateDeviceBlock}
                           />
                         )}
                       </>
@@ -12934,6 +12946,7 @@ function InternalMainApp() {
                     openingEntryId={openingSharedEntryId}
                     onOpen={(entry) => void handleOpenSharedEntry(entry)}
                     onRefresh={() => void refreshSharedEntries()}
+                    onTogglePrivateDeviceBlock={handleToggleSharedPrivateDeviceBlock}
                   />
                 </div>
               )}

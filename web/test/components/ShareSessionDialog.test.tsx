@@ -10,6 +10,8 @@ const apiMocks = vi.hoisted(() => ({
   createShare: vi.fn(),
   updateShare: vi.fn(),
   revokeShare: vi.fn(),
+  getMyServerPrivateDevicePolicy: vi.fn(),
+  updateMyServerPrivateDevicePolicy: vi.fn(),
 }));
 
 vi.mock('react-i18next', () => ({
@@ -43,6 +45,8 @@ vi.mock('../../src/api.js', () => ({
   createShare: apiMocks.createShare,
   updateShare: apiMocks.updateShare,
   revokeShare: apiMocks.revokeShare,
+  getMyServerPrivateDevicePolicy: apiMocks.getMyServerPrivateDevicePolicy,
+  updateMyServerPrivateDevicePolicy: apiMocks.updateMyServerPrivateDevicePolicy,
   ApiError: class ApiError extends Error {
     body?: string;
     constructor(body?: string) {
@@ -66,6 +70,12 @@ describe('ShareSessionDialog security warnings', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     apiMocks.listSharesForTarget.mockResolvedValue([]);
+    apiMocks.getMyServerPrivateDevicePolicy.mockResolvedValue({ ok: true, serverId: 'srv-1', blockPrivateDevices: false });
+    apiMocks.updateMyServerPrivateDevicePolicy.mockImplementation(async (serverId: string, blockPrivateDevices: boolean) => ({
+      ok: true,
+      serverId,
+      blockPrivateDevices,
+    }));
   });
 
   afterEach(() => {
@@ -232,5 +242,41 @@ describe('ShareSessionDialog security warnings', () => {
     expect(dialog?.querySelector('.share-security-warning')).toBeTruthy();
     expect(dialog?.querySelector('.share-dialog-panel')).toBeTruthy();
     expect(dialog?.querySelector('.ask-actions')).toBeTruthy();
+  });
+
+  it('hydrates and toggles Owner self-protection blockPrivateDevices for session variant and omits it for passive machine variant', async () => {
+    apiMocks.getMyServerPrivateDevicePolicy.mockResolvedValue({
+      ok: true,
+      serverId: 'srv-1',
+      blockPrivateDevices: true,
+    });
+    const sessionView = render(
+      <ShareSessionDialog
+        variant="session"
+        target={defaultTarget}
+        onClose={vi.fn()}
+      />
+    );
+
+    const toggle = screen.getByTestId('share-private-device-toggle');
+    const checkbox = toggle.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    await waitFor(() => expect(checkbox.checked).toBe(true));
+
+    fireEvent.click(checkbox);
+    await waitFor(() => {
+      expect(apiMocks.updateMyServerPrivateDevicePolicy).toHaveBeenCalledWith('srv-1', false);
+    });
+    expect(checkbox.checked).toBe(false);
+    sessionView.unmount();
+
+    render(
+      <ShareSessionDialog
+        variant="machine"
+        fixedTarget={{ kind: 'server', serverId: 'ctl-1' }}
+        target={{ ...defaultTarget, serverId: 'ctl-1' }}
+        onClose={vi.fn()}
+      />
+    );
+    expect(screen.queryByTestId('share-private-device-toggle')).toBeNull();
   });
 });

@@ -24,6 +24,8 @@ const apiMocks = vi.hoisted(() => ({
   createShare: vi.fn(),
   updateShare: vi.fn(),
   revokeShare: vi.fn(),
+  getMyServerPrivateDevicePolicy: vi.fn(),
+  updateMyServerPrivateDevicePolicy: vi.fn(),
 }));
 
 vi.mock('react-i18next', () => ({
@@ -42,6 +44,8 @@ vi.mock('../../src/api.js', () => ({
   createShare: apiMocks.createShare,
   updateShare: apiMocks.updateShare,
   revokeShare: apiMocks.revokeShare,
+  getMyServerPrivateDevicePolicy: apiMocks.getMyServerPrivateDevicePolicy,
+  updateMyServerPrivateDevicePolicy: apiMocks.updateMyServerPrivateDevicePolicy,
   ApiError: class ApiError extends Error {
     body?: string;
     constructor(body?: string) {
@@ -68,6 +72,7 @@ describe('ShareSessionDialog machine collaboration real-locale verification', ()
   beforeEach(async () => {
     vi.clearAllMocks();
     apiMocks.listSharesForTarget.mockResolvedValue([]);
+    apiMocks.getMyServerPrivateDevicePolicy.mockResolvedValue({ ok: true, serverId: 'srv-1', blockPrivateDevices: false });
     if (!realI18n.isInitialized) {
       await realI18n.init({
         resources: Object.fromEntries(ALL_LOCALES.map((loc) => [loc, { translation: loadLocale(loc) }])),

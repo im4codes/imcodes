@@ -28,6 +28,8 @@ const apiMocks = vi.hoisted(() => ({
   createShare: vi.fn(),
   updateShare: vi.fn(),
   revokeShare: vi.fn(),
+  getMyServerPrivateDevicePolicy: vi.fn(),
+  updateMyServerPrivateDevicePolicy: vi.fn(),
 }));
 
 vi.mock('../src/api.js', async (importOriginal) => {
@@ -38,6 +40,8 @@ vi.mock('../src/api.js', async (importOriginal) => {
     createShare: apiMocks.createShare,
     updateShare: apiMocks.updateShare,
     revokeShare: apiMocks.revokeShare,
+    getMyServerPrivateDevicePolicy: apiMocks.getMyServerPrivateDevicePolicy,
+    updateMyServerPrivateDevicePolicy: apiMocks.updateMyServerPrivateDevicePolicy,
   };
 });
 
@@ -867,5 +871,49 @@ describe('collaborative tab sharing UI', () => {
     const source = readFileSync(join(WEB_ROOT, 'src/components/SessionControls.tsx'), 'utf8');
     expect(source).toContain("t('share.menu.shareTab')");
     expect(source).toContain('onShareSession(activeSession, subSessionId ?? null)');
+  });
+
+  it('renders deduplicated Participant self-protection toggle per shared host and updates private device policy', async () => {
+    const onTogglePrivateDeviceBlock = vi.fn().mockResolvedValue(undefined);
+    render(
+      <SharedEntriesPanel
+        entries={[
+          {
+            id: 'share-1',
+            serverId: 'srv-1',
+            serverName: 'Team Workstation',
+            role: 'participant',
+            status: 'active',
+            blockMyPrivateDevices: false,
+            targetLabel: 'Tab A',
+            target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_a_brain' },
+          },
+          {
+            id: 'share-2',
+            serverId: 'srv-1',
+            serverName: 'Team Workstation',
+            role: 'participant',
+            status: 'active',
+            blockMyPrivateDevices: false,
+            targetLabel: 'Tab B',
+            target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_b_brain' },
+          },
+        ]}
+        onOpen={() => {}}
+        onRefresh={() => {}}
+        onTogglePrivateDeviceBlock={onTogglePrivateDeviceBlock}
+      />,
+    );
+
+    const rows = document.querySelectorAll('[data-testid="shared-private-policy-srv-1"]');
+    expect(rows).toHaveLength(1);
+    const checkbox = rows[0]!.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+
+    fireEvent.click(checkbox);
+    await waitFor(() => {
+      expect(onTogglePrivateDeviceBlock).toHaveBeenCalledWith('srv-1', true);
+    });
+    expect(checkbox.checked).toBe(true);
   });
 });

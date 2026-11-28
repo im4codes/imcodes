@@ -1,7 +1,15 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { ApiError, createShare, listSharesForTarget, revokeShare, updateShare } from '../api.js';
+import {
+  ApiError,
+  createShare,
+  getMyServerPrivateDevicePolicy,
+  listSharesForTarget,
+  revokeShare,
+  updateMyServerPrivateDevicePolicy,
+  updateShare,
+} from '../api.js';
 import {
   buildCurrentTabShareTarget,
   isParticipantRole,
@@ -62,6 +70,9 @@ export function ShareSessionDialog({
   const [shares, setShares] = useState<ShareGrantSummary[]>([]);
   const [sharesLoading, setSharesLoading] = useState(false);
   const [updatingShareId, setUpdatingShareId] = useState<string | null>(null);
+  const [blockPrivateDevices, setBlockPrivateDevices] = useState(false);
+  const [policyLoading, setPolicyLoading] = useState(false);
+  const [policySaving, setPolicySaving] = useState(false);
   const accountTabRef = useRef<HTMLButtonElement>(null);
   const remoteDesktopTabRef = useRef<HTMLButtonElement>(null);
   const hasRemoteDesktopSection = variant === 'machine' && remoteDesktopAccess !== undefined;
@@ -113,6 +124,46 @@ export function ShareSessionDialog({
   useEffect(() => {
     void loadShares();
   }, [loadShares]);
+
+  useEffect(() => {
+    if (variant === 'machine' || typeof getMyServerPrivateDevicePolicy !== 'function') return;
+    const req = getMyServerPrivateDevicePolicy(target.serverId);
+    if (!req || typeof req.then !== 'function') return;
+    let cancelled = false;
+    setPolicyLoading(true);
+    void req
+      .then((res) => {
+        if (!cancelled && res && typeof res === 'object') {
+          setBlockPrivateDevices(res.blockPrivateDevices === true);
+        }
+      })
+      .catch(() => {
+        // Policy read failure stays silent so grant management keeps working.
+      })
+      .finally(() => {
+        if (!cancelled) setPolicyLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [target.serverId, variant]);
+
+  const handleTogglePrivateDevices = useCallback(async () => {
+    if (policySaving || policyLoading || typeof updateMyServerPrivateDevicePolicy !== 'function') return;
+    const next = !blockPrivateDevices;
+    setPolicySaving(true);
+    setError(null);
+    setBlockPrivateDevices(next);
+    try {
+      const res = await updateMyServerPrivateDevicePolicy(target.serverId, next);
+      setBlockPrivateDevices(res.blockPrivateDevices === true);
+    } catch (err) {
+      setBlockPrivateDevices(!next);
+      setError(formatShareError(err));
+    } finally {
+      setPolicySaving(false);
+    }
+  }, [blockPrivateDevices, policyLoading, policySaving, target.serverId]);
 
   const submit = useCallback(async () => {
     const trimmedUser = targetUser.trim();
@@ -333,6 +384,21 @@ export function ShareSessionDialog({
                 ))
               )}
             </div>
+
+            {variant !== 'machine' && (
+              <label class="share-private-device-toggle" data-testid="share-private-device-toggle">
+                <input
+                  type="checkbox"
+                  checked={blockPrivateDevices}
+                  disabled={policyLoading || policySaving}
+                  onChange={() => void handleTogglePrivateDevices()}
+                />
+                <span class="share-private-device-toggle-text">
+                  <span class="share-private-device-toggle-title">{t('share.privateDeviceBlock.label')}</span>
+                  <span class="share-private-device-toggle-help">{t('share.privateDeviceBlock.help')}</span>
+                </span>
+              </label>
+            )}
           </div>
         )}
 

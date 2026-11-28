@@ -123,6 +123,8 @@ describe('ShareSessionDialog mobile 375x667 & desktop layout in Chromium', () =>
                 export async function createShare() { return { id: 'sh-1', targetUserId: 'u1', role: 'viewer', status: 'active' }; }
                 export async function updateShare() { return { id: 'sh-1', role: 'participant' }; }
                 export async function revokeShare() { return { id: 'sh-1', status: 'revoked' }; }
+                export async function getMyServerPrivateDevicePolicy(serverId) { return { ok: true, serverId, blockPrivateDevices: false }; }
+                export async function updateMyServerPrivateDevicePolicy(serverId, blockPrivateDevices) { return { ok: true, serverId, blockPrivateDevices }; }
               `,
               loader: 'js',
               resolveDir: webDir,
