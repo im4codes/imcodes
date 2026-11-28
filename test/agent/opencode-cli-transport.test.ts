@@ -159,6 +159,14 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
       env: { PATH: `${nonExecDir}:${join(subDirAsFile)}`, HOME: join(root, 'empty-home') },
       platform: 'linux',
       homeDir: join(root, 'empty-home'),
+      includeSystemFallback: false,
+    })).toBeNull();
+
+    // Causal: on macOS host with /opt/homebrew/bin/opencode, platform: 'linux' never probes macOS homebrew
+    expect(resolveOpenCodeCliBinary({
+      env: { PATH: '', HOME: join(root, 'empty-home') },
+      platform: 'linux',
+      homeDir: join(root, 'empty-home'),
     })).toBeNull();
 
     const winDir = join(root, 'win-path');
@@ -245,6 +253,7 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
       env: { PATH: '', HOME: emptyHome },
       platform: 'linux',
       homeDir: emptyHome,
+      includeSystemFallback: false,
     })).toEqual({ mode: OPENCODE_TRANSPORT_MODES.EMBEDDED, reason: 'cli-not-found' });
 
     const v1Res = await resolveOpenCodeTransport({
@@ -621,7 +630,7 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
       binaryPath: wrapper,
       hostname: '127.0.0.1',
       port: 0,
-      timeout: 250,
+      timeout: 1_500,
       signal: new AbortController().signal,
       hostGroupKey: 'f2-timeout',
     })).rejects.toThrow(/timed out/i);

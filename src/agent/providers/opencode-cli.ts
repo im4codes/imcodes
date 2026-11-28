@@ -1,12 +1,13 @@
-import { spawn, execFile, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { accessSync, constants as fsConstants, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, dirname, extname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
-import { promisify } from 'node:util';
 import { bindSharedProviderProcessResource, type AgentProcessResource } from './agent-process-resource.js';
 import { parseNpmCmdShim, resolveBinaryOnWindows } from '../transport-paths.js';
 import { PROVIDER_ERROR_CODES, type ProviderConfig, type ProviderError } from '../transport-provider.js';
+import { gateChildStream } from '../../util/event-loop-backpressure.js';
+import { execFileOffMain } from '../../util/exec-helper.js';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import logger from '../../util/logger.js';
 import type {
@@ -15,8 +16,6 @@ import type {
   OpenCodeSdkRuntimeStartResult,
   OpenCodeSdkStartOptions,
 } from './opencode-sdk.js';
-
-const execFileP = promisify(execFile);
 
 const LOOPBACK_HOST = '127.0.0.1';
 const DEFAULT_CLI_PROBE_TIMEOUT_MS = 3_000;
@@ -252,6 +251,7 @@ export function resolveOpenCodeCliBinary(options: {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   homeDir?: string;
+  includeSystemFallback?: boolean;
 } = {}): string | null {
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
@@ -285,6 +285,7 @@ export function resolveOpenCodeCliBinary(options: {
   }
 
   // 4. Per-user / common install locations for sparse launchd / systemd PATHs
+  const includeSystem = options.includeSystemFallback ?? (platform === process.platform);
   const fallbackCandidates = platform === 'win32'
     ? [
         join(home, '.opencode', 'bin', 'opencode.exe'),
@@ -294,8 +295,8 @@ export function resolveOpenCodeCliBinary(options: {
     : [
         join(home, '.opencode', 'bin', 'opencode'),
         join(home, '.local', 'bin', 'opencode'),
-        '/opt/homebrew/bin/opencode',
-        '/usr/local/bin/opencode',
+        ...(includeSystem && platform === 'darwin' ? ['/opt/homebrew/bin/opencode'] : []),
+        ...(includeSystem ? ['/usr/local/bin/opencode'] : []),
       ];
 
   for (const candidate of fallbackCandidates) {
@@ -311,6 +312,7 @@ export function resolveOpenCodeCliLaunchPlan(options: {
   platform?: NodeJS.Platform;
   homeDir?: string;
   nodeExecutable?: string;
+  includeSystemFallback?: boolean;
 } = {}): OpenCodeCliLaunchPlan | null {
   const resolved = resolveOpenCodeCliBinary(options);
   if (!resolved) return null;
@@ -372,7 +374,7 @@ export async function probeOpenCodeCli(
     const rawOutput = options.execProbe
       ? await options.execProbe(cmd.executable, cmd.args, timeoutMs, launchPlan)
       : await (async () => {
-          const { stdout, stderr } = await execFileP(cmd.executable, cmd.args, {
+          const { stdout, stderr } = await execFileOffMain(cmd.executable, cmd.args, {
             timeout: timeoutMs,
             signal: options.signal,
             windowsHide: true,
@@ -409,6 +411,7 @@ export async function resolveOpenCodeTransport(options: {
   timeoutMs?: number;
   signal?: AbortSignal;
   execProbe?: NonNullable<Parameters<typeof probeOpenCodeCli>[1]>['execProbe'];
+  includeSystemFallback?: boolean;
 }): Promise<OpenCodeTransportResolution> {
   if (options.hookOverridden) {
     return { mode: OPENCODE_TRANSPORT_MODES.HOOK_OVERRIDE, reason: 'runtime-hook-override' };
@@ -448,6 +451,7 @@ export async function resolveOpenCodeTransport(options: {
     env,
     platform: options.platform,
     homeDir: options.homeDir,
+    includeSystemFallback: options.includeSystemFallback,
   });
   if (!launchPlan) {
     if (cliForced) {
@@ -869,7 +873,7 @@ async function spawnV2ServeProcess(options: {
     timer.unref?.();
 
     options.signal.addEventListener('abort', onAbort, { once: true });
-    child.stdout?.on('data', onChunk);
+    gateChildStream(child.stdout)?.on('data', onChunk);
     child.stderr?.on('data', onChunk);
     child.once('error', onError);
     child.once('exit', onExit);

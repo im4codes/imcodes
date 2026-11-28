@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import { pathToFileURL } from 'node:url';
+import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import type {
   ApprovalRequest,
   ProviderCapabilities,
@@ -305,7 +306,7 @@ async function spawnV1OpencodeServer(options: OpenCodeV1RuntimeStartOptions): Pr
     timer.unref?.();
 
     options.signal.addEventListener('abort', onAbort, { once: true });
-    child.stdout?.on('data', onChunk);
+    gateChildStream(child.stdout)?.on('data', onChunk);
     child.stderr?.on('data', onChunk);
     child.once('error', onError);
     child.once('exit', onExit);
