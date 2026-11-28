@@ -11,7 +11,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   P2P_RUN_STATE_DIR_ENV,
@@ -48,15 +48,14 @@ describe('PR-ζ persistence hardening', () => {
       repoRoot,
       runId: 'run-pid-tmp',
     });
-    // Persistence is fire-and-forget; allow microtasks to settle.
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const files = readdirSync(join(runStateRoot, 'run-pid-tmp'));
-    // Final file is `identity.json`. Tmp files (if observable) include the
-    // pid pattern. We cannot easily race two writes inside one test, so
-    // we assert the FINAL file exists AND no leftover .tmp lingers (tmp
-    // is renamed atomically).
-    expect(files).toContain('identity.json');
-    expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([]);
+    const dir = join(runStateRoot, 'run-pid-tmp');
+    // Persistence is fire-and-forget; wait for atomic rename to complete so no
+    // in-flight .tmp lingers before asserting on the directory contents.
+    await vi.waitFor(() => {
+      const files = readdirSync(dir);
+      expect(files).toContain('identity.json');
+      expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([]);
+    }, { timeout: 5000 });
   });
 
   it('clearPersistedFrozenP2pArtifactIdentity removes both memory and disk (A2)', async () => {
@@ -65,11 +64,15 @@ describe('PR-ζ persistence hardening', () => {
       repoRoot,
       runId: 'run-clear',
     });
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const dir = join(runStateRoot, 'run-clear');
+    await vi.waitFor(() => {
+      const files = readdirSync(dir);
+      expect(files).toContain('identity.json');
+      expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([]);
+    }, { timeout: 5000 });
     expect(getFrozenP2pArtifactIdentity('run-clear')).toBeDefined();
     await clearPersistedFrozenP2pArtifactIdentity('run-clear');
     expect(getFrozenP2pArtifactIdentity('run-clear')).toBeUndefined();
-    const dir = join(runStateRoot, 'run-clear');
     expect(() => readFileSync(join(dir, 'identity.json'), 'utf8')).toThrow();
   });
 

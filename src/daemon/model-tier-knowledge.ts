@@ -129,6 +129,11 @@ function isSqliteBusyError(err: unknown): boolean {
     || /database is locked|SQLITE_BUSY/i.test(msg);
 }
 
+function sleepSyncMs(ms: number): void {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 /**
  * Acquire an OS-kernel transactional lock via SQLite `BEGIN IMMEDIATE` on a
  * companion `.lock.db` file so concurrent processes serialize strictly without
@@ -157,8 +162,21 @@ function withSqliteKnowledgeLockSync<T>(
       throw err;
     }
     const result = fn();
-    db.exec('COMMIT;');
-    inTx = false;
+    const commitDeadline = Date.now() + timeoutMs;
+    while (true) {
+      try {
+        db.exec('COMMIT;');
+        inTx = false;
+        break;
+      } catch (err) {
+        if (!isSqliteBusyError(err)) throw err;
+        const remaining = commitDeadline - Date.now();
+        if (remaining <= 0) {
+          throw new Error(`Timed out committing model-tier-knowledge lock: ${lockDbPath}`);
+        }
+        sleepSyncMs(Math.min(10, Math.max(1, remaining)));
+      }
+    }
     return result;
   } catch (err) {
     if (inTx) {
@@ -203,8 +221,21 @@ async function withSqliteKnowledgeLockAsync<T>(
     }
     try {
       const result = fn();
-      db.exec('COMMIT;');
-      inTx = false;
+      const commitDeadline = Date.now() + timeoutMs;
+      while (true) {
+        try {
+          db.exec('COMMIT;');
+          inTx = false;
+          break;
+        } catch (err) {
+          if (!isSqliteBusyError(err)) throw err;
+          if (Date.now() >= commitDeadline) {
+            throw new Error(`Timed out committing model-tier-knowledge lock: ${lockDbPath}`);
+          }
+          const jitter = 5 + Math.floor(Math.random() * 11);
+          await new Promise((resolve) => setTimeout(resolve, jitter));
+        }
+      }
       return result;
     } catch (err) {
       if (inTx) {

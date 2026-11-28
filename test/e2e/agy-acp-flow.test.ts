@@ -107,11 +107,11 @@ describe('real AG ACP SDK/runtime/durable store/relay', () => {
       await runtime.appendExternalMessageToActiveTurn('APPEND_STAYS_A', 'model-selection-append');
       expect(finalized()).toHaveLength(0);
     } finally { unlock(); await lock; await unlink(log + '.hold'); }
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
     const rows = await requests();
     expect(rows.filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'model-c']);
     expect(new Set(rows.filter(row => row.method === 'session/set_model' || row.method === 'session/prompt').map(row => row.params.sessionId)).size).toBe(1);
     expect(rows.some(row => row.method === 'session/cancel')).toBe(false);
-    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
     expect(finalized()).toHaveLength(1);
     expect(nativeCompletions).toEqual([expect.objectContaining({ model: 'model-a' })]);
     expect(getSession(NAME)).toMatchObject({ requestedModel: 'model-c', activeModel: 'model-c', modelDisplay: 'model-c' });

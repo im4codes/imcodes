@@ -442,6 +442,43 @@ describe('probeExecutionPoolSdks', () => {
     expect(reloaded.map((r) => r.model).sort()).toEqual(['claude-proc-alpha', 'gpt-proc-beta']);
   });
 
+  it('survives heavy cross-process write contention without SQLITE_BUSY on COMMIT', async () => {
+    const dir = makeTmpDir();
+    const knowledgeFile = join(dir, 'model-tier-knowledge.json');
+    const moduleUrl = pathToFileURL(resolve(process.cwd(), 'src/daemon/model-tier-knowledge.ts')).href;
+    const tsxLoader = pathToFileURL(resolve(process.cwd(), 'node_modules/tsx/dist/loader.mjs')).href;
+    const workerCount = 6;
+    const roundsPerWorker = 5;
+
+    const runStressWorker = (workerIdx: number) => new Promise<void>((resolveWorker, rejectWorker) => {
+      const script = [
+        `import { upsertModelTierKnowledge } from ${JSON.stringify(moduleUrl)};`,
+        `for (let r = 0; r < ${roundsPerWorker}; r += 1) {`,
+        `  await upsertModelTierKnowledge([{ provider: 'codex-sdk', model: \`stress-w${workerIdx}-r\${r}\`, tier: 'secondary', source: 'stress_test' }], ${JSON.stringify(knowledgeFile)});`,
+        `}`,
+      ].join('\n');
+      const child = spawn(process.execPath, ['--import', tsxLoader, '--input-type=module', '-e', script], {
+        cwd: process.cwd(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+      child.on('error', rejectWorker);
+      child.on('exit', (code) => {
+        if (code === 0) resolveWorker();
+        else rejectWorker(new Error(`Stress worker ${workerIdx} exited with ${code}: ${stderr}`));
+      });
+    });
+
+    await Promise.all(Array.from({ length: workerCount }, (_, idx) => runStressWorker(idx)));
+
+    const reloaded = loadModelTierKnowledge(knowledgeFile);
+    const expectedModels = Array.from({ length: workerCount }, (_, w) =>
+      Array.from({ length: roundsPerWorker }, (__, r) => `stress-w${w}-r${r}`),
+    ).flat().sort();
+    expect(reloaded.map((r) => r.model).sort()).toEqual(expectedModels);
+  }, 30_000);
+
   it('excludes UNSTARTED native AGY sessions and cold copilot/cursor caches without spawning headless CLIs', async () => {
     const dir = makeTmpDir();
     const homeDir = join(dir, 'home');
