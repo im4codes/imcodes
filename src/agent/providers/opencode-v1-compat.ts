@@ -457,20 +457,51 @@ class OpenCodeRequestTimeoutError extends Error {
   }
 }
 
-function withOpenCodeRequestTimeout<T>(promise: Promise<T>, operation: string): Promise<T> {
+function withOpenCodeRequestTimeout<T>(
+  promise: Promise<T>,
+  operation: string,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal?.aborted) {
+    const abortErr = new Error(`OpenCode ${operation} aborted`);
+    abortErr.name = 'AbortError';
+    return Promise.reject(abortErr);
+  }
   return new Promise<T>((resolveTimeout, rejectTimeout) => {
-    const timer = setTimeout(
-      () => rejectTimeout(new OpenCodeRequestTimeoutError(operation)),
-      MISSING_FINAL_RECOVERY_TIMEOUT_MS,
-    );
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = signal
+      ? () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          const abortErr = new Error(`OpenCode ${operation} aborted`);
+          abortErr.name = 'AbortError';
+          rejectTimeout(abortErr);
+        }
+      : null;
+    if (signal && onAbort) signal.addEventListener('abort', onAbort, { once: true });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      rejectTimeout(new OpenCodeRequestTimeoutError(operation));
+    }, MISSING_FINAL_RECOVERY_TIMEOUT_MS);
     timer.unref?.();
     promise.then(
       (value) => {
-        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        cleanup();
         resolveTimeout(value);
       },
       (error) => {
-        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        cleanup();
         rejectTimeout(error);
       },
     );
@@ -1243,28 +1274,33 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     const preAdmissionAbort = new AbortController();
     state.pendingAdmissionAbort = preAdmissionAbort;
     try {
+      // Perform the read-only duplicate-delivery lookup outside the provider session lock
+      // with abort+deadline protection so an ownership transfer or detach can never deadlock
+      // behind a stalled upstream GET.
+      if (await this.hasAcceptedPrompt(state, messageId, preAdmissionAbort.signal)) {
+        return;
+      }
       await this.withProviderSessionLock(state.providerSessionId, async () => {
         if (preAdmissionAbort.signal.aborted || !this.isCurrent(state, generation) || state.cancelled) return;
         this.assertRouteOwner(state);
-        if (await this.hasAcceptedPrompt(state, messageId)) {
-          return;
-        }
-        this.assertRouteOwner(state);
-        if (preAdmissionAbort.signal.aborted || !this.isCurrent(state, generation) || state.cancelled) return;
-        await invokeWithOptionalAbort(
-          state.client.session.promptAsync.bind(state.client.session),
-          {
-            path: { id: state.providerSessionId },
-            query: { directory: state.cwd },
-            body: {
-              messageID: messageId,
-              ...(model ? { model } : {}),
-              ...(variant ? { variant } : {}),
-              ...(system ? { system } : {}),
-              parts,
+        await withOpenCodeRequestTimeout(
+          invokeWithOptionalAbort(
+            state.client.session.promptAsync.bind(state.client.session),
+            {
+              path: { id: state.providerSessionId },
+              query: { directory: state.cwd },
+              body: {
+                messageID: messageId,
+                ...(model ? { model } : {}),
+                ...(variant ? { variant } : {}),
+                ...(system ? { system } : {}),
+                parts,
+              },
+              throwOnError: true,
             },
-            throwOnError: true,
-          },
+            preAdmissionAbort.signal,
+          ),
+          'prompt submission',
           preAdmissionAbort.signal,
         );
       });
@@ -1273,7 +1309,7 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
       if (!this.isCurrent(state, generation) || state.cancelled) return;
       if (isTransientRequestFailure(error)) {
         try {
-          const acceptance = await this.waitForPromptAcceptance(state, generation, messageId);
+          const acceptance = await this.waitForPromptAcceptance(state, generation, messageId, preAdmissionAbort.signal);
           this.assertRouteOwner(state);
           if (acceptance === 'accepted' || !this.isCurrent(state, generation) || state.cancelled) return;
           if (acceptance === 'unknown') {
@@ -1566,13 +1602,25 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     }
   }
 
-  private async hasAcceptedPrompt(state: OpenCodeSessionState, messageId: string): Promise<boolean> {
+  private async hasAcceptedPrompt(
+    state: OpenCodeSessionState,
+    messageId: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     try {
-      const result = await state.client.session.message({
-        path: { id: state.providerSessionId, messageID: messageId },
-        query: { directory: state.cwd },
-        throwOnError: true,
-      });
+      const result = await withOpenCodeRequestTimeout(
+        invokeWithOptionalAbort(
+          state.client.session.message.bind(state.client.session),
+          {
+            path: { id: state.providerSessionId, messageID: messageId },
+            query: { directory: state.cwd },
+            throwOnError: true,
+          },
+          signal,
+        ),
+        'prompt acceptance check',
+        signal,
+      );
       return safeString(result.data?.info?.id) === messageId
         && result.data?.info?.role === 'user';
     } catch (error) {
@@ -1585,13 +1633,16 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     state: OpenCodeSessionState,
     generation: number,
     messageId: string,
+    signal?: AbortSignal,
   ): Promise<PromptAcceptance> {
     let lastObservation: PromptAcceptance = 'unknown';
     for (const delayMs of PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS) {
       await sleep(delayMs);
-      if (!this.isCurrent(state, generation) || state.cancelled || !this.isRouteOwner(state)) return 'unknown';
+      if (signal?.aborted || !this.isCurrent(state, generation) || state.cancelled || !this.isRouteOwner(state)) {
+        return 'unknown';
+      }
       try {
-        if (await this.hasAcceptedPrompt(state, messageId)) {
+        if (await this.hasAcceptedPrompt(state, messageId, signal)) {
           logger.warn(
             { provider: this.id, sessionId: state.routeId, messageId },
             'OpenCode prompt submission response failed after the message was accepted; suppressing duplicate replay',
@@ -1600,6 +1651,7 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
         }
         lastObservation = 'absent';
       } catch (error) {
+        if (signal?.aborted) return 'unknown';
         if (!isTransientRequestFailure(error)) throw error;
         lastObservation = 'unknown';
       }
@@ -1671,48 +1723,54 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
         })
       : [];
 
-    const fencedSet = new Set<string>(OPENCODE_V1_NATIVE_AGENT_TOOLS);
-    const preservedSpecificDenies: Array<{ permission: string; pattern: string; action: 'deny' }> = [];
-    const seenSpecificDeny = new Set<string>();
-    for (const rule of existing) {
-      if (rule.action === 'deny' && rule.permission !== '*' && !fencedSet.has(rule.permission)) {
-        const key = `${rule.permission}\0${rule.pattern}`;
-        if (!seenSpecificDeny.has(key)) {
-          seenSpecificDeny.add(key);
-          preservedSpecificDenies.push({ permission: rule.permission, pattern: rule.pattern, action: 'deny' });
-        }
-      }
-    }
-
-    // OpenCode Permission.evaluate matches with .findLast(), and PATCH /session/:id appends.
-    // Check if the trailing ruleset already places wildcard ask BEFORE preserved specific denies & fenced denies,
-    // with no stale non-deny rules after the wildcard ask.
-    let lastWildcardAskIdx = -1;
+    // OpenCode Permission.evaluate matches with .findLast() and PATCH /session/:id appends.
+    // Determine if `existing` already enforces the requested guard (no unshadowed `allow` and
+    // catch-all `*/*` is `ask` or `deny`) and native-agent deny rules (effective `deny` on each tool).
+    let catchAllIdx = -1;
     for (let i = existing.length - 1; i >= 0; i--) {
       const r = existing[i]!;
-      if (r.permission === '*' && r.pattern === '*' && r.action === 'ask') {
-        lastWildcardAskIdx = i;
+      if (r.permission === '*' && r.pattern === '*' && (r.action === 'ask' || r.action === 'deny')) {
+        catchAllIdx = i;
         break;
       }
     }
-    const tail = lastWildcardAskIdx >= 0 ? existing.slice(lastWildcardAskIdx + 1) : existing;
-    const wildcardSatisfied = !guardTools || (
-      lastWildcardAskIdx >= 0
-      && !tail.some((r) => r.action !== 'deny')
+    const guardSatisfied = !guardTools || (
+      catchAllIdx >= 0
+      && !existing.slice(catchAllIdx + 1).some((r) => r.action === 'allow')
     );
-    const deniesSatisfied = preservedSpecificDenies.every((req) =>
-      tail.some((r) => r.permission === req.permission && r.pattern === req.pattern && r.action === 'deny'),
-    );
-    const fencedSatisfied = !nativeAgentsFenced || OPENCODE_V1_NATIVE_AGENT_TOOLS.every((tool) =>
-      tail.some((r) => r.permission === tool && r.pattern === '*' && r.action === 'deny'),
-    );
-    if (wildcardSatisfied && deniesSatisfied && fencedSatisfied) return [];
+    const fencedToolsSatisfied = !nativeAgentsFenced || OPENCODE_V1_NATIVE_AGENT_TOOLS.every((tool) => {
+      for (let i = existing.length - 1; i >= 0; i--) {
+        const r = existing[i]!;
+        if (r.pattern === '*' && (r.permission === tool || r.permission === '*')) {
+          return r.action === 'deny';
+        }
+      }
+      return false;
+    });
+    if (guardSatisfied && fencedToolsSatisfied) return [];
 
+    // Guard already satisfied (e.g. session has `*/* deny`), only missing native-agent deny rules:
+    // append ONLY those deny rules so existing `*/* deny` stays intact.
+    if (guardSatisfied && nativeAgentsFenced) {
+      return OPENCODE_V1_NATIVE_AGENT_TOOLS.map((tool) => ({
+        permission: tool,
+        pattern: '*',
+        action: 'deny' as const,
+      }));
+    }
+
+    // Replay existing rules in exact relative order after a catch-all `*/* ask`, turning
+    // executable `allow` rules into `ask` while preserving every `deny` (including `*/* deny`
+    // and `* /secret/* deny`), then enforce native-agent `deny` last.
+    const fencedSet = new Set<string>(OPENCODE_V1_NATIVE_AGENT_TOOLS);
     const patch: Array<{ permission: string; pattern: string; action: 'allow' | 'deny' | 'ask' }> = [];
     if (guardTools) {
       patch.push({ permission: '*', pattern: '*', action: 'ask' });
     }
-    patch.push(...preservedSpecificDenies);
+    for (const rule of existing) {
+      if (nativeAgentsFenced && fencedSet.has(rule.permission) && rule.pattern === '*') continue;
+      patch.push(guardTools && rule.action === 'allow' ? { ...rule, action: 'ask' } : rule);
+    }
     if (nativeAgentsFenced) {
       for (const tool of OPENCODE_V1_NATIVE_AGENT_TOOLS) {
         patch.push({ permission: tool, pattern: '*', action: 'deny' });

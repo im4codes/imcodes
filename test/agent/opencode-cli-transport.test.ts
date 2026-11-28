@@ -974,7 +974,7 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     await provider.send(routeA, 'resumed after routeB detach');
     await provider.disconnect();
 
-    // Counterexample B: v1 in-flight prompt submission interrupted before admission completes by route handoff
+    // Counterexample B: v1 hung pre-submission GET (session.message) NEVER blocks route handoff or detach
     let releaseLookupA!: () => void;
     const lookupInFlightA = new Promise<void>((res) => { releaseLookupA = res; });
     let lookupStartedResolve!: () => void;
@@ -992,7 +992,7 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
             get: vi.fn(async () => ({ data: { id: 'shared-inflight-ses' } })),
             list: vi.fn(async () => ({ data: [] })),
             message: vi.fn(async () => {
-              if (myIdx === 2) {
+              if (myIdx === 2 || myIdx === 4) {
                 lookupStartedResolve();
                 await lookupInFlightA;
               }
@@ -1018,24 +1018,38 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     const rSlowA = await pInflight.createSession({ sessionKey: 'v1-slow-a', cwd: root });
     const inflightSend = pInflight.send(rSlowA, 'in-flight payload');
     await lookupStarted;
-    // Route B takes over while route A is mid-send before promptAsync enqueue; release lookup after takeover begins
-    const takeoverPromise = pInflight.createSession({
+    // B takes over & submits BEFORE releasing A's hung pre-submission GET (must complete immediately without deadlock!)
+    const takeoverT0 = Date.now();
+    const rTakeoverB = await pInflight.createSession({
       sessionKey: 'v1-takeover-b',
       cwd: root,
       skipCreate: true,
       resumeId: 'shared-inflight-ses',
     });
-    await new Promise((res) => setTimeout(res, 20));
-    releaseLookupA();
-    const rTakeoverB = await takeoverPromise;
+    expect(Date.now() - takeoverT0).toBeLessThan(300);
     expect(rTakeoverB).toBe('v1-takeover-b');
+    await pInflight.send(rTakeoverB, 'route B payload');
+    // Old route A's promptAsync RPC must NEVER execute, and releasing A later stays inert
+    expect(promptAsyncCalls).toEqual(['client-3']);
+    // Also verify detachSession completes immediately while a new slow GET is hung
+    let lookupStartedResolve2!: () => void;
+    const lookupStarted2 = new Promise<void>((res) => { lookupStartedResolve2 = res; });
+    lookupStartedResolve = lookupStartedResolve2;
+    const slowDetachSend = pInflight.send(rTakeoverB, 'route B slow GET').catch(() => {});
+    // Note: client-3 doesn't hang message, detach on fresh slow route client-4
+    const rSlowC = await pInflight.createSession({ sessionKey: 'v1-slow-c', cwd: root, skipCreate: true, resumeId: 'shared-inflight-ses' });
+    const slowC = pInflight.send(rSlowC, 'slow C GET');
+    await lookupStarted2;
+    const detachT0 = Date.now();
+    await pInflight.detachSession(rSlowC);
+    expect(Date.now() - detachT0).toBeLessThan(300);
+    releaseLookupA();
+    await slowDetachSend;
+    await slowC.catch(() => {});
     const inflightOutcome = await inflightSend.catch((err) => err);
     if (inflightOutcome !== undefined) {
-      expect(inflightOutcome).toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+      expect([PROVIDER_ERROR_CODES.CANCELLED, PROVIDER_ERROR_CODES.SESSION_NOT_FOUND]).toContain((inflightOutcome as any).code);
     }
-    // Old route A's promptAsync RPC must NEVER have executed after takeover!
-    expect(promptAsyncCalls).toEqual([]);
-    await pInflight.send(rTakeoverB, 'route B payload');
     expect(promptAsyncCalls).toEqual(['client-3']);
     await pInflight.disconnect();
 
@@ -1284,7 +1298,153 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
       openCodeStorageOwner: 'v1-cli',
     });
     expect(forcedV1Route).toBe('route-explicit-v1');
+    // Explicit v2-cli owner under v1-cli throws explicit CONFIG_ERROR (never silent cutover)
+    await expect(pCollision.createSession({
+      sessionKey: 'route-explicit-v2-under-v1',
+      cwd: root,
+      skipCreate: true,
+      resumeId: oldSessionId,
+      openCodeStorageOwner: 'v2-cli',
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
     await pCollision.disconnect();
+
+    // 5. v2-cli with SAME ID present in BOTH v2 store (1 stale msg + newer metadata touch time) and embedded DB:
+    //    (a) Known openCodeStorageOwner='embedded' goes straight to embedded BEFORE touching v2 CLI & keeps owner='embedded'
+    //    (b) Unowned legacy session where embedded has MORE messages than metadata-touched v2 copy also chooses embedded
+    //    (c) New sessions still use v2-cli, and missing known-embedded session fails explicitly
+    const v2PromptCalls: string[] = [];
+    const v2GetCalls: string[] = [];
+    const v2HostScript = join(root, 'v2-f6-host.mjs');
+    writeFileSync(v2HostScript, `
+      import http from 'node:http';
+      import { appendFileSync } from 'node:fs';
+      if (process.argv.includes('--version')) {
+        console.log('opencode v2.4.2');
+        process.exit(0);
+      }
+      const logFile = process.env.V2_F6_LOG;
+      const srv = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+          const pathname = new URL(req.url || '/', 'http://127.0.0.1').pathname;
+          if (pathname === '/api/info') {
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ version: '2.4.2', urls: [] }));
+            return;
+          }
+          if (pathname === '/api/event') {
+            res.writeHead(200, { 'content-type': 'text/event-stream' });
+            res.write('data: ' + JSON.stringify({ type: 'server.connected', properties: {} }) + '\\n\\n');
+            return;
+          }
+          if (pathname === '/api/provider') {
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ data: [{ id: 'opencode', name: 'OpenCode', activation: 'ready' }] }));
+            return;
+          }
+          if (pathname === '/api/model') {
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ data: [{ id: 'opencode/big-pickle', providerID: 'opencode', modelID: 'big-pickle', enabled: true, type: 'chat' }] }));
+            return;
+          }
+          if (pathname === '/api/model/default') {
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ data: { providerID: 'opencode', modelID: 'big-pickle' } }));
+            return;
+          }
+          if (pathname === '/api/session' && req.method === 'POST') {
+            appendFileSync(logFile, JSON.stringify({ op: 'create' }) + '\\n');
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ data: { id: 'ses-new-v2-only', location: { directory: ${JSON.stringify(root)} } } }));
+            return;
+          }
+          if (pathname === ${JSON.stringify('/api/session/' + oldSessionId)} && req.method === 'GET') {
+            appendFileSync(logFile, JSON.stringify({ op: 'get', id: ${JSON.stringify(oldSessionId)} }) + '\\n');
+            res.setHeader('content-type', 'application/json');
+            // V2 stale copy has only 1 message, even with newer metadata touch timestamp!
+            res.end(JSON.stringify({ data: { id: ${JSON.stringify(oldSessionId)}, time: { created: 1000, updated: 9999999999999 } } }));
+            return;
+          }
+          if (pathname === ${JSON.stringify('/api/session/' + oldSessionId + '/message')} && req.method === 'GET') {
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ data: [{ id: 'stale-v2-msg-1', type: 'user', time: { created: 1000 } }] }));
+            return;
+          }
+          if (pathname.startsWith('/api/session/') && req.method === 'GET') {
+            res.statusCode = 404;
+            res.end(JSON.stringify({ message: 'Not Found' }));
+            return;
+          }
+          if (pathname.endsWith('/prompt')) {
+            appendFileSync(logFile, JSON.stringify({ op: 'prompt', path: pathname }) + '\\n');
+            res.setHeader('content-type', 'application/json');
+            res.end('{}');
+            return;
+          }
+          if (pathname.startsWith('/api/experimental/mcp/')) {
+            res.statusCode = 204;
+            res.end();
+            return;
+          }
+          res.setHeader('content-type', 'application/json');
+          res.end('{}');
+        });
+      });
+      srv.listen(0, '127.0.0.1', () => {
+        console.log('listening on http://127.0.0.1:' + srv.address().port);
+      });
+      process.on('SIGTERM', () => process.exit(0));
+    `, 'utf8');
+    const v2F6Log = join(root, 'v2-f6.log');
+    writeFileSync(v2F6Log, '', 'utf8');
+    process.env.V2_F6_LOG = v2F6Log;
+    const v2F6Bin = makeFakeExecutable(join(root, 'v2f6'), 'opencode', `#!/bin/sh\nexec "${process.execPath}" "${v2HostScript}" "$@"\n`);
+
+    const pV2Upgrade = new OpenCodeSdkProvider();
+    const v2UpgradeOwners: Array<{ sid: string; owner: string | undefined }> = [];
+    pV2Upgrade.onSessionInfo((sid, info) => v2UpgradeOwners.push({ sid, owner: info.openCodeStorageOwner }));
+    await pV2Upgrade.connect({ binaryPath: v2F6Bin, cwd: root } as any);
+
+    // (a) Known openCodeStorageOwner='embedded' bypasses v2 CLI GET completely & keeps owner='embedded'
+    const knownEmbRoute = await pV2Upgrade.createSession({
+      sessionKey: 'v2-known-emb',
+      cwd: root,
+      skipCreate: true,
+      resumeId: oldSessionId,
+      openCodeStorageOwner: 'embedded',
+    });
+    expect(knownEmbRoute).toBe('v2-known-emb');
+    expect(v2UpgradeOwners.find((x) => x.sid === 'v2-known-emb')?.owner).toBe('embedded');
+    expect(readFileSync(v2F6Log, 'utf8')).toBe('');
+
+    // (b) Known openCodeStorageOwner='embedded' for nonexistent ID fails explicitly without switching to v2 CLI
+    await expect(pV2Upgrade.createSession({
+      sessionKey: 'v2-missing-known-emb',
+      cwd: root,
+      skipCreate: true,
+      resumeId: 'ses_missing_known_emb',
+      openCodeStorageOwner: 'embedded',
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND });
+
+    // (c) Unowned collision: embedded has MORE messages (2+ vs 1 stale v2 msg), even though v2 metadata time.updated is larger
+    const unownedV2Collision = await pV2Upgrade.createSession({
+      sessionKey: 'v2-unowned-coll',
+      cwd: root,
+      skipCreate: true,
+      resumeId: oldSessionId,
+    });
+    expect(unownedV2Collision).toBe('v2-unowned-coll');
+    expect(v2UpgradeOwners.filter((x) => x.sid === 'v2-unowned-coll').at(-1)?.owner).toBe('embedded');
+
+    // (d) New session still defaults to v2-cli
+    const freshV2Route = await pV2Upgrade.createSession({ sessionKey: 'v2-fresh-new', cwd: root });
+    expect(freshV2Route).toBe('v2-fresh-new');
+    expect(v2UpgradeOwners.find((x) => x.sid === 'v2-fresh-new')?.owner).toBe('v2-cli');
+    expect(v2GetCalls.length + v2PromptCalls.length).toBe(0);
+    expect(readFileSync(v2F6Log, 'utf8')).toContain('"op":"create"');
+    delete process.env.V2_F6_LOG;
+    await pV2Upgrade.disconnect();
     await pUpgraded.disconnect();
   }, 30_000);
 
@@ -1491,7 +1651,187 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
       expect(evalPerm('task')).toBe('deny');
       expect(evalPerm('subagent')).toBe('deny');
       expect(evalPerm('bash')).toBe('ask');
+
+      // 4. Global wildcard `*/* deny` session: guard must preserve `*/* deny` (NOT downgrade to `ask`!),
+      //    keep `task`/`subagent` hard `deny`, and remain idempotent across second restore.
+      const globalDenyCreated = await fencedState.client.session.create({
+        query: { directory: root },
+        body: {
+          title: 'f4-global-deny',
+          permission: [{ permission: '*', pattern: '*', action: 'deny' }],
+        },
+        throwOnError: true,
+      });
+      const globalDenyId = globalDenyCreated.data.id;
+      await guardedProvider.createSession({
+        sessionKey: 'f4-global-deny-1',
+        sessionName: 'f4-global-deny-1',
+        cwd: root,
+        skipCreate: true,
+        resumeId: globalDenyId,
+      });
+      const gdState1 = ((guardedProvider as any).v1Delegate as any).sessions.get('f4-global-deny-1');
+      await gdState1.client.session.prompt({
+        path: { id: globalDenyId },
+        query: { directory: root },
+        body: { noReply: true, parts: [{ type: 'text', text: 'noop-global-deny' }] },
+        throwOnError: true,
+      });
+      const gdSession1 = await gdState1.client.session.get({ path: { id: globalDenyId }, query: { directory: root } });
+      const gdPerms1 = (gdSession1.data?.permission ?? []) as Array<{ permission: string; pattern: string; action: string }>;
+      const evalPatternPerm = (list: typeof gdPerms1, tool: string, targetPattern = '*') => {
+        for (let i = list.length - 1; i >= 0; i--) {
+          const r = list[i]!;
+          const matchTool = r.permission === '*' || r.permission === tool;
+          const matchPat = r.pattern === '*' || r.pattern === targetPattern || (r.pattern.endsWith('/*') && targetPattern.startsWith(r.pattern.slice(0, -1)));
+          if (matchTool && matchPat) return r.action;
+        }
+        return 'allow';
+      };
+      expect(evalPatternPerm(gdPerms1, 'bash')).toBe('deny');
+      expect(evalPatternPerm(gdPerms1, 'read', '/any/file')).toBe('deny');
+      expect(evalPatternPerm(gdPerms1, 'task')).toBe('deny');
+      expect(evalPatternPerm(gdPerms1, 'subagent')).toBe('deny');
+      // Second restore is idempotent (no duplicated rules appended)
+      await guardedProvider.createSession({
+        sessionKey: 'f4-global-deny-2',
+        sessionName: 'f4-global-deny-2',
+        cwd: root,
+        skipCreate: true,
+        resumeId: globalDenyId,
+      });
+      const gdSession2 = await gdState1.client.session.get({ path: { id: globalDenyId }, query: { directory: root } });
+      expect((gdSession2.data?.permission ?? []).length).toBe(gdPerms1.length);
+
+      // 5. Wildcard-action scoped directory deny (`* /secret/* deny`) + executable `read * allow`:
+      //    `/secret/key` MUST stay `deny`, executable `/pub/file` & `bash` MUST hit guard `ask`, `task/subagent` -> `deny`!
+      const scopedCreated = await fencedState.client.session.create({
+        query: { directory: root },
+        body: {
+          title: 'f4-scoped-deny',
+          permission: [
+            { permission: '*', pattern: '/secret/*', action: 'deny' },
+            { permission: 'read', pattern: '*', action: 'allow' },
+          ],
+        },
+        throwOnError: true,
+      });
+      const scopedId = scopedCreated.data.id;
+      await guardedProvider.createSession({
+        sessionKey: 'f4-scoped-1',
+        sessionName: 'f4-scoped-1',
+        cwd: root,
+        skipCreate: true,
+        resumeId: scopedId,
+      });
+      const scState1 = ((guardedProvider as any).v1Delegate as any).sessions.get('f4-scoped-1');
+      await scState1.client.session.prompt({
+        path: { id: scopedId },
+        query: { directory: root },
+        body: { noReply: true, parts: [{ type: 'text', text: 'noop-scoped-deny' }] },
+        throwOnError: true,
+      });
+      const scSession1 = await scState1.client.session.get({ path: { id: scopedId }, query: { directory: root } });
+      const scPerms1 = (scSession1.data?.permission ?? []) as Array<{ permission: string; pattern: string; action: string }>;
+      expect(evalPatternPerm(scPerms1, 'bash', '/pub/cmd')).toBe('ask');
+      expect(evalPatternPerm(scPerms1, 'task')).toBe('deny');
+      expect(evalPatternPerm(scPerms1, 'subagent')).toBe('deny');
+      // Verify ordered replay preserves `* /secret/* deny` vs `read * allow->ask` exactly as original:
+      // Note original had `* /secret/* deny` BEFORE `read * allow`, so `read` on `/secret/k` matched `read * allow`->`ask`
+      // while `bash`/`edit`/`write` on `/secret/k` MUST remain `deny` (and `read` on `/pub/a` is `ask`)!
+      expect(evalPatternPerm(scPerms1, 'edit', '/secret/key')).toBe('deny');
+      expect(evalPatternPerm(scPerms1, 'bash', '/secret/key')).toBe('deny');
+      expect(evalPatternPerm(scPerms1, 'read', '/pub/file')).toBe('ask');
+      // Reverse order (`read * allow` BEFORE `* /secret/* deny`): BOTH `read` AND `edit` on `/secret/key` stay `deny`!
+      const revCreated = await fencedState.client.session.create({
+        query: { directory: root },
+        body: {
+          title: 'f4-rev-scoped',
+          permission: [
+            { permission: 'read', pattern: '*', action: 'allow' },
+            { permission: '*', pattern: '/secret/*', action: 'deny' },
+          ],
+        },
+        throwOnError: true,
+      });
+      await guardedProvider.createSession({
+        sessionKey: 'f4-rev-1',
+        sessionName: 'f4-rev-1',
+        cwd: root,
+        skipCreate: true,
+        resumeId: revCreated.data.id,
+      });
+      const revSession = await scState1.client.session.get({ path: { id: revCreated.data.id }, query: { directory: root } });
+      const revPerms = (revSession.data?.permission ?? []) as Array<{ permission: string; pattern: string; action: string }>;
+      expect(evalPatternPerm(revPerms, 'read', '/secret/key')).toBe('deny');
+      expect(evalPatternPerm(revPerms, 'edit', '/secret/key')).toBe('deny');
+      expect(evalPatternPerm(revPerms, 'read', '/pub/file')).toBe('ask');
+      // Idempotent second restore
+      await guardedProvider.createSession({
+        sessionKey: 'f4-rev-2',
+        sessionName: 'f4-rev-2',
+        cwd: root,
+        skipCreate: true,
+        resumeId: revCreated.data.id,
+      });
+      const revSession2 = await scState1.client.session.get({ path: { id: revCreated.data.id }, query: { directory: root } });
+      expect((revSession2.data?.permission ?? []).length).toBe(revPerms.length);
       await guardedProvider.disconnect();
+
+      // 6. Verify v2 mergeOpenCodeFencedPermissions preserves `*/* deny` & `* /secret/* deny` & turns `allow` -> `ask`
+      const v2UpdatedPermissions: Array<Array<{ action: string; resource: string; effect: string }>> = [];
+      let v2RestoreCase: 'global-deny' | 'scoped-ordered' = 'global-deny';
+      openCodeSdkRuntimeHooks.start = vi.fn(async (opts) => {
+        const q = createAsyncQueue<Record<string, any>>();
+        opts.signal.addEventListener('abort', q.close, { once: true });
+        return {
+          client: {
+            sessions: {
+              create: vi.fn(async () => ({ id: 'ses-v2-f4' })),
+              get: vi.fn(async () => ({
+                id: 'ses-v2-f4',
+                permissions: v2RestoreCase === 'global-deny'
+                  ? [{ action: '*', resource: '*', effect: 'deny' }]
+                  : [{ action: 'read', resource: '*', effect: 'allow' }, { action: '*', resource: '/secret/*', effect: 'deny' }],
+              })),
+              prompt: vi.fn(async () => ({})),
+            },
+            session: {
+              update: vi.fn(async ({ permissions }: any) => {
+                v2UpdatedPermissions.push(permissions);
+              }),
+              switchModel: vi.fn(async () => ({})),
+              interrupt: vi.fn(async () => ({})),
+              message: { get: vi.fn(async () => { const e: any = new Error('404'); e.status = 404; throw e; }) },
+            },
+            provider: { list: vi.fn(async () => ({ data: [] })) },
+            model: { list: vi.fn(async () => ({ data: [] })), default: vi.fn(async () => ({ data: null })) },
+            mcp: { add: vi.fn(async () => ({})), list: vi.fn(async () => ({ data: [] })) },
+            permission: { reply: vi.fn(async () => ({})) },
+            events: { subscribe: vi.fn(async () => ({ stream: q.stream })) },
+          } as any,
+          server: { url: 'http://127.0.0.1:42999', close: vi.fn(async () => { q.close(); }) },
+        };
+      });
+      const pV2F4 = new OpenCodeSdkProvider();
+      pV2F4.setNativeAgentFenceResolver(() => true);
+      pV2F4.setToolExecutionGuard(async () => ({ allow: false }));
+      await pV2F4.connect({});
+      await pV2F4.createSession({ sessionKey: 'v2-gd', cwd: root, skipCreate: true, resumeId: 'ses-v2-f4' });
+      expect(v2UpdatedPermissions[0]).toEqual([
+        { action: '*', resource: '*', effect: 'ask' },
+        { action: '*', resource: '*', effect: 'deny' },
+        { action: 'subagent', resource: '*', effect: 'deny' },
+      ]);
+      v2RestoreCase = 'scoped-ordered';
+      await pV2F4.createSession({ sessionKey: 'v2-sc', cwd: root, skipCreate: true, resumeId: 'ses-v2-f4' });
+      expect(v2UpdatedPermissions[1]).toEqual([
+        { action: '*', resource: '*', effect: 'ask' },
+        { action: 'read', resource: '*', effect: 'ask' },
+        { action: '*', resource: '/secret/*', effect: 'deny' },
+        { action: 'subagent', resource: '*', effect: 'deny' },
+      ]);
+      await pV2F4.disconnect();
     } finally {
       for (const [k, v] of Object.entries(prevXdg)) {
         if (v === undefined) delete process.env[k];

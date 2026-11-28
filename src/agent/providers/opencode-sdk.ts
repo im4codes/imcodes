@@ -45,6 +45,7 @@ import logger from '../../util/logger.js';
 import { imcodesStatePath } from '../../util/imcodes-state-dir.js';
 import {
   OPENCODE_TRANSPORT_MODES,
+  compareOpenCodeSessionSnapshots,
   inspectOpenCodeSqliteSession,
   inspectOpenCodeSqliteSessions,
   isLoopbackHostname,
@@ -1494,19 +1495,28 @@ function mergeOpenCodeFencedPermissions(
   guardTools = false,
 ): OpenCodeSessionPermissionRuleLike[] {
   const denySet = new Set<string>(OPENCODE_NATIVE_AGENT_TOOLS);
-  const preserved = (existing ?? []).filter((rule) => (
-    !(nativeAgentsFenced && denySet.has(rule.action) && rule.resource === '*')
-    && !(guardTools && rule.action === '*' && rule.resource === '*')
-  ));
-  const specificDenies = preserved.filter((rule) => rule.effect === 'deny' && rule.action !== '*');
-  const nonSpecificDenyRules = preserved.filter((rule) => !(rule.effect === 'deny' && rule.action !== '*'));
-  const guardRules: OpenCodeSessionPermissionRuleLike[] = guardTools
-    ? [{ action: '*', resource: '*', effect: 'ask' }]
-    : [];
-  const fenceRules: OpenCodeSessionPermissionRuleLike[] = nativeAgentsFenced
-    ? buildOpenCodeSubagentDenyRules()
-    : [];
-  return [...nonSpecificDenyRules, ...guardRules, ...specificDenies, ...fenceRules];
+  const rules: OpenCodeSessionPermissionRuleLike[] = [];
+  if (guardTools) {
+    rules.push({ action: '*', resource: '*', effect: 'ask' });
+  }
+  for (const rule of existing ?? []) {
+    if (nativeAgentsFenced && denySet.has(rule.action) && rule.resource === '*') continue;
+    // Replay all existing rules in original relative order so global (`*/* deny`),
+    // wildcard-action directory (`* /secret/* deny`), and tool-specific denies keep
+    // exact `.findLast()` precedence while any executable `allow` becomes `ask`.
+    const mapped: OpenCodeSessionPermissionRuleLike = guardTools && rule.effect === 'allow'
+      ? { ...rule, effect: 'ask' }
+      : rule;
+    const prev = rules[rules.length - 1];
+    if (prev && prev.action === mapped.action && prev.resource === mapped.resource && prev.effect === mapped.effect) {
+      continue;
+    }
+    rules.push(mapped);
+  }
+  if (nativeAgentsFenced) {
+    rules.push(...buildOpenCodeSubagentDenyRules());
+  }
+  return rules;
 }
 
 function parseJsonRecord(raw: unknown): Record<string, any> | undefined {
@@ -2018,14 +2028,12 @@ async function readLegacySessionImportPayload(
   if (preferredOwner === 'embedded') {
     const embeddedFirst = resolveOpenCodeEmbeddedDbCandidates(databasePath);
     orderedCandidates = [...embeddedFirst, ...rawCandidates.filter((c) => !embeddedFirst.includes(c))];
-  } else if (preferredOwner !== 'v1-cli' && rawCandidates.length > 1) {
+  } else if (preferredOwner === 'v1-cli') {
+    orderedCandidates = rawCandidates;
+  } else if (rawCandidates.length > 1) {
     const snapshots = await inspectOpenCodeSqliteSessions(sessionId, rawCandidates);
     if (snapshots.length > 1) {
-      snapshots.sort((a, b) => (
-        b.messageCount - a.messageCount
-        || b.timeUpdated - a.timeUpdated
-        || b.latestMessageTime - a.latestMessageTime
-      ));
+      snapshots.sort((a, b) => compareOpenCodeSessionSnapshots(b, a));
       const ranked = snapshots.map((s) => s.dbPath);
       orderedCandidates = [...ranked, ...rawCandidates.filter((c) => !ranked.includes(c))];
     }
@@ -2433,22 +2441,27 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       await inflight.catch(() => {});
     }
     await v1DisconnectWhileConnecting;
-    if (this.v1Delegate || this.embeddedFallbackDelegate) {
-      const v1 = this.v1Delegate;
-      const fallback = this.embeddedFallbackDelegate;
+    if (this.embeddedFallbackConnectPromise) {
+      await this.embeddedFallbackConnectPromise.catch(() => {});
+    }
+    const v1 = this.v1Delegate;
+    const fallback = this.embeddedFallbackDelegate;
+    if (v1 || fallback || this.delegateDisposers.length > 0 || this.embeddedFallbackRoutes.size > 0) {
       this.v1Delegate = null;
       this.embeddedFallbackDelegate = null;
       this.embeddedFallbackConnectPromise = null;
       this.embeddedFallbackRoutes.clear();
       for (const dispose of this.delegateDisposers) dispose();
       this.delegateDisposers = [];
-      this.transportResolution = null;
-      this.connectConfig = {};
       await Promise.all([
         v1 ? v1.disconnect().catch(() => {}) : Promise.resolve(),
         fallback ? fallback.disconnect().catch(() => {}) : Promise.resolve(),
       ]);
-      return;
+      if (this.sessions.size === 0 && !this.server && !this.client) {
+        this.transportResolution = null;
+        this.connectConfig = {};
+        return;
+      }
     }
     const states = [...this.sessions.values()];
     this.sessions.clear();
@@ -2505,28 +2518,99 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     if (!embeddedSnap && !v1Snap) return 'missing';
     if (embeddedSnap && !v1Snap) return 'embedded';
     if (!embeddedSnap && v1Snap) return 'v1-cli';
-    const embeddedHasFollowUp = embeddedSnap!.messageCount > v1Snap!.messageCount
-      || embeddedSnap!.timeUpdated > v1Snap!.timeUpdated
-      || embeddedSnap!.latestMessageTime > v1Snap!.timeUpdated;
-    return embeddedHasFollowUp ? 'embedded' : 'v1-cli';
+    const cmp = compareOpenCodeSessionSnapshots(
+      {
+        messageCount: embeddedSnap!.messageCount,
+        timeUpdated: embeddedSnap!.timeUpdated,
+        latestMessageTime: embeddedSnap!.latestMessageTime,
+      },
+      {
+        messageCount: v1Snap!.messageCount,
+        timeUpdated: v1Snap!.timeUpdated,
+        latestMessageTime: v1Snap!.timeUpdated,
+      },
+    );
+    return cmp > 0 ? 'embedded' : 'v1-cli';
+  }
+
+  private async isEmbeddedCopyMoreCompleteThanV2(
+    client: OpenCodeClientLike,
+    v2Info: OpenCodeSessionInfoLike,
+    resumeId: string,
+  ): Promise<boolean> {
+    const embeddedCandidates = resolveOpenCodeEmbeddedDbCandidates(this.databasePath);
+    const embeddedSnap = await inspectOpenCodeSqliteSession(resumeId, embeddedCandidates);
+    if (!embeddedSnap) return false;
+    let v2MessageCount = 0;
+    let v2LatestMsgTime = 0;
+    let countedMessages = false;
+    if (typeof client.message?.list === 'function') {
+      try {
+        const res = await client.message.list({
+          sessionID: resumeId,
+          limit: Math.max(embeddedSnap.messageCount + 5, 100),
+        });
+        if (Array.isArray(res?.data)) {
+          countedMessages = true;
+          v2MessageCount = res.data.length;
+          for (const msg of res.data) {
+            const t = positiveNumber((msg as any)?.time?.completed) ?? positiveNumber((msg as any)?.time?.created) ?? 0;
+            if (t > v2LatestMsgTime) v2LatestMsgTime = t;
+          }
+        }
+      } catch {
+        // Fall back to metadata timestamps if message listing is unavailable
+      }
+    }
+    const v2Updated = positiveNumber(v2Info?.time?.updated) ?? positiveNumber(v2Info?.time?.created) ?? 0;
+    if (!countedMessages) {
+      return embeddedSnap.timeUpdated > v2Updated || embeddedSnap.latestMessageTime > v2Updated;
+    }
+    return compareOpenCodeSessionSnapshots(
+      {
+        messageCount: embeddedSnap.messageCount,
+        timeUpdated: embeddedSnap.timeUpdated,
+        latestMessageTime: embeddedSnap.latestMessageTime,
+      },
+      {
+        messageCount: v2MessageCount,
+        timeUpdated: v2Updated,
+        latestMessageTime: v2LatestMsgTime,
+      },
+    ) > 0;
   }
 
   async createSession(config: SessionConfig): Promise<string> {
+    const routeId = config.bindExistingKey ?? config.sessionKey;
+    const resumeId = safeString(config.resumeId);
+    if ((!config.skipCreate || config.fresh) && this.embeddedFallbackRoutes.has(routeId)) {
+      this.embeddedFallbackRoutes.delete(routeId);
+      await this.embeddedFallbackDelegate?.endSession(routeId).catch(() => {});
+    }
+
+    // Deterministic storage-owner routing BEFORE touching v1Delegate or v2-cli session runtimes:
+    // known embedded-owned sessions stay on embedded DB even if v2-cli / v1-cli holds a stale copy of the same ID.
+    if (
+      config.skipCreate
+      && resumeId
+      && this.transportResolution?.mode !== OPENCODE_TRANSPORT_MODES.EMBEDDED
+      && (this.embeddedFallbackRoutes.has(routeId) || config.openCodeStorageOwner === 'embedded')
+    ) {
+      const fallback = await this.ensureEmbeddedFallbackDelegate();
+      const restoredRoute = await fallback.createSession(config);
+      this.embeddedFallbackRoutes.add(restoredRoute);
+      return restoredRoute;
+    }
+
     if (this.v1Delegate) {
-      const routeKey = config.bindExistingKey ?? config.sessionKey;
-      const resumeId = safeString(config.resumeId);
-      if (
-        (this.embeddedFallbackRoutes.has(routeKey) || config.openCodeStorageOwner === 'embedded')
-        && (!config.fresh || config.skipCreate)
-      ) {
-        if (config.skipCreate && resumeId) {
-          const fallback = await this.ensureEmbeddedFallbackDelegate();
-          const restoredRoute = await fallback.createSession(config);
-          this.embeddedFallbackRoutes.add(restoredRoute);
-          return restoredRoute;
-        }
-      }
       if (config.skipCreate && resumeId) {
+        if (config.openCodeStorageOwner === 'v2-cli') {
+          throw providerError(
+            PROVIDER_ERROR_CODES.CONFIG_ERROR,
+            `OpenCode session "${resumeId}" belongs to v2 CLI storage and cannot be restored under OpenCode v1 CLI. Upgrade OpenCode CLI to v2 (\`opencode upgrade --major\`).`,
+            false,
+          );
+        }
         const resolvedOwner = await this.resolveV1VsEmbeddedOwner(resumeId, {
           cwd: config.cwd,
           openCodeStorageOwner: config.openCodeStorageOwner,
@@ -2546,7 +2630,6 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     }
     this.assertConnected();
     if (!this.modelCache) await this.listModels(false);
-    const routeId = config.bindExistingKey ?? config.sessionKey;
     const existing = this.sessions.get(routeId);
     if (existing && !config.fresh) {
       if (safeString(config.agentId)) existing.model = config.agentId!.trim();
@@ -2563,14 +2646,25 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const guardTools = Boolean(this.toolExecutionGuard);
     const createPermissions = buildOpenCodeGuardedSessionPermissions(nativeAgentsFenced, guardTools);
     let info: OpenCodeSessionInfoLike;
-    if (config.skipCreate && safeString(config.resumeId)) {
+    if (config.skipCreate && resumeId) {
       try {
         info = await this.ensureSessionPresentOrImportLegacy(
           sessionRuntime.client,
-          config.resumeId!,
+          resumeId,
           cwd,
           config.openCodeStorageOwner,
         );
+        if (
+          this.transportResolution?.mode === OPENCODE_TRANSPORT_MODES.V2_CLI
+          && !config.openCodeStorageOwner
+          && await this.isEmbeddedCopyMoreCompleteThanV2(sessionRuntime.client, info, resumeId)
+        ) {
+          await this.closeStartedRuntime(sessionRuntime);
+          const fallback = await this.ensureEmbeddedFallbackDelegate();
+          const restoredRoute = await fallback.createSession(config);
+          this.embeddedFallbackRoutes.add(restoredRoute);
+          return restoredRoute;
+        }
         if ((nativeAgentsFenced || guardTools) && typeof sessionRuntime.client.session?.update === 'function') {
           await sessionRuntime.client.session.update({
             sessionID: info.id,
@@ -2848,6 +2942,14 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       const session = await this.ensureSessionPresentOrImportLegacy(client, sessionId, this.catalogDirectory);
       return safeString(session?.id) === sessionId;
     } catch (error) {
+      if (
+        this.transportResolution?.mode === OPENCODE_TRANSPORT_MODES.V2_CLI
+        && isNotFoundError(error)
+        && await inspectOpenCodeSqliteSession(sessionId, resolveOpenCodeEmbeddedDbCandidates(this.databasePath))
+      ) {
+        const fallback = await this.ensureEmbeddedFallbackDelegate();
+        return await fallback.restoreSession(sessionId);
+      }
       if (!isNotFoundError(error)) {
         logger.warn({ provider: this.id, sessionId, error }, 'OpenCode restoreSession failed');
       }

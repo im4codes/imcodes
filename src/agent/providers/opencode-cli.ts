@@ -1280,6 +1280,18 @@ export interface OpenCodeSqliteSessionSnapshot {
   latestMessageTime: number;
 }
 
+/** Compare completeness of two copies of the same session ID.
+ *  Message count strictly outranks metadata timestamps so a metadata touch
+ *  never overrides a store holding additional conversation turns. */
+export function compareOpenCodeSessionSnapshots(
+  a: Pick<OpenCodeSqliteSessionSnapshot, 'messageCount' | 'timeUpdated' | 'latestMessageTime'>,
+  b: Pick<OpenCodeSqliteSessionSnapshot, 'messageCount' | 'timeUpdated' | 'latestMessageTime'>,
+): number {
+  if (a.messageCount !== b.messageCount) return a.messageCount - b.messageCount;
+  if (a.timeUpdated !== b.timeUpdated) return a.timeUpdated - b.timeUpdated;
+  return a.latestMessageTime - b.latestMessageTime;
+}
+
 export async function inspectOpenCodeSqliteSessions(
   sessionId: string,
   dbPaths: readonly string[],
@@ -1366,11 +1378,7 @@ export async function inspectOpenCodeSqliteSession(
 ): Promise<OpenCodeSqliteSessionSnapshot | null> {
   const snapshots = await inspectOpenCodeSqliteSessions(sessionId, dbPaths);
   if (snapshots.length === 0) return null;
-  snapshots.sort((a, b) => (
-    b.messageCount - a.messageCount
-    || b.timeUpdated - a.timeUpdated
-    || b.latestMessageTime - a.latestMessageTime
-  ));
+  snapshots.sort((a, b) => compareOpenCodeSessionSnapshots(b, a));
   return snapshots[0] ?? null;
 }
 
