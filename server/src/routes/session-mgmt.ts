@@ -9,6 +9,7 @@ import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/da
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { WsBridge } from '../ws/bridge.js';
+import { daemonPodRebalancer } from '../ws/daemon-pod-rebalance.js';
 import logger from '../util/logger.js';
 import {
   deriveShareTransitionKey,
@@ -1174,6 +1175,7 @@ sessionMgmtRoutes.post('/:id/sessions/:rootSession/group-clone', async (c) => {
   }
 
   if (!bridge.isDaemonConnected()) {
+    daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
     await auditSessionGroupClone(c, {
       ...auditBase,
       outcome: 'failed',
@@ -1695,8 +1697,12 @@ async function relayToDaemon(
   const rest = bodyOverride === undefined ? stripBrowserShareFields(rawBody) : rawBody;
   const payload = JSON.stringify({ type: command, ...rest });
 
+  const bridge = WsBridge.get(serverId);
+  if (typeof bridge.isDaemonConnected === 'function' && !bridge.isDaemonConnected()) {
+    daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
+  }
   try {
-    WsBridge.get(serverId).sendToDaemon(payload);
+    bridge.sendToDaemon(payload);
   } catch (err) {
     logger.error({ serverId, command, err }, 'WsBridge relay failed');
     return c.json({ error: 'relay_failed' }, 502);

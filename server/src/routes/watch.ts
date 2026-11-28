@@ -15,6 +15,7 @@ import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { authorizeTimelineSession, type TimelineSessionActorRole } from './timeline-session-access.js';
 import { redactPairTimelineEventForShareRole } from '../ws/share-policy.js';
 import { WsBridge } from '../ws/bridge.js';
+import { daemonPodRebalancer } from '../ws/daemon-pod-rebalance.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
 import { TIMELINE_RESPONSE_STATUS } from '../../../shared/timeline-protocol.js';
@@ -608,7 +609,10 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
     return c.json(withBoundedHttpTimelinePayload(body, TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    if (message === 'daemon_offline') return c.json({ error: 'daemon_offline' }, 503);
+    if (message === 'daemon_offline') {
+      daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
+      return c.json({ error: 'daemon_offline' }, 503);
+    }
     if (message === 'timeout') return c.json({ error: 'timeline_timeout' }, 504);
     return c.json({ error: 'relay_failed' }, 502);
   }
@@ -722,7 +726,10 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
     const bridgeMs = Date.now() - tStart;
     const message = err instanceof Error ? err.message : String(err);
     logger.warn({ serverId, sessionHash: hashSessionName(sessionName), bridgeMs, err: message }, 'timeline.history/full failed');
-    if (message === 'daemon_offline') return c.json({ error: 'daemon_offline' }, 503);
+    if (message === 'daemon_offline') {
+      daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
+      return c.json({ error: 'daemon_offline' }, 503);
+    }
     if (message === 'timeout') return c.json({ error: 'timeline_timeout' }, 504);
     return c.json({ error: 'relay_failed' }, 502);
   }

@@ -26,6 +26,7 @@ import {
   type CreatePreviewRequest,
 } from '../../../shared/preview-types.js';
 import { WsBridge } from '../ws/bridge.js';
+import { daemonPodRebalancer } from '../ws/daemon-pod-rebalance.js';
 import { isSseResponse } from '../../../shared/preview-stream-policy.js';
 import { randomHex } from '../security/crypto.js';
 import logger from '../util/logger.js';
@@ -360,6 +361,7 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
 
   const bridge = WsBridge.get(serverId);
   if (!bridge.isDaemonConnected()) {
+    daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
     // Daemon offline → 503, with NO TTL touch (commit not yet called). This is
     // an availability outcome, not an authorization failure; the cached cookie
     // above keeps the credential warm for when the daemon returns.

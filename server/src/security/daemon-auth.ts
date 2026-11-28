@@ -6,6 +6,8 @@ import { USAGE_INGEST_PATH_HEADER } from '../../../shared/usage-analytics.js';
 import { NODE_ROLE, NODE_ROLE_REFUSAL, type NodeRole } from '../../../shared/remote-exec.js';
 import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
 import type { AuthErrorCode } from '../../../shared/auth-error-codes.js';
+import { WsBridge } from '../ws/bridge.js';
+import { daemonPodRebalancer } from '../ws/daemon-pod-rebalance.js';
 
 /**
  * Bearer authentication for daemon-token routes.
@@ -123,6 +125,10 @@ export async function authenticateDaemonServer<E extends { Bindings: Env }>(
   }
 
   enforceDaemonTokenRoute(c.req, row.id, nodeRole);
+
+  if (serverId && typeof WsBridge.find === 'function' && !WsBridge.find(row.id)?.isDaemonConnected()) {
+    daemonPodRebalancer.requestDaemonRebalance(row.id, c.env.DB);
+  }
 
   return {
     ok: true,

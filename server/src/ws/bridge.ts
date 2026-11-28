@@ -43,6 +43,8 @@ import { CLOCK_SYNC_FIELD } from '../../../shared/clock-sync.js';
 import { performance } from 'node:perf_hooks';
 import { randomUUID, createHash } from 'node:crypto';
 import type { Database } from '../db/client.js';
+import { getPodIdentity } from '../util/pod-identity.js';
+import { DAEMON_REBALANCE_WS_CLOSE_CODE, DAEMON_REBALANCE_WS_CLOSE_REASON } from './daemon-pod-rebalance.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { SHARE_MESSAGE_LANE, SHARE_MESSAGE_LANE_MAX_PENDING, shareBrowserMessageLane, type ShareMessageLane } from './share-lanes.js';
@@ -2328,6 +2330,7 @@ export class WsBridge {
   /** DB-authoritative role of the connected daemon (controlled nodes are a restricted surface). */
   private daemonNodeRole: NodeRole = NODE_ROLE.FULL;
   private authenticated = false;
+  private daemonAuthenticatedAt = 0;
   /** Current daemon generation has completed durable route reconciliation. */
   private remoteDesktopAuthorityReadyGeneration: number | null = null;
   private daemonVersion: string | null = null;
@@ -6250,6 +6253,7 @@ export class WsBridge {
     this.peerAuditRouter.setDaemonGeneration(this.daemonGeneration);
     abandonComputerUsePriorGenerations(this.serverId, this.daemonGeneration);
     this.authenticated = false;
+    this.daemonAuthenticatedAt = 0;
     this.lastCapabilityRevisionSent = 0;
     this.capabilitySyncInitialized = false;
     this.lastCapabilityHeartbeatRefreshAt = 0;
@@ -6546,6 +6550,7 @@ export class WsBridge {
         }
         this.resetLegacyUpgradeRescueForGeneration(connectionGeneration);
         this.authenticated = true;
+        this.daemonAuthenticatedAt = Date.now();
         defaultPortForwardRouter.onDaemonConnected(this.serverId, connectionGeneration);
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
         const advertisedRuntimeBackends = Array.isArray(msg[SHARED_CONTEXT_RUNTIME_CAPABILITY_PROTOCOL.AUTH_BACKENDS_FIELD])
@@ -7232,6 +7237,7 @@ export class WsBridge {
         const wasControlled = this.daemonNodeRole === NODE_ROLE.CONTROLLED;
         this.daemonWs = null;
         this.authenticated = false;
+        this.daemonAuthenticatedAt = 0;
         // Audit fix (78-server reconnect-storm) — drop the auth promise
         // so the next reconnect's message handlers don't await a stale
         // pending promise. If auth was still in flight when the socket
@@ -14552,6 +14558,46 @@ export class WsBridge {
   /** Returns true if the daemon WebSocket is connected and authenticated. */
   isDaemonConnected(): boolean {
     return !!(this.daemonWs && this.authenticated);
+  }
+
+  /**
+   * Close a live daemon WebSocket cleanly with 1012 (pod_rebalance) so the
+   * daemon reconnects through ingress to its current consistent-hash pod.
+   * Returns true if a sufficiently aged daemon connection was closed.
+   */
+  rebalanceDaemonConnection(
+    minConnectionAgeMs = 5_000,
+    requesterPodId?: string,
+    now = Date.now(),
+  ): boolean {
+    const ws = this.daemonWs;
+    if (!ws || !this.authenticated || this.daemonAuthenticatedAt <= 0) {
+      return false;
+    }
+    const ageMs = now - this.daemonAuthenticatedAt;
+    if (ageMs < minConnectionAgeMs) {
+      return false;
+    }
+    logger.info(
+      {
+        serverId: this.serverId,
+        podId: getPodIdentity(),
+        requesterPodId: requesterPodId ?? null,
+        connectionAgeMs: ageMs,
+        closeCode: DAEMON_REBALANCE_WS_CLOSE_CODE,
+        closeReason: DAEMON_REBALANCE_WS_CLOSE_REASON,
+      },
+      'Closing daemon WS for pod rebalance',
+    );
+    try {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close(DAEMON_REBALANCE_WS_CLOSE_CODE, DAEMON_REBALANCE_WS_CLOSE_REASON);
+        return true;
+      }
+    } catch (err) {
+      logger.warn({ serverId: this.serverId, err }, 'Failed closing daemon WS during rebalance');
+    }
+    return false;
   }
 
   /** Returns latest known heartbeat timestamp for an active daemon connection. */

@@ -4,6 +4,7 @@ import { TASK_PAIR_TITLE_AUTHORITY_PATH } from '../../shared/task-pair-title-acc
 import { MachineGroupInvalidationRuntime } from './services/machine-group-invalidation.js';
 import { applyMachineGroupInvalidation, failClosedMachineGroupConnections } from './ws/machine-group-revalidation.js';
 import { globalTaskHub } from './services/global-task-hub.js';
+import { daemonPodRebalancer } from './ws/daemon-pod-rebalance.js';
 import { pushStreamHub } from './services/push-stream-hub.js';
 import { globalTasksRoutes } from './routes/global-tasks.js';
 import { remoteVoiceHub } from './services/remote-voice-hub.js';
@@ -1204,6 +1205,9 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
         // pins that asymmetry. An audit read the missing `consumeJti` as a
         // replay defect — it is a design decision, and the coverage re-read on
         // every upgrade is what actually bounds a stale ticket.
+        if (!WsBridge.find(serverId)?.isDaemonConnected()) {
+          daemonPodRebalancer.requestDaemonRebalance(serverId, env.DB);
+        }
         wss.handleUpgrade(req, socket, head, (ws) => {
           WsBridge.get(serverId).handleShareBrowserConnection(ws, shareTicket.sub, env.DB, {
             ticketId: shareTicket.jti,
@@ -1251,6 +1255,9 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
       }
 
       const userId = payload.sub as string;
+      if (!WsBridge.find(serverId)?.isDaemonConnected()) {
+        daemonPodRebalancer.requestDaemonRebalance(serverId, env.DB);
+      }
       wss.handleUpgrade(req, socket, head, (ws) => {
         WsBridge.get(serverId).handleBrowserConnection(
           ws,
@@ -1348,6 +1355,7 @@ async function handlePreviewWsUpgrade(
 
   // 4. Verify daemon is connected
   if (!bridge.isDaemonConnected()) {
+    daemonPodRebalancer.requestDaemonRebalance(serverId, env.DB);
     socket.write(`HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n`);
     socket.destroy();
     return;
@@ -1563,6 +1571,7 @@ async function main() {
   );
   await machineGroupInvalidation.start();
   await globalTaskHub.start(envConfig.DATABASE_URL, db);
+  await daemonPodRebalancer.start(envConfig.DATABASE_URL, db);
   await Promise.all([
     remoteVoiceHub.refreshServerSharedProviders(db),
     remoteVoiceHub.refreshServerAsrServices(db, env),
@@ -1653,6 +1662,7 @@ async function main() {
     stopAccountWatch();
     await defaultPortForwardRouter.stopCluster();
     await globalTaskHub.stop();
+    await daemonPodRebalancer.stop();
     pushStreamHub.stop();
     remoteVoiceHub.stop();
     await machineGroupInvalidation.stop();

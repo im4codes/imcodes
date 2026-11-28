@@ -10,6 +10,7 @@ import {
   upsertSessionIdentityProfile,
 } from '../db/session-identity-queries.js';
 import { WsBridge } from '../ws/bridge.js';
+import { daemonPodRebalancer } from '../ws/daemon-pod-rebalance.js';
 import { resolveHttpShareAccess } from './share-http-auth.js';
 import logger from '../util/logger.js';
 import { SESSION_IDENTITY_LOCAL_RPC_TIMEOUT_MS } from '../../../shared/session-identity-ws.js';
@@ -112,6 +113,7 @@ async function callDaemonLocal<
   }
   const bridge = WsBridge.get(serverId);
   if (!bridge.isDaemonConnected()) {
+    daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
     return { ok: false, response: c.json({ error: 'daemon_offline' }, 409) };
   }
   try {
@@ -126,6 +128,9 @@ async function callDaemonLocal<
     return { ok: true, body };
   } catch (err) {
     const reason = err instanceof Error ? err.message : 'daemon_offline';
+    if (reason !== 'timeout') {
+      daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
+    }
     const status = reason === 'timeout' ? 504 : 409;
     return { ok: false, response: c.json({ error: reason === 'timeout' ? 'daemon_timeout' : 'daemon_offline' }, status) };
   }

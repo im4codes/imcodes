@@ -12,6 +12,7 @@ import { requireAuth } from '../security/authorization.js';
 import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { shareTargetFromSessionName } from '../db/tab-sharing.js';
 import { WsBridge } from '../ws/bridge.js';
+import { daemonPodRebalancer } from '../ws/daemon-pod-rebalance.js';
 import { randomHex } from '../security/crypto.js';
 import {
   FILE_TRANSFER_LIMITS,
@@ -795,7 +796,10 @@ async function authorizeControlledFileTarget(
     logger.error({ serverId, action, err }, 'Refusing a machine file operation — durable audit could not be persisted');
     return { ok: false, reason: 'daemon_offline' };
   }
-  if (!bridge.isDaemonConnected()) return { ok: false, reason: 'daemon_offline' };
+  if (!bridge.isDaemonConnected()) {
+    daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
+    return { ok: false, reason: 'daemon_offline' };
+  }
   // Capture the exact socket generation synchronously with the capability
   // observation. Callers can spend time reading/validating request bodies, but
   // must never dispatch the authorized command to a replacement generation.
@@ -1492,6 +1496,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   // Daemon connectivity check
   const bridge = controlledGate.bridge;
   if (!bridge.isDaemonConnected()) {
+    daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
     return c.json({ error: 'daemon_offline' }, 503);
   }
   // The request has an exact-key daemon validator. Include the dedupe field
@@ -1797,7 +1802,10 @@ fileTransferRoutes.delete('/:id/uploads/:attachmentId', async (c) => {
     if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
   }
   if (!mayConsumeControlledHandle(c, gate, serverId, attachmentId)) return c.json({ error: 'forbidden' }, 403);
-  if (!gate.bridge.isDaemonConnected()) return c.json({ error: 'daemon_offline' }, 503);
+  if (!gate.bridge.isDaemonConnected()) {
+    daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
+    return c.json({ error: 'daemon_offline' }, 503);
+  }
 
   const requestId = randomHex(16);
   const parsed = validateFileDeleteRequest({ type: FILE_TRANSFER_MSG.DELETE, requestId, attachmentId });
@@ -1918,6 +1926,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   // Daemon connectivity check
   const bridge = controlledGate.bridge;
   if (!bridge.isDaemonConnected()) {
+    daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
     return c.json({ error: 'daemon_offline' }, 503);
   }
   if (downloadSharedActor && !hasSharedActorCapability(bridge)) {
@@ -2021,7 +2030,10 @@ async function r2RouteAccess(c: Context, mode: SharedFileAccessMode) {
   if (!config || !target || target.node_role === 'controlled' || !bridge.hasDaemonCapability(R2_RELAY_CAPABILITY)) {
     return { response: c.body(null, 204) } as const;
   }
-  if (!bridge.isDaemonConnected()) return { response: c.json({ error: 'daemon_offline' }, 503) } as const;
+  if (!bridge.isDaemonConnected()) {
+    daemonPodRebalancer.requestDaemonRebalance(serverId, c.env.DB);
+    return { response: c.json({ error: 'daemon_offline' }, 503) } as const;
+  }
   if (access.sharedActor && !hasSharedActorCapability(bridge)) {
     return { response: c.json({ error: 'capability_unavailable' }, 409) } as const;
   }
