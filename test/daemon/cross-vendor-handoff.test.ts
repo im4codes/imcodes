@@ -312,6 +312,45 @@ describe('reported lost provider-switch context counterexamples', () => {
     }
   });
 
+  it('falls back to conservative tokenizer by 2500ms under default timeoutMs budget when countTokensAsync stalls', async () => {
+    vi.useFakeTimers();
+    resetMetricsForTests();
+    const countMock = vi.mocked(tokenizer.countTokensAsync);
+    const prevImpl = countMock.getMockImplementation();
+    countMock.mockImplementation(() => new Promise<number>(() => {}));
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue([
+      event('user.message', { text: 'DEFAULT_BUDGET_STALLED_TOKENIZER_MSG' }, 1, 10),
+    ]);
+    try {
+      let resolvedPack: CrossVendorHandoffPack | undefined;
+      let settled = false;
+      const packPromise = buildCrossVendorHandoffPack(
+        record('claude-code-sdk'),
+        { epoch: 7, seq: 1, ts: 10 },
+        'codex-sdk',
+        'transport',
+      );
+      void packPromise.then((pack) => {
+        settled = true;
+        resolvedPack = pack;
+      });
+
+      // Advance timers to 2500ms. With the widened 750ms reserve (deadline at 2250ms),
+      // the fallback timer fires and resolves by 2250ms.
+      // Under the old 250ms reserve (deadline at 2750ms), 2500ms was still pending.
+      await vi.advanceTimersByTimeAsync(2500);
+
+      expect(settled).toBe(true);
+      expect(resolvedPack).toBeDefined();
+      expect(resolvedPack!.text).toContain('DEFAULT_BUDGET_STALLED_TOKENIZER_MSG');
+      expect(getCounter('handoff.build_timeout', {})).toBe(0);
+      expect(getCounter('handoff.tokenizer_fallback', {})).toBeGreaterThanOrEqual(1);
+    } finally {
+      vi.useRealTimers();
+      if (prevImpl) countMock.mockImplementation(prevImpl);
+    }
+  });
+
   it('still triggers handoff.build_timeout when timeline reading itself stalls beyond timeoutMs', async () => {
     resetMetricsForTests();
     vi.spyOn(timelineStore, 'readCompletedTextTail').mockImplementation(() => new Promise(() => {}));
