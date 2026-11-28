@@ -1,17 +1,21 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import {
   accessSync,
   chmodSync,
+  closeSync,
   constants as fsConstants,
   createReadStream,
   createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   realpathSync,
   rmSync,
+  unlinkSync,
+  writeSync,
 } from 'node:fs';
 import { access, stat } from 'node:fs/promises';
 import http from 'node:http';
@@ -23,6 +27,7 @@ import { Readable } from 'node:stream';
 import tls from 'node:tls';
 import { createGunzip } from 'node:zlib';
 import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
+import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 
 export const NPM_OFFICIAL_REGISTRY = 'https://registry.npmjs.org';
 export const NPM_MIRROR_REGISTRY = 'https://registry.npmmirror.com';
@@ -1487,5 +1492,158 @@ export function ensureExecutablePermission(filePath: string, platform: NodeJS.Pl
     accessSync(filePath, fsConstants.X_OK);
   } catch {
     chmodSync(filePath, 0o755);
+  }
+}
+
+function assertLockFileSafeSync(lockPath: string): void {
+  try {
+    const st = lstatSync(lockPath);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      throw new Error(`unsafe_symlink_target:${path.basename(lockPath)}`);
+    }
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return;
+    throw err;
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: unknown) {
+    return (err as NodeJS.ErrnoException | undefined)?.code !== 'ESRCH';
+  }
+}
+
+function isSqliteBusyError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  const code = (err as { code?: unknown } | null)?.code;
+  return (code === 'ERR_SQLITE_ERROR' && /database is locked|SQLITE_BUSY/i.test(msg))
+    || /database is locked|SQLITE_BUSY/i.test(msg);
+}
+
+async function withOwnerPidLockFile<T>(
+  pidLockPath: string,
+  deadline: number,
+  timeoutMessage: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const token = randomUUID();
+  while (true) {
+    assertLockFileSafeSync(pidLockPath);
+    let fd: number | null = null;
+    try {
+      fd = openSync(pidLockPath, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
+      writeSync(fd, JSON.stringify({ pid: process.pid, token, at: Date.now() }));
+      closeSync(fd);
+      fd = null;
+      break;
+    } catch (err: unknown) {
+      if (fd !== null) {
+        try { closeSync(fd); } catch { /* ignore */ }
+      }
+      if ((err as NodeJS.ErrnoException | undefined)?.code !== 'EEXIST') throw err;
+      try {
+        assertLockFileSafeSync(pidLockPath);
+        const raw = readFileSync(pidLockPath, 'utf8');
+        const parsed = JSON.parse(raw) as { pid?: unknown };
+        // Only reclaim when the recorded owner PID is provably dead — never preempt a live process by age.
+        if (typeof parsed.pid === 'number' && !isPidAlive(parsed.pid)) {
+          try {
+            const verifyRaw = readFileSync(pidLockPath, 'utf8');
+            const verifyParsed = JSON.parse(verifyRaw) as { pid?: unknown };
+            if (verifyParsed.pid === parsed.pid) {
+              unlinkSync(pidLockPath);
+              continue;
+            }
+          } catch {
+            // concurrent reclaim
+          }
+        }
+      } catch (checkErr: unknown) {
+        if (checkErr instanceof Error && checkErr.message.startsWith('unsafe_symlink_target')) {
+          throw checkErr;
+        }
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(timeoutMessage);
+      }
+      const jitter = 5 + Math.floor(Math.random() * 11);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(jitter, remaining)));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    try {
+      const currentRaw = readFileSync(pidLockPath, 'utf8');
+      const current = JSON.parse(currentRaw) as { token?: unknown };
+      if (current.token === token) {
+        unlinkSync(pidLockPath);
+      }
+    } catch {
+      // ignore missing/reclaimed lock file
+    }
+  }
+}
+
+export async function withProcessExclusiveLock<T>(
+  lockDbPath: string,
+  opts: { timeoutMs?: number; timeoutMessage?: string; forceLegacyPidFile?: boolean } = {},
+  fn: () => Promise<T>,
+): Promise<T> {
+  const timeoutMs = Math.max(1, Math.floor(opts.timeoutMs ?? 10_000));
+  const timeoutMessage = opts.timeoutMessage ?? 'codex_publish_lock_timeout';
+  const deadline = Date.now() + timeoutMs;
+
+  assertLockFileSafeSync(lockDbPath);
+  assertLockFileSafeSync(`${lockDbPath}-wal`);
+  assertLockFileSafeSync(`${lockDbPath}-shm`);
+
+  let DatabaseSyncCtor: typeof import('node:sqlite')['DatabaseSync'] | null = null;
+  if (!opts.forceLegacyPidFile) {
+    try {
+      suppressSqliteExperimentalWarning();
+      ({ DatabaseSync: DatabaseSyncCtor } = await import('node:sqlite'));
+    } catch {
+      DatabaseSyncCtor = null;
+    }
+  }
+
+  if (!DatabaseSyncCtor) {
+    return await withOwnerPidLockFile(`${lockDbPath}.pid`, deadline, timeoutMessage, fn);
+  }
+
+  const db = new DatabaseSyncCtor(lockDbPath);
+  let inTx = false;
+  try {
+    db.exec('PRAGMA busy_timeout = 0;');
+    while (true) {
+      if (Date.now() >= deadline) {
+        throw new Error(timeoutMessage);
+      }
+      try {
+        db.exec('BEGIN IMMEDIATE;');
+        inTx = true;
+        break;
+      } catch (err) {
+        if (!isSqliteBusyError(err)) throw err;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          throw new Error(timeoutMessage);
+        }
+        const jitter = 5 + Math.floor(Math.random() * 11);
+        await new Promise((resolve) => setTimeout(resolve, Math.min(jitter, remaining)));
+      }
+    }
+    return await fn();
+  } finally {
+    if (inTx) {
+      try { db.exec('ROLLBACK;'); } catch { /* ignore */ }
+    }
+    try { db.close(); } catch { /* ignore */ }
   }
 }

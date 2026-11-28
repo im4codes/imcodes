@@ -1,19 +1,15 @@
 import {
   chmodSync,
-  closeSync,
   constants as fsConstants,
   copyFileSync,
   linkSync,
   lstatSync,
   mkdirSync,
-  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
   rmdirSync,
   rmSync,
-  statSync,
-  writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -41,6 +37,7 @@ import {
   readEnvCaseInsensitive,
   resolveCandidateNpmRegistries,
   validateDownloadUrl,
+  withProcessExclusiveLock,
   fetchWithSafeRedirects,
   type CliInstallLogger,
   type InstallCliResult,
@@ -60,59 +57,6 @@ const MAX_CODEX_TARBALL_BYTES = 450 * 1024 * 1024;
 const MAX_CLAUDE_TARBALL_BYTES = 350 * 1024 * 1024;
 const MAX_AGY_DOWNLOAD_BYTES = 200 * 1024 * 1024;
 const CODEX_PUBLISH_LOCK_TIMEOUT_MS = 10_000;
-const CODEX_PUBLISH_LOCK_STALE_MS = 60_000;
-
-async function withExclusiveFileLock<T>(
-  lockPath: string,
-  timeoutMs: number,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
-  while (true) {
-    let fd: number | null = null;
-    try {
-      fd = openSync(lockPath, 'wx');
-      writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
-      closeSync(fd);
-      fd = null;
-      break;
-    } catch (err: unknown) {
-      if (fd !== null) {
-        try { closeSync(fd); } catch { /* ignore */ }
-      }
-      const code = (err as NodeJS.ErrnoException | undefined)?.code;
-      if (code !== 'EEXIST') throw err;
-      try {
-        const st = lstatSync(lockPath);
-        if (st.isSymbolicLink()) {
-          throw new Error('unsafe_symlink_target:codex_publish_lock');
-        }
-        const mtime = statSync(lockPath).mtimeMs;
-        if (Date.now() - mtime > CODEX_PUBLISH_LOCK_STALE_MS) {
-          rmSync(lockPath, { force: true });
-          continue;
-        }
-      } catch (statErr: unknown) {
-        if (statErr instanceof Error && statErr.message.startsWith('unsafe_symlink_target')) {
-          throw statErr;
-        }
-      }
-      if (Date.now() >= deadline) {
-        throw new Error('codex_publish_lock_timeout');
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-  }
-  try {
-    return await fn();
-  } finally {
-    try {
-      rmSync(lockPath, { force: true });
-    } catch {
-      // ignore lock release failure
-    }
-  }
-}
 
 export type DefaultAgentCliId = 'opencode' | 'codex' | 'claude' | 'agy';
 
@@ -583,8 +527,6 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
       const suffixTag = makeUniqueSuffix();
       const tmpTgz = pathMod.join(codexBaseDir, `.tmp-codex-${suffixTag}.tgz`);
       const stageDir = pathMod.join(codexBaseDir, `.tmp-codex-stage-${suffixTag}`);
-      const createdFiles: string[] = [];
-      const createdDirs: string[] = [];
 
       try {
         const regUrl = new URL(registry);
@@ -675,12 +617,12 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
           };
         }
 
-        const publishLockPath = pathMod.join(codexBaseDir, '.codex-publish.lock');
-        const publishOutcome = await withExclusiveFileLock<InstallCliResult>(
-          publishLockPath,
-          CODEX_PUBLISH_LOCK_TIMEOUT_MS,
+        const publishLockDbPath = pathMod.join(codexBaseDir, '.codex-publish.lock.db');
+        const publishOutcome = await withProcessExclusiveLock<InstallCliResult>(
+          publishLockDbPath,
+          { timeoutMs: CODEX_PUBLISH_LOCK_TIMEOUT_MS, timeoutMessage: 'codex_publish_lock_timeout' },
           async () => {
-            // Re-check destination inside exclusive lock so concurrent installers wait for
+            // Re-check destination inside exclusive kernel lock so concurrent installers wait for
             // the winner to finish publishing + linking before concluding 'existing'.
             try {
               const existingStat = lstatSync(destPath);
@@ -701,8 +643,10 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
               }
             }
 
-            createdFiles.length = 0;
-            createdDirs.length = 0;
+            // Publish creation tracking is strictly local to the critical section so rollback
+            // runs AT MOST ONCE while still holding the exclusive lock.
+            const createdFiles: string[] = [];
+            const createdDirs: string[] = [];
             try {
               publishStagedDirectorySiblings(
                 stageDir,
@@ -758,7 +702,6 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
         );
         return publishOutcome;
       } catch (err) {
-        rollbackCreatedArtifacts(createdFiles, createdDirs);
         lastReason = err instanceof Error ? err.message : String(err);
         opts.logger?.warn?.(`codex install attempt from ${registry} failed (${lastReason})`);
       } finally {
