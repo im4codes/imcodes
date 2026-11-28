@@ -553,6 +553,14 @@ export async function getPiPresetTransportConfig(presetName: string, requestedMo
   };
 }
 
+function resolvePresetAuthType(preset: CcPreset): CcPresetAuthType {
+  return preset.authType ?? (
+    preset.env['OPENAI_BASE_URL']?.trim() && !preset.env['ANTHROPIC_BASE_URL']?.trim()
+      ? 'openai'
+      : 'anthropic'
+  );
+}
+
 export async function getKimiPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
   env: Record<string, string>;
   kimiLlm?: KimiLlmConfig;
@@ -567,20 +575,23 @@ export async function getKimiPresetTransportConfig(presetName: string, requested
   const availableModels = getPresetAvailableModelIds(preset);
   const model = selectPresetModel(preset, requestedModel);
   const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
-  const isOpenAi = preset.authType === 'openai'
-    || Boolean(resolvedEnv['OPENAI_BASE_URL']?.trim() && !resolvedEnv['ANTHROPIC_BASE_URL']?.trim());
+  // Resolve protocol from explicit authType or un-normalized preset.env BEFORE resolvePresetEnv cross-populates URLs.
+  const isOpenAi = resolvePresetAuthType(preset) === 'openai';
   const baseUrl = isOpenAi
-    ? (resolvedEnv['OPENAI_BASE_URL']?.trim() || undefined)
-    : (resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || resolvedEnv['OPENAI_BASE_URL']?.trim() || undefined);
+    ? (preset.env['OPENAI_BASE_URL']?.trim() || resolvedEnv['OPENAI_BASE_URL']?.trim() || undefined)
+    : (preset.env['ANTHROPIC_BASE_URL']?.trim() || resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || preset.env['OPENAI_BASE_URL']?.trim() || undefined);
   const apiKey = isOpenAi
     ? (
-        resolvedEnv['OPENAI_API_KEY']?.trim()
+        preset.env['OPENAI_API_KEY']?.trim()
+        || resolvedEnv['OPENAI_API_KEY']?.trim()
         || resolvedEnv['ANTHROPIC_API_KEY']?.trim()
         || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
         || undefined
       )
     : (
-        resolvedEnv['ANTHROPIC_API_KEY']?.trim()
+        preset.env['ANTHROPIC_API_KEY']?.trim()
+        || preset.env['ANTHROPIC_AUTH_TOKEN']?.trim()
+        || resolvedEnv['ANTHROPIC_API_KEY']?.trim()
         || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
         || resolvedEnv['OPENAI_API_KEY']?.trim()
         || undefined
@@ -673,9 +684,7 @@ export async function discoverPresetModels(preset: CcPreset): Promise<{
   endpoint: string;
 }> {
   const env = { ...preset.env };
-  const authType: CcPresetAuthType = preset.authType ?? (
-    env['OPENAI_BASE_URL'] && !env['ANTHROPIC_BASE_URL'] ? 'openai' : 'anthropic'
-  );
+  const authType: CcPresetAuthType = resolvePresetAuthType(preset);
   const baseUrl = authType === 'openai'
     ? (env['OPENAI_BASE_URL']?.trim() || env['ANTHROPIC_BASE_URL']?.trim() || '')
     : (env['ANTHROPIC_BASE_URL']?.trim() || env['OPENAI_BASE_URL']?.trim() || '');

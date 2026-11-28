@@ -1304,8 +1304,8 @@ export interface LaunchOpts extends SessionIncognitoConfig {
   description?: string;
   /** Effective synchronized user/project/session identity contract. */
   identityPrompt?: string;
-  /** CC env preset name — resolved to env vars at launch, persisted for respawn. */
-  ccPreset?: string;
+  /** CC env preset name — resolved to env vars at launch, persisted for respawn (`null` clears). */
+  ccPreset?: string | null;
   /** Bind to an existing remote session key instead of creating a new one. */
   bindExistingKey?: string;
   /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
@@ -1459,16 +1459,17 @@ export async function relaunchSessionWithSettings(
   // A model id is provider-scoped. An AG switch without an explicit choice
   // must use AG's default, not the previous provider's (possibly invalid) id.
   const enteringAgy = targetAgentType === AGY_SDK_PROVIDER_ID && record.agentType !== AGY_SDK_PROVIDER_ID;
+  const targetCcPreset = overrides.ccPreset !== undefined
+    ? (CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(targetAgentType) ? (overrides.ccPreset ?? null) : null)
+    : (isPresetCompatibleAgentSwitch(record.agentType, targetAgentType) ? (record.ccPreset ?? null) : null);
+  const clearingCcPreset = overrides.ccPreset === null && Boolean(record.ccPreset);
   const rawRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel
-    : enteringAgy ? null : (record.requestedModel ?? null);
+    : (enteringAgy || clearingCcPreset) ? null : (record.requestedModel ?? null);
   const targetRequestedModel = targetAgentType === AGY_SDK_PROVIDER_ID
     ? (sanitizeAgyStartupModel(rawRequestedModel) ?? null)
     : rawRequestedModel;
   const targetEffort = overrides.effort !== undefined ? overrides.effort : (record.effort ?? null);
   const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
-  const targetCcPreset = overrides.ccPreset !== undefined
-    ? (CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(targetAgentType) ? (overrides.ccPreset ?? null) : null)
-    : (isPresetCompatibleAgentSwitch(record.agentType, targetAgentType) ? (record.ccPreset ?? null) : null);
   const compatibleIds = targetFresh ? {} : getCompatibleSessionIds(record, targetAgentType);
   const targetRuntimeType = getSessionRuntimeType(targetAgentType);
   const forceHandoff = overrides.handoff === true;
@@ -1551,7 +1552,7 @@ export async function relaunchSessionWithSettings(
       requestedModel: targetRequestedModel ?? undefined,
       effort: targetEffort ?? undefined,
       transportConfig: targetTransportConfig ?? undefined,
-      ccPreset: targetCcPreset ?? undefined,
+      ccPreset: targetCcPreset,
       ...(preserveTransportBinding ? {
         bindExistingKey: record.providerSessionId,
         ...(!targetFresh ? { skipCreate: true } : {}),
@@ -4053,7 +4054,8 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
   // preserve existing.requestedModel across fresh/reset ("Start over" / 重启新建)
   // whenever the provider stays the same, while never inheriting a foreign
   // provider's model ID on cross-provider switches.
-  const storedRequestedModel = (existing?.providerId ?? existing?.agentType) === agentType
+  const clearingCcPreset = opts.ccPreset === null && Boolean(existing?.ccPreset);
+  const storedRequestedModel = !clearingCcPreset && (existing?.providerId ?? existing?.agentType) === agentType
     ? existing?.requestedModel
     : undefined;
   const storedProviderResumeId = (!opts.fresh && (existing?.providerId ?? existing?.agentType) === agentType)
@@ -4080,8 +4082,9 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
   // and causes Qwen to revert from the preset model (MiniMax-M2 / GLM / Kimi …)
   // back to the OAuth `coder-model` placeholder. `opts.fresh` (from /clear or
   // explicit reset) still wins — same rule applied to transportConfig above.
-  const effectiveCcPreset: string | undefined =
-    opts.ccPreset ?? (!opts.fresh && existing?.ccPreset && isPresetCompatibleAgentSwitch(existing.agentType, agentType) ? existing.ccPreset : undefined);
+  const effectiveCcPreset: string | undefined = opts.ccPreset === null
+    ? undefined
+    : (opts.ccPreset ?? (!opts.fresh && existing?.ccPreset && isPresetCompatibleAgentSwitch(existing.agentType, agentType) ? existing.ccPreset : undefined));
   const effectiveUserCreated: boolean | undefined =
     opts.userCreated ?? (!opts.fresh ? existing?.userCreated : undefined);
   const effectiveParentSession: string | undefined =
@@ -4103,7 +4106,7 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     !opts.fresh ? existing?.summarySyncFingerprints : undefined;
   let transportResumeId: string | undefined;
   let transportEnv: Record<string, string> | undefined = opts.extraEnv;
-  let presetContextWindow: number | undefined = !opts.fresh ? existing?.presetContextWindow : undefined;
+  let presetContextWindow: number | undefined = !opts.fresh && effectiveCcPreset ? existing?.presetContextWindow : undefined;
   // Declared HERE (before the bootstrap resolver closes over it) because
   // `resolveTransportContextBootstrap` reads it to decide whether to skip
   // startup-memory DB queries entirely for restarts. Previously declared

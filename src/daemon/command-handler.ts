@@ -3602,6 +3602,7 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
             requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
             effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
             transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
+            ...('ccPreset' in cmd ? { ccPreset: (cmd.ccPreset as string | null) } : {}),
           });
           await handleGetSessions(serverLink);
           logger.info({ sessionName, agentType: cmd.agentType ?? record.agentType }, 'Session relaunched via settings');
@@ -9160,6 +9161,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
           requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
           effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
           transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
+          ...('ccPreset' in cmd ? { ccPreset: (cmd.ccPreset as string | null) } : {}),
         });
         try {
           await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sName));

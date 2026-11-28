@@ -339,6 +339,44 @@ describe('cc presets', () => {
     expect(openaiRes?.kimiLlm.models.map((m) => m.id)).toEqual(['glm-5.3-flash', 'glm-5.3']);
     expect(openaiRes?.env).not.toHaveProperty('OPENAI_API_KEY');
     expect(openaiRes?.env).not.toHaveProperty('KIMI_API_KEY');
+
+    // Legacy OPENAI_BASE_URL-only preset without authType MUST resolve to openai_legacy (not anthropic)
+    await savePresets([
+      {
+        name: 'LegacyOpenAIOnly',
+        env: {
+          OPENAI_BASE_URL: 'https://legacy-openai.invalid/v1',
+          OPENAI_API_KEY: 'oa-legacy-key',
+          OPENAI_MODEL: 'legacy-oai-model',
+        },
+        defaultModel: 'legacy-oai-model',
+      },
+      {
+        name: 'AnthropicOnly',
+        env: {
+          ANTHROPIC_BASE_URL: 'https://anthropic-only.invalid/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'anth-only-key',
+          ANTHROPIC_MODEL: 'anth-model',
+        },
+        defaultModel: 'anth-model',
+      },
+    ]);
+
+    const legacyOpenAiRes = await getKimiPresetTransportConfig('LegacyOpenAIOnly');
+    expect(legacyOpenAiRes?.kimiLlm).toMatchObject({
+      providerType: 'openai_legacy',
+      baseUrl: 'https://legacy-openai.invalid/v1',
+      apiKey: 'oa-legacy-key',
+      model: 'legacy-oai-model',
+    });
+
+    const anthOnlyRes = await getKimiPresetTransportConfig('AnthropicOnly');
+    expect(anthOnlyRes?.kimiLlm).toMatchObject({
+      providerType: 'anthropic',
+      baseUrl: 'https://anthropic-only.invalid/anthropic',
+      apiKey: 'anth-only-key',
+      model: 'anth-model',
+    });
   });
 
   it('clamps a previous provider model to the newly selected preset catalogue', async () => {

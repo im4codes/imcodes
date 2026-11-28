@@ -4158,4 +4158,83 @@ describe('sdk transport session restore', () => {
       codexPresetSpy.mockRestore();
     }
   });
+
+  it('clears ccPreset, presetContextWindow, and stale preset model when relaunching kimi-sdk with ccPreset=null while preserving providerResumeId and contrasting undefined inherit', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const kimiPresetSpy = vi.spyOn(ccPresets, 'getKimiPresetTransportConfig').mockResolvedValue({
+      env: { ANTHROPIC_MODEL: 'glm-5.3-flash' },
+      kimiLlm: {
+        provider: 'glm5.3',
+        providerType: 'anthropic',
+        model: 'glm-5.3-flash',
+        baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+        apiKey: 'test-kimi-key',
+        contextWindow: 1_000_000,
+        models: [{ id: 'glm-5.3-flash', contextWindow: 1_000_000 }],
+      },
+      model: 'glm-5.3-flash',
+      availableModels: ['glm-5.3-flash'],
+      contextWindow: 1_000_000,
+    });
+    const initSpy = vi.spyOn(TransportSessionRuntime.prototype, 'initialize').mockResolvedValue(undefined);
+    try {
+      await connectProvider('kimi-sdk', {});
+      const name = 'deck_relaunch_kimi_clear_preset_brain';
+      mocks.store.set(name, {
+        name,
+        projectName: 'relaunchkimiclear',
+        role: 'brain',
+        agentType: 'kimi-sdk',
+        projectDir: '/tmp/relaunch-kimi-clear',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'kimi-sdk',
+        providerSessionId: 'route-kimi-preset-1',
+        providerResumeId: 'kimi-resume-1',
+        ccPreset: 'glm5.3',
+        requestedModel: 'glm-5.3-flash',
+        presetContextWindow: 1_000_000,
+      });
+
+      // 1) Contrast: omitted ccPreset (undefined) inherits the stored preset and kimiLlm route
+      await relaunchSessionWithSettings(mocks.store.get(name)! as any, { agentType: 'kimi-sdk' });
+      expect(kimiPresetSpy).toHaveBeenCalledTimes(1);
+      expect(kimiPresetSpy).toHaveBeenCalledWith('glm5.3', 'glm-5.3-flash');
+      expect(initSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+        sessionName: name,
+        resumeId: 'kimi-resume-1',
+        kimiLlm: expect.objectContaining({ provider: 'glm5.3', model: 'glm-5.3-flash' }),
+      });
+      expect(mocks.store.get(name)?.ccPreset).toBe('glm5.3');
+      expect(mocks.store.get(name)?.presetContextWindow).toBe(1_000_000);
+
+      // 2) Explicit ccPreset: null clears preset, presetContextWindow, and stale preset model while keeping resumeId
+      kimiPresetSpy.mockClear();
+      initSpy.mockClear();
+      await relaunchSessionWithSettings(mocks.store.get(name)! as any, {
+        agentType: 'kimi-sdk',
+        ccPreset: null,
+      });
+      expect(kimiPresetSpy).not.toHaveBeenCalled();
+      const clearedInit = initSpy.mock.calls.at(-1)?.[0];
+      expect(clearedInit).toMatchObject({
+        sessionName: name,
+        resumeId: 'kimi-resume-1',
+      });
+      expect(clearedInit?.kimiLlm).toBeUndefined();
+      expect(clearedInit?.agentId).toBeUndefined();
+      const persistedAfterClear = mocks.store.get(name);
+      expect(persistedAfterClear?.ccPreset).toBeUndefined();
+      expect(persistedAfterClear?.presetContextWindow).toBeUndefined();
+      expect(persistedAfterClear?.requestedModel).toBeUndefined();
+      expect(persistedAfterClear?.providerResumeId).toBe('kimi-resume-1');
+    } finally {
+      initSpy.mockRestore();
+      kimiPresetSpy.mockRestore();
+    }
+  });
 });

@@ -1893,19 +1893,28 @@ describe('KimiV2Provider', () => {
         expect(defaultArgs).toEqual(['acp']);
         expect(defaultOpts.env.KIMI_SHARE_DIR).toBeUndefined();
 
+        // Point KIMI_SHARE_DIR at an isolated test directory BEFORE creating preset sessions so real ~/.kimi is never touched.
+        const testBaseShareDir = path.join(tmpDir, 'base-kimi-share');
+        mkdirSync(testBaseShareDir, { recursive: true });
+        process.env.KIMI_SHARE_DIR = testBaseShareDir;
+
         // 2) Switching to an Anthropic preset recycles child process with 0o700 KIMI_SHARE_DIR + 0o600 config.toml
-        state.conn = makeMockConn({
-          newSession: vi.fn(async () => ({
-            sessionId: 'kimi-sess-1',
-            models: {
-              availableModels: [
-                { modelId: 'glm-5.3-flash', name: 'GLM-5.3-Flash' },
-                { modelId: 'glm-5.3', name: 'GLM-5.3' },
-              ],
-              currentModelId: 'glm-5.3-flash',
-            },
-          })),
-        });
+        state.connQueue.push(
+          makeMockConn({
+            newSession: vi.fn(async () => ({
+              sessionId: 'kimi-sess-1',
+              models: {
+                availableModels: [
+                  { modelId: 'glm-5.3-flash', name: 'GLM-5.3-Flash' },
+                  { modelId: 'glm-5.3', name: 'GLM-5.3' },
+                ],
+                currentModelId: 'glm-5.3-flash',
+              },
+            })),
+          }),
+          makeMockConn(), // default route probe for listModels() under testBaseShareDir
+          makeMockConn(), // OpenAI preset route
+        );
         await provider.createSession({
           sessionKey: 'sess-preset-anth',
           cwd: tmpDir,
@@ -1956,13 +1965,11 @@ describe('KimiV2Provider', () => {
           usage: { input_tokens: 1200, model_context_window: 1_000_000 },
         });
 
-        // listModels merges/returns preset model catalog cleanly
-        const listed = await provider.listModels(true);
-        expect(listed.models.map((m) => m.id)).toEqual(expect.arrayContaining(['glm-5.3-flash', 'glm-5.3']));
+        // Default listModels refreshes on default route without leaking preset models
+        const listed = await provider.listModels(false);
+        expect(listed.models.map((m) => m.id)).toEqual(['kimi-k2.5', 'kimi-for-coding']);
 
-        // Switching to OpenAI preset recycles again cleanly, cleans prior share dir, and writes type = "openai_legacy"
-        const prevShareDir = capturedShareDir!;
-        state.conn = makeMockConn();
+        // Creating OpenAI preset uses a separate child + share dir; endSession cleans only the ended route.
         await provider.createSession({
           sessionKey: 'sess-preset-openai',
           cwd: tmpDir,
@@ -1977,23 +1984,140 @@ describe('KimiV2Provider', () => {
             models: [{ id: 'gpt-compat', contextWindow: 128_000 }],
           },
         });
-        expect(mockSpawn).toHaveBeenCalledTimes(3);
+        expect(mockSpawn).toHaveBeenCalledTimes(4);
         const { existsSync } = await import('node:fs');
-        expect(existsSync(prevShareDir)).toBe(false);
-        const openaiEnv = (mockSpawn.mock.calls[2]![2] as { env: NodeJS.ProcessEnv }).env;
-        capturedShareDir = openaiEnv.KIMI_SHARE_DIR;
-        const openaiToml = readFileSync(path.join(capturedShareDir!, 'config.toml'), 'utf8');
+        // Anthropic preset session is still open on its own route, so both preset share dirs stay isolated until ended/disconnected.
+        expect(existsSync(capturedShareDir!)).toBe(true);
+        const openaiEnv = (mockSpawn.mock.calls[3]![2] as { env: NodeJS.ProcessEnv }).env;
+        const openaiShareDir = openaiEnv.KIMI_SHARE_DIR!;
+        const openaiToml = readFileSync(path.join(openaiShareDir, 'config.toml'), 'utf8');
         expect(openaiToml).toContain('type = "openai_legacy"');
         expect(openaiToml).toContain('api_key = "secret-openai-key"');
         expect(openaiToml).toContain('max_context_size = 128000');
 
-        await provider.disconnect();
+        await provider.endSession('sess-preset-anth');
         expect(existsSync(capturedShareDir!)).toBe(false);
+        expect(existsSync(openaiShareDir)).toBe(true);
+
+        await provider.disconnect();
+        expect(existsSync(openaiShareDir)).toBe(false);
       } finally {
-        if (origShareEnv !== undefined) process.env.KIMI_SHARE_DIR = origShareEnv;
+        if (origShareEnv !== undefined) {
+          process.env.KIMI_SHARE_DIR = origShareEnv;
+        } else {
+          delete process.env.KIMI_SHARE_DIR;
+        }
       }
     } finally {
       if (capturedShareDir) rmSync(capturedShareDir, { recursive: true, force: true });
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps concurrent route connections isolated while B launches or default listModels refreshes, and endSession(B) cleans only B', async () => {
+    const tmpDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-iso-')));
+    const origShareEnv = process.env.KIMI_SHARE_DIR;
+    const baseShareDir = path.join(tmpDir, 'base-share');
+    mkdirSync(baseShareDir, { recursive: true });
+    process.env.KIMI_SHARE_DIR = baseShareDir;
+
+    try {
+      let resolvePromptA!: (r: PromptResponse) => void;
+      const connA = makeMockConn({
+        newSession: vi.fn(async () => ({
+          sessionId: 'acp-sess-a',
+          models: {
+            availableModels: [{ modelId: 'kimi-default-a', name: 'Kimi Default A' }],
+            currentModelId: 'kimi-default-a',
+          },
+        })),
+        prompt: vi.fn(() => new Promise<PromptResponse>((r) => { resolvePromptA = r; })),
+      });
+      const connB = makeMockConn({
+        newSession: vi.fn(async () => ({
+          sessionId: 'acp-sess-b',
+          models: {
+            availableModels: [{ modelId: 'glm-5.3-flash', name: 'GLM-5.3-Flash' }],
+            currentModelId: 'glm-5.3-flash',
+          },
+        })),
+      });
+      state.connQueue.push(connA, connB);
+
+      const provider = new KimiV2Provider();
+      const deltasA: string[] = [];
+      const errorsA: Array<{ code: string }> = [];
+      provider.onDelta((sid, d) => {
+        if (sid === 'sess-a' && d.delta) deltasA.push(d.delta);
+      });
+      provider.onError((sid, e) => {
+        if (sid === 'sess-a') errorsA.push({ code: e.code });
+      });
+
+      await provider.connect({});
+      await provider.createSession({ sessionKey: 'sess-a', cwd: tmpDir });
+      const handlersA = state.handlers!;
+      const childA = state.children[0]!;
+
+      // Start streaming on A
+      await provider.send('sess-a', 'turn A');
+      await vi.waitFor(() => expect(connA.prompt).toHaveBeenCalledTimes(1));
+      await handlersA.sessionUpdate({
+        sessionId: 'acp-sess-a',
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'part-1 ' } } as never,
+      });
+
+      // Concurrently launch B on a different preset route -> must NOT disturb or kill A
+      await provider.createSession({
+        sessionKey: 'sess-b',
+        cwd: tmpDir,
+        agentId: 'glm-5.3-flash',
+        kimiLlm: {
+          provider: 'glm5.3',
+          providerType: 'anthropic',
+          baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+          apiKey: 'iso-key-b',
+          model: 'glm-5.3-flash',
+          contextWindow: 1_000_000,
+          models: [{ id: 'glm-5.3-flash', contextWindow: 1_000_000 }],
+        },
+      });
+      expect(mockSpawn).toHaveBeenCalledTimes(2);
+      const childB = state.children[1]!;
+      const shareDirB = (mockSpawn.mock.calls[1]![2] as { env: NodeJS.ProcessEnv }).env.KIMI_SHARE_DIR!;
+
+      // Generic default listModels() must run against default route and NOT return preset B models
+      const defaultCatalog = await provider.listModels(true);
+      expect(defaultCatalog.models.map((m) => m.id)).toEqual(['kimi-default-a']);
+      expect(defaultCatalog.models.map((m) => m.id)).not.toContain('glm-5.3-flash');
+
+      // Session A continues receiving streaming chunks after B launched & listModels ran
+      await handlersA.sessionUpdate({
+        sessionId: 'acp-sess-a',
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'part-2' } } as never,
+      });
+      expect(deltasA).toEqual(['part-1 ', 'part-2']);
+
+      // Closing B kills ONLY childB and deletes ONLY shareDirB; A keeps running and can cancel cleanly
+      await provider.endSession('sess-b');
+      const { existsSync } = await import('node:fs');
+      expect(existsSync(shareDirB)).toBe(false);
+      expect(mockKillProcessTree).toHaveBeenCalledWith(childB, { ownsProcessGroup: true });
+      expect(mockKillProcessTree).not.toHaveBeenCalledWith(childA, expect.anything());
+      expect(provider.getSessionDiagnostics('sess-a')?.connected).toBe(true);
+
+      await provider.cancel('sess-a');
+      await vi.waitFor(() => expect(connA.cancel).toHaveBeenCalledWith({ sessionId: 'acp-sess-a' }));
+      resolvePromptA({ stopReason: 'cancelled' });
+      await vi.waitFor(() => expect(errorsA).toContainEqual({ code: 'CANCELLED' }));
+
+      await provider.disconnect();
+    } finally {
+      if (origShareEnv !== undefined) {
+        process.env.KIMI_SHARE_DIR = origShareEnv;
+      } else {
+        delete process.env.KIMI_SHARE_DIR;
+      }
       rmSync(tmpDir, { recursive: true, force: true });
     }
   });
