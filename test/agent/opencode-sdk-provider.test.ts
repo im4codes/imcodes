@@ -362,6 +362,93 @@ describe('OpenCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
+  it('does not use a delayed prompt execution terminal to confirm stop while cancelling manual /compact', async () => {
+    const harness = createHarness();
+    let releaseInterrupt!: () => void;
+    let hangInterrupt = true;
+    harness.client.session.interrupt.mockImplementation(async () => {
+      if (hangInterrupt) {
+        await new Promise<void>((resolve) => { releaseInterrupt = resolve; });
+      }
+      return { interrupted: true };
+    });
+    harness.client.session.compact = vi.fn(async () => ({}));
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    let completedCount = 0;
+    provider.onComplete(() => { completedCount += 1; });
+    const errors: Array<{ sessionId: string; code: string }> = [];
+    provider.onError((sid, err) => errors.push({ sessionId: sid, code: err.code }));
+    await provider.connect({});
+    const route = await provider.createSession({ sessionKey: 'route-compact-stop-proof', cwd: '/tmp/project' });
+
+    // Preceding normal prompt finishes, leaving a delayed prompt terminal that can race into /compact.
+    await provider.send(route, 'ordinary prompt before compact');
+    harness.queue.push({
+      type: 'session.text.delta',
+      data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-pre-compact', ordinal: 0, delta: 'ok' },
+    });
+    harness.queue.push({ type: 'session.idle', data: { sessionID: 'oc-session-1' } });
+    await vi.waitFor(() => expect(completedCount).toBe(1));
+
+    await provider.send(route, '/compact');
+    await vi.waitFor(() => expect(harness.client.session.compact).toHaveBeenCalledTimes(1));
+
+    let settled = false;
+    const cancelling = provider.cancel(route).then(() => { settled = true; });
+    await vi.waitFor(() => expect(harness.client.session.interrupt).toHaveBeenCalledTimes(1));
+
+    // Delayed prompt execution terminals (and unrelated/auto compaction) before and after 150ms MUST NOT confirm /compact stop!
+    harness.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1' } });
+    harness.queue.push({ type: 'session.compaction.ended', data: { sessionID: 'oc-session-1', reason: 'auto' } });
+    await new Promise((resolve) => setTimeout(resolve, 220));
+    expect(settled).toBe(false);
+    expect(errors).toEqual([]);
+    harness.queue.push({ type: 'session.execution.interrupted', data: { sessionID: 'oc-session-1', reason: 'late' } });
+    harness.queue.push({
+      type: 'session.execution.failed',
+      data: { sessionID: 'oc-session-1', error: { name: 'AbortError', message: 'late prompt abort' } },
+    });
+    await expect(provider.send(route, 'overlap during cancelled compact')).rejects.toThrow(/busy/i);
+    expect(settled).toBe(false);
+    expect(errors).toEqual([]);
+
+    // Authoritative session.idle confirms stop cleanly once, releases busy, and enables next send.
+    harness.queue.push({ type: 'session.idle', data: { sessionID: 'oc-session-1' } });
+    await cancelling;
+    expect(settled).toBe(true);
+    expect(errors).toEqual([expect.objectContaining({ sessionId: route, code: PROVIDER_ERROR_CODES.CANCELLED })]);
+    releaseInterrupt?.();
+
+    // Second manual /compact cancelled via correlated manual compaction terminal (not delayed prompt terminal).
+    await provider.send(route, '/compact');
+    await vi.waitFor(() => expect(harness.client.session.compact).toHaveBeenCalledTimes(2));
+    const compactInputId = (harness.client.session.compact.mock.calls[1]?.[0] as { id?: string } | undefined)?.id;
+    expect(compactInputId).toBeTruthy();
+    let settledSecond = false;
+    const cancellingSecond = provider.cancel(route).then(() => { settledSecond = true; });
+    await vi.waitFor(() => expect(harness.client.session.interrupt).toHaveBeenCalledTimes(2));
+    harness.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1' } });
+    await new Promise((resolve) => setTimeout(resolve, 220));
+    expect(settledSecond).toBe(false);
+    harness.queue.push({
+      type: 'session.compaction.ended',
+      data: { sessionID: 'oc-session-1', reason: 'manual', inputID: compactInputId },
+    });
+    await cancellingSecond;
+    expect(settledSecond).toBe(true);
+    expect(errors).toHaveLength(2);
+
+    hangInterrupt = false;
+    releaseInterrupt?.();
+    await provider.send(route, 'after cancelled compact');
+    harness.queue.push({ type: 'session.idle', data: { sessionID: 'oc-session-1' } });
+    await provider.disconnect();
+  });
+
   it('steers a correlated delegation completion through client.sessions.prompt', async () => {
     const harness = createHarness();
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {

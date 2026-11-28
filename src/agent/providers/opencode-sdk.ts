@@ -2960,7 +2960,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     if (this.providerToRoute.get(previousOwner.providerSessionId) === previousOwner.routeId) {
       this.providerToRoute.delete(previousOwner.providerSessionId);
     }
-    this.completeStopConfirmations(previousOwner);
+    this.recordStopProof(previousOwner, { kind: 'reclaim' });
     this.failOnce(
       previousOwner,
       providerError(
@@ -3906,15 +3906,76 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   private readonly cancelTerminalConfirmations = new ProviderStopConfirmation();
   private readonly cancelTerminalObservers = new WeakMap<
     OpenCodeSessionState,
-    { providerSessionId: string; generation: number; observed: boolean }
+    { providerSessionId: string; generation: number; cancelTarget: 'compact' | 'prompt'; observed: boolean }
   >();
   private readonly cancelledCompactRequests = new WeakMap<
     OpenCodeSessionState,
     { generation: number; compactRequest: OpenCodeCompactRequestState }
   >();
 
-  private completeStopConfirmations(state: OpenCodeSessionState): void {
+  private activeStopCancelTarget(
+    state: OpenCodeSessionState,
+    observer?: { providerSessionId: string; generation: number; cancelTarget: 'compact' | 'prompt'; observed: boolean },
+  ): 'compact' | 'prompt' {
+    if (
+      observer
+      && observer.providerSessionId === state.providerSessionId
+      && observer.generation === state.generation
+    ) {
+      return observer.cancelTarget;
+    }
+    const cancelledCompact = this.cancelledCompactRequests.get(state);
+    if (state.compacting || (state.cancelled && cancelledCompact && cancelledCompact.generation === state.generation)) {
+      return 'compact';
+    }
+    return 'prompt';
+  }
+
+  private matchesStopProofSignal(
+    state: OpenCodeSessionState,
+    target: 'compact' | 'prompt',
+    signal:
+      | { kind: 'session-idle' }
+      | { kind: 'session-error' }
+      | { kind: 'prompt-terminal'; correlatedRetry: boolean }
+      | { kind: 'compact-terminal'; compactKind: 'ended' | 'failed' | 'legacy_compacted'; data?: Record<string, any> }
+      | { kind: 'reclaim' },
+  ): boolean {
+    switch (signal.kind) {
+      case 'reclaim':
+      case 'session-idle':
+      case 'session-error':
+        return true;
+      case 'prompt-terminal':
+        if (target !== 'prompt') return false;
+        if (state.authHealInFlight || state.authHealPhase === 'preparing') return false;
+        return signal.correlatedRetry;
+      case 'compact-terminal':
+        return target === 'compact'
+          && this.isMatchingManualCompactionEvent(state, signal.data, signal.compactKind);
+    }
+  }
+
+  /**
+   * Unified stop-proof predicate: funnels early cancel observer state,
+   * stopConfirmations, and cancelTerminalConfirmations through one attribution check
+   * so delayed prompt terminals cannot close a cancelled /compact and auto/uncorrelated
+   * compaction cannot close a cancelled prompt.
+   */
+  private recordStopProof(
+    state: OpenCodeSessionState,
+    signal:
+      | { kind: 'session-idle' }
+      | { kind: 'session-error' }
+      | { kind: 'prompt-terminal'; correlatedRetry: boolean }
+      | { kind: 'compact-terminal'; compactKind: 'ended' | 'failed' | 'legacy_compacted'; data?: Record<string, any> }
+      | { kind: 'reclaim' },
+  ): boolean {
     const observer = this.cancelTerminalObservers.get(state);
+    const target = this.activeStopCancelTarget(state, observer);
+    if (!this.matchesStopProofSignal(state, target, signal)) {
+      return false;
+    }
     if (
       observer
       && observer.providerSessionId === state.providerSessionId
@@ -3924,6 +3985,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     }
     this.stopConfirmations.complete(state);
     this.cancelTerminalConfirmations.complete(state);
+    return true;
   }
 
   private isMatchingManualCompactionEvent(
@@ -3997,9 +4059,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const prevActiveTurnParams = state.activeTurnParams;
     const capturedProviderSessionId = state.providerSessionId;
     const cancelledGeneration = state.generation + 1;
+    const cancelTarget: 'compact' | 'prompt' = wasCompacting ? 'compact' : 'prompt';
     const observer = {
       providerSessionId: capturedProviderSessionId,
       generation: cancelledGeneration,
+      cancelTarget,
       observed: false,
     };
     this.cancelTerminalObservers.set(state, observer);
@@ -4802,7 +4866,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.execution.succeeded': {
-        this.completeStopConfirmations(state);
+        this.recordStopProof(state, {
+          kind: 'prompt-terminal',
+          correlatedRetry: !inRetryLifecycle() || isCorrelatedRetryEvent(),
+        });
         // Late prompt completion frames must never settle an active manual /compact or auth-heal attempt.
         if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
         if (inRetryLifecycle()) {
@@ -4817,7 +4884,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.execution.failed': {
-        this.completeStopConfirmations(state);
+        this.recordStopProof(state, {
+          kind: 'prompt-terminal',
+          correlatedRetry: !inRetryLifecycle() || isCorrelatedRetryEvent(),
+        });
         if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
         if (inRetryLifecycle()) {
           if (isCorrelatedRetryEvent()) {
@@ -4831,7 +4901,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.execution.interrupted': {
-        this.completeStopConfirmations(state);
+        this.recordStopProof(state, {
+          kind: 'prompt-terminal',
+          correlatedRetry: !inRetryLifecycle() || isCorrelatedRetryEvent(),
+        });
         if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
         if (inRetryLifecycle() && !isCorrelatedRetryEvent()) {
           this.scheduleRetryTerminalReconcile(state, state.generation, event.type);
@@ -4875,11 +4948,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       case 'session.status': {
         const status = data?.status;
         if (state.compacting) {
-          if (status?.type === 'idle') this.completeStopConfirmations(state);
+          if (status?.type === 'idle') this.recordStopProof(state, { kind: 'session-idle' });
           return;
         }
         if (status?.type === 'idle') {
-          this.completeStopConfirmations(state);
+          this.recordStopProof(state, { kind: 'session-idle' });
           if (state.authHealInFlight || state.authHealPhase === 'preparing') return;
           if (inRetryLifecycle()) {
             if (isCorrelatedRetryEvent()) {
@@ -4913,9 +4986,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.compaction.ended': {
-        if (this.isMatchingManualCompactionEvent(state, data, 'ended')) {
-          this.completeStopConfirmations(state);
-        }
+        this.recordStopProof(state, { kind: 'compact-terminal', compactKind: 'ended', data });
         if (!state.compacting || !state.compactRequest || state.cancelled) return;
         state.compactRequest.sawV2Compaction = true;
         if (data?.reason !== 'manual') return;
@@ -4933,17 +5004,13 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       }
       case 'session.compacted':
         // Standalone legacy v1 compaction compatibility event (never overrides an active v2 compaction flow).
-        if (this.isMatchingManualCompactionEvent(state, data, 'legacy_compacted')) {
-          this.completeStopConfirmations(state);
-        }
+        this.recordStopProof(state, { kind: 'compact-terminal', compactKind: 'legacy_compacted', data });
         if (state.compacting && !state.cancelled && !state.compactRequest?.sawV2Compaction) {
           this.completeCompactOnce(state, event.type);
         }
         return;
       case 'session.compaction.failed': {
-        if (this.isMatchingManualCompactionEvent(state, data, 'failed')) {
-          this.completeStopConfirmations(state);
-        }
+        this.recordStopProof(state, { kind: 'compact-terminal', compactKind: 'failed', data });
         if (!state.compacting || !state.compactRequest || state.cancelled) return;
         state.compactRequest.sawV2Compaction = true;
         if (data?.reason !== 'manual') return;
@@ -4958,7 +5025,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.idle':
-        this.completeStopConfirmations(state);
+        this.recordStopProof(state, { kind: 'session-idle' });
         if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
         if (inRetryLifecycle()) {
           if (isCorrelatedRetryEvent()) {

@@ -1140,7 +1140,7 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     if (this.providerToRoute.get(previousOwner.providerSessionId) === previousOwner.routeId) {
       this.providerToRoute.delete(previousOwner.providerSessionId);
     }
-    this.completeStopConfirmations(previousOwner);
+    this.recordStopProof(previousOwner, { kind: 'reclaim' });
     this.failOnce(
       previousOwner,
       providerError(
@@ -1577,11 +1577,40 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
   private readonly cancelTerminalConfirmations = new ProviderStopConfirmation();
   private readonly cancelTerminalObservers = new WeakMap<
     OpenCodeSessionState,
-    { providerSessionId: string; generation: number; observed: boolean }
+    { providerSessionId: string; generation: number; cancelTarget: 'compact' | 'prompt'; observed: boolean }
   >();
 
-  private completeStopConfirmations(state: OpenCodeSessionState): void {
+  private activeStopCancelTarget(
+    state: OpenCodeSessionState,
+    observer?: { providerSessionId: string; generation: number; cancelTarget: 'compact' | 'prompt'; observed: boolean },
+  ): 'compact' | 'prompt' {
+    if (
+      observer
+      && observer.providerSessionId === state.providerSessionId
+      && observer.generation === state.generation
+    ) {
+      return observer.cancelTarget;
+    }
+    return state.compacting ? 'compact' : 'prompt';
+  }
+
+  private recordStopProof(
+    state: OpenCodeSessionState,
+    signal:
+      | { kind: 'session-idle' }
+      | { kind: 'session-error' }
+      | { kind: 'prompt-terminal' }
+      | { kind: 'compact-terminal' }
+      | { kind: 'reclaim' },
+  ): boolean {
     const observer = this.cancelTerminalObservers.get(state);
+    const target = this.activeStopCancelTarget(state, observer);
+    const matches = signal.kind === 'reclaim'
+      || signal.kind === 'session-idle'
+      || signal.kind === 'session-error'
+      || (signal.kind === 'prompt-terminal' && target === 'prompt')
+      || (signal.kind === 'compact-terminal' && target === 'compact');
+    if (!matches) return false;
     if (
       observer
       && observer.providerSessionId === state.providerSessionId
@@ -1591,6 +1620,7 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     }
     this.stopConfirmations.complete(state);
     this.cancelTerminalConfirmations.complete(state);
+    return true;
   }
 
   cancelAndWait(sessionId: string): Promise<void> {
@@ -1634,9 +1664,11 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     const prevCancelled = state.cancelled;
     const capturedProviderSessionId = state.providerSessionId;
     const cancelledGeneration = state.generation + 1;
+    const cancelTarget: 'compact' | 'prompt' = wasCompacting ? 'compact' : 'prompt';
     const observer = {
       providerSessionId: capturedProviderSessionId,
       generation: cancelledGeneration,
+      cancelTarget,
       observed: false,
     };
     this.cancelTerminalObservers.set(state, observer);
@@ -2083,6 +2115,7 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
         return;
       case 'message.updated':
         if (this.processMessage(state, event.properties?.info)) {
+          this.recordStopProof(state, { kind: 'prompt-terminal' });
           this.completeOnce(state, 'message.updated');
         }
         return;
@@ -2106,11 +2139,11 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
       case 'session.status': {
         const status = event.properties?.status;
         if (state.compacting) {
-          if (status?.type === 'idle') this.completeStopConfirmations(state);
+          if (status?.type === 'idle') this.recordStopProof(state, { kind: 'session-idle' });
           return;
         }
         if (status?.type === 'idle') {
-          this.completeStopConfirmations(state);
+          this.recordStopProof(state, { kind: 'session-idle' });
           this.completeOnce(state, 'session.status');
           return;
         }
@@ -2120,18 +2153,18 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
         return;
       }
       case 'session.compacted':
+        this.recordStopProof(state, { kind: 'compact-terminal' });
         if (state.compacting && !state.cancelled) {
-          this.completeStopConfirmations(state);
           this.completeCompactOnce(state, 'session.compacted');
         }
         return;
       case 'session.idle':
-        this.completeStopConfirmations(state);
+        this.recordStopProof(state, { kind: 'session-idle' });
         if (state.compacting) return;
         this.completeOnce(state, 'session.idle');
         return;
       case 'session.error': {
-        this.completeStopConfirmations(state);
+        this.recordStopProof(state, { kind: 'session-error' });
         const sessionProviderId = state.activeStepProviderId
           ?? parseModelIdentity(state.model)?.providerID
           ?? parseModelIdentity(this.modelCache?.value.defaultModel)?.providerID;
