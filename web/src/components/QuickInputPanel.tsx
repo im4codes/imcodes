@@ -2230,26 +2230,20 @@ export function QuickInputPanel({
               </div>
             ) : (
               <div class="qp-alias-items">
-                {filteredAliases.map((a) => (
-                  <span key={a.name} class="qp-pill qp-pill-custom qp-alias-item" title={a.description || a.name}>
-                    <span class="qp-alias-item-row">
+                {filteredAliases.map((a) => {
+                  const metaParts = [a.value, a.description];
+                  if (a.tags && a.tags.length > 0) metaParts.push(a.tags.map((t) => `#${t}`).join(' '));
+                  const hoverTitle = metaParts.filter(Boolean).join(' — ') || a.name;
+                  return (
+                    <span key={a.name} class="qp-pill qp-pill-custom qp-alias-item" title={hoverTitle}>
                       <span class="qp-pill-text" onClick={() => { onInsertAlias?.(a.name); onClose(); }}>{a.name}</span>
-                      <span class="qp-alias-item-meta">
-                        <span class="qp-alias-item-value">{a.value}</span>
-                        {a.description ? <span class="qp-alias-item-desc">{a.description}</span> : null}
-                        {a.tags && a.tags.length > 0 ? (
-                          <span class="qp-alias-item-tags">
-                            {a.tags.map((tg) => <span key={tg} class="qp-alias-tag">{tg}</span>)}
-                          </span>
-                        ) : null}
-                      </span>
                       <span class="qp-alias-item-actions">
-                        <button class="qp-pill-edit" title={t('alias.edit')} onClick={() => openAliasEdit(a.name)}>✎</button>
-                        <button class="qp-pill-del" title={t('alias.delete')} onClick={() => { void deleteAliasEntry(a.name); }}>✕</button>
+                        <button type="button" class="qp-pill-edit" title={t('alias.edit')} onClick={() => openAliasEdit(a.name)}>✎</button>
+                        <button type="button" class="qp-pill-del" title={t('alias.delete')} onClick={() => { void deleteAliasEntry(a.name); }}>✕</button>
                       </span>
                     </span>
-                  </span>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>

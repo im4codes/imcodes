@@ -7,6 +7,8 @@
  * without a reload. Inline validation errors surface via the shared reason
  * codes (localized under `alias.error.*`).
  */
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { render, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AliasEntry } from '@shared/alias-types.js';
@@ -80,18 +82,56 @@ function aliasTabButton(): HTMLButtonElement {
 afterEach(() => { cleanup(); vi.clearAllMocks(); __resetAliasesForTests(); store = []; });
 
 describe('QuickInputPanel — 别名 tab', () => {
-  it('renders an alias tab and lists aliases with value + desc + tags (desktop list)', async () => {
+  it('renders an alias tab and lists aliases in compact button mode (no inline meta clutter)', async () => {
     store = [{ name: 'deploy', value: 'ssh root@host', description: 'ship', tags: ['ops', 'prod'], createdAt: '', updatedAt: '', source: 'web' }];
     render(<QuickInputPanel {...baseProps()} />);
     fireEvent.click(aliasTabButton());
     await waitFor(() => expect(root().textContent).toContain('deploy'));
-    // The user's OWN management list shows the (truncated) value + description +
-    // tags. This is the user's own surface — the MCP list_aliases tool stays
-    // metadata-only for agents, but the web owner can see their own value.
-    expect(root().textContent).toContain('ssh root@host');
-    expect(root().textContent).toContain('ship');
-    expect(root().textContent).toContain('ops');
-    expect(root().textContent).toContain('prod');
+    // Compact pill button mode: only name is displayed in the pill, no inline meta/tag clutter.
+    expect(root().querySelector('.qp-alias-item-meta')).toBeNull();
+    expect(root().querySelector('.qp-alias-tag')).toBeNull();
+    expect(root().textContent).not.toContain('ssh root@host');
+    expect(root().textContent).not.toContain('ship');
+    // Detailed value/description/tags are accessible on the pill's hover title
+    const pill = root().querySelector('.qp-alias-item') as HTMLElement;
+    expect(pill.getAttribute('title')).toContain('ssh root@host');
+    expect(pill.getAttribute('title')).toContain('ship');
+    expect(pill.getAttribute('title')).toContain('#ops');
+    expect(pill.getAttribute('title')).toContain('#prod');
+  });
+
+  it('searching by name or description filters compact alias pills accurately', async () => {
+    store = [
+      { name: 'web-prod', value: '10.0.0.1', description: 'frontend cluster', tags: ['k8s', 'prod'], createdAt: '', updatedAt: '', source: 'web' },
+      { name: 'db-stage', value: '10.0.0.2', description: 'postgres staging', tags: ['db', 'staging'], createdAt: '', updatedAt: '', source: 'web' },
+    ];
+    render(<QuickInputPanel {...baseProps()} />);
+    fireEvent.click(aliasTabButton());
+    await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('2'));
+
+    const searchInput = root().querySelector('.qp-alias-search-row input') as HTMLInputElement;
+
+    // Search by name
+    fireEvent.input(searchInput, { target: { value: 'web' } });
+    await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('1'));
+    expect(root().textContent).toContain('web-prod');
+    expect(root().textContent).not.toContain('db-stage');
+
+    // Search by description (matches even though description is not rendered inline in the list)
+    fireEvent.input(searchInput, { target: { value: 'staging' } });
+    await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('1'));
+    expect(root().textContent).toContain('db-stage');
+    expect(root().textContent).not.toContain('web-prod');
+
+    // Search by another description keyword
+    fireEvent.input(searchInput, { target: { value: 'frontend' } });
+    await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('1'));
+    expect(root().textContent).toContain('web-prod');
+
+    // Non-matching search
+    fireEvent.input(searchInput, { target: { value: 'nonexistent' } });
+    await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('0'));
+    expect(root().textContent).toContain('alias.no_results');
   });
 
   it('creates an alias with space-separated tags (whitespace collapsed)', async () => {
@@ -217,7 +257,7 @@ describe('QuickInputPanel — 别名 tab', () => {
     expect(document.activeElement).toBe(valueInput);
   });
 
-  it('renders upgraded alias search counter, clear control, and structured item actions container', async () => {
+  it('renders upgraded alias search counter, clear control, and compact item actions container', async () => {
     store = [
       { name: 'alpha', value: 'ssh 1.2.3.4', description: 'box 1', tags: ['ops'], createdAt: '', updatedAt: '', source: 'web' },
       { name: 'beta', value: 'ssh 5.6.7.8', description: 'box 2', tags: [], createdAt: '', updatedAt: '', source: 'web' },
@@ -225,7 +265,7 @@ describe('QuickInputPanel — 别名 tab', () => {
     render(<QuickInputPanel {...baseProps()} />);
     fireEvent.click(aliasTabButton());
     await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('2'));
-    expect(root().querySelectorAll('.qp-alias-item-row')).toHaveLength(2);
+    expect(root().querySelectorAll('.qp-alias-item')).toHaveLength(2);
     expect(root().querySelectorAll('.qp-alias-item-actions')).toHaveLength(2);
 
     const search = root().querySelector('.qp-alias-search-row input') as HTMLInputElement;
@@ -237,7 +277,7 @@ describe('QuickInputPanel — 别名 tab', () => {
     await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('2'));
   });
 
-  it('uses dedicated scrollable fields container + pinned Save/Cancel actions when editing and wraps 30+ long-tag items', async () => {
+  it('uses dedicated scrollable fields container + pinned Save/Cancel actions when editing and keeps compact pills for 30+ items', async () => {
     store = Array.from({ length: 32 }, (_, i) => ({
       name: `box-${i}`,
       value: `ssh root@host-${i}`,
@@ -250,7 +290,9 @@ describe('QuickInputPanel — 别名 tab', () => {
     render(<QuickInputPanel {...baseProps()} />);
     fireEvent.click(aliasTabButton());
     await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('32'));
-    expect(root().querySelectorAll('.qp-alias-tag').length).toBe(96);
+    // Compact pill buttons: no inline tags or cards rendered in the list!
+    expect(root().querySelectorAll('.qp-alias-tag').length).toBe(0);
+    expect(root().querySelectorAll('.qp-alias-item').length).toBe(32);
 
     const panel = root().querySelector('.qp-alias-panel')!;
     expect(panel.classList.contains('is-editing')).toBe(false);
@@ -269,5 +311,24 @@ describe('QuickInputPanel — 别名 tab', () => {
       'alias.save',
       'alias.cancel',
     ]);
+  });
+
+  it('satisfies CSS contract: .qp-alias-items uses flex-wrap: wrap row flow and .qp-alias-item is auto-width pill', () => {
+    const cssPath = resolve(__dirname, '../src/styles.css');
+    const cssContent = readFileSync(cssPath, 'utf-8');
+
+    // .qp-alias-items must use horizontal wrapping flex flow
+    expect(cssContent).toMatch(/\.qp-alias-items\s*\{[^}]*display:\s*flex/);
+    expect(cssContent).toMatch(/\.qp-alias-items\s*\{[^}]*flex-direction:\s*row/);
+    expect(cssContent).toMatch(/\.qp-alias-items\s*\{[^}]*flex-wrap:\s*wrap/);
+
+    // .qp-alias-item must be inline auto-width pill, NOT full-width card (width: 100%)
+    expect(cssContent).toMatch(/\.qp-alias-item\s*\{[^}]*width:\s*auto/);
+    expect(cssContent).toMatch(/\.qp-alias-item\s*\{[^}]*display:\s*inline-flex/);
+    expect(cssContent).not.toMatch(/\.qp-alias-item\s*\{[^}]*(?<![a-z-])width:\s*100%/);
+
+    // Obsolete full-width card meta/tag selectors must be removed
+    expect(cssContent).not.toContain('.qp-alias-item-meta');
+    expect(cssContent).not.toContain('.qp-alias-tag');
   });
 });
