@@ -1153,7 +1153,7 @@
     "state_error_detail": "错误：{{error}}"
   },
   "ccPreset": {
-    "toolbarButton": "API 预设",
+    "toolbarButton": "BYOK",
     "managerTitle": "CC Preset 配置",
     "managerSubtitle": "管理保存在当前守护进程上的自定义 Anthropic/OpenAI 兼容 API 预设。",
     "editorTitle": "新增 / 编辑预设",
@@ -3454,8 +3454,8 @@
       "memoryPinned": "记忆已置顶，将用于后续摘要。"
     },
     "management": {
-      "title": "共享上下文",
-      "heroDescription": "在一个地方管理共享企业、注册项目、编撰知识和处理行为。",
+      "title": "记忆",
+      "heroDescription": "在一个地方管理个人记忆、处理行为、MCP 服务与技能。",
       "inviteDescription": "以成员身份邀请人员加入企业。如需要可稍后在成员标签页中提升为管理员。",
       "inviteFlowTitle": "邀请流程",
       "memberRolesDescription": "所有者可以提升管理员。管理员可以管理项目和知识但不能任命其他管理员。",

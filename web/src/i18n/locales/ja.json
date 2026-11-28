@@ -1153,7 +1153,7 @@
     "state_error_detail": "エラー: {{error}}"
   },
   "ccPreset": {
-    "toolbarButton": "API プリセット",
+    "toolbarButton": "BYOK",
     "managerTitle": "CC Preset 設定",
     "managerSubtitle": "このデーモン上に保存されたカスタム Anthropic / OpenAI 互換プロバイダープリセットを管理します。",
     "editorTitle": "プリセットを追加 / 編集",
@@ -3454,8 +3454,8 @@
       "memoryPinned": "今後の要約用にメモリをピン留めしました。"
     },
     "management": {
-      "title": "共有コンテキスト",
-      "heroDescription": "共有エンタープライズ、登録プロジェクト、ナレッジ、処理動作を一か所で管理します。",
+      "title": "メモリ",
+      "heroDescription": "個人メモリ、処理動作、MCP、スキルを一か所で管理します。",
       "inviteDescription": "メンバーとしてエンタープライズに招待します。必要に応じてメンバータブで管理者に昇格できます。",
       "inviteFlowTitle": "招待フロー",
       "memberRolesDescription": "オーナーは管理者を昇格できます。管理者はプロジェクトとナレッジを管理できますが、他の管理者を任命できません。",

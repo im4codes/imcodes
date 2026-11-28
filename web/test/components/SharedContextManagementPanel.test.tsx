@@ -289,150 +289,115 @@ describe('SharedContextManagementPanel', () => {
     vi.unstubAllGlobals();
   });
 
-  it('loads enterprise data and renders members, workspaces, projects, and documents', async () => {
-    render(<SharedContextManagementPanel />);
-    await flush();
-    await waitFor(() => expect(getTeamMock).toHaveBeenCalledWith('team-1'));
-    expect((await screen.findAllByText(/Platform/)).length).toBeGreaterThan(0);
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.tabs.members'));
-    });
-    expect(await screen.findByText(/Owner User/)).toBeDefined();
-    expect((await screen.findAllByText(/@member/)).length).toBeGreaterThan(0);
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.tabs.projects'));
-    });
-    expect((await screen.findAllByText(/Repo/)).length).toBeGreaterThan(0);
-    expect(await screen.findByText('sharedContext.management.projectRelationshipTitle')).toBeDefined();
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.tabs.knowledge'));
-    });
-    expect((await screen.findAllByText(/Rules/)).length).toBeGreaterThan(0);
-  });
+  it('defaults to the memory tab, renders only personal/runtime tabs in order, and omits retired enterprise tabs and requests', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const ws = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage() {
+        return () => undefined;
+      },
+    };
 
-  it('creates invite, workspace, document version, and binding', async () => {
-    render(<SharedContextManagementPanel />);
+    const { container } = render(
+      <SharedContextManagementPanel
+        enterpriseId="legacy-ent-1"
+        serverId="srv-1"
+        ws={ws as never}
+      />,
+    );
     await flush();
 
-    expect(screen.queryByText('sharedContext.roles.admin')).toBeNull();
-    expect(await screen.findByText('sharedContext.management.inviteFlowLine1')).toBeDefined();
+    const tabButtons = [...container.querySelectorAll('.shared-context-tabbar-tech .shared-context-tab-tech')];
+    expect(tabButtons.map((btn) => btn.textContent)).toEqual([
+      'sharedContext.management.tabs.memory',
+      'sharedContext.management.tabs.processing',
+      'sharedContext.management.tabs.mcp',
+      'sharedContext.management.tabs.skills',
+    ]);
+    expect(tabButtons[0]?.className).toContain('is-active');
 
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.createInvite'));
-    });
-    expect(createTeamInviteMock).toHaveBeenCalledWith('team-1', 'member', undefined);
-    expect(await screen.findByText('invite-token')).toBeDefined();
+    expect(screen.queryByText('sharedContext.management.tabs.enterprise')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.tabs.members')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.tabs.projects')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.tabs.knowledge')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.selectEnterprise')).toBeNull();
+    expect(screen.queryByPlaceholderText('sharedContext.management.enterpriseNamePlaceholder')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.createEnterprise')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.statEnterprise')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.statMembers')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.statProjects')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.statKnowledgeDocs')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.memoryTabPersonal')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.memoryTabEnterprise')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.memorySummaryLine3')).toBeNull();
 
-    const workspaceNameInput = screen.getByPlaceholderText('sharedContext.management.workspaceNamePlaceholder') as HTMLInputElement;
-    fireEvent.input(workspaceNameInput, { target: { value: 'Infra' } });
-    await flush();
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.createWorkspace'));
-    });
-    expect(createSharedWorkspaceMock).toHaveBeenCalledWith('team-1', 'Infra');
-
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.tabs.knowledge'));
-    });
-
-    const documentContent = screen.getByPlaceholderText('sharedContext.management.documentContent') as HTMLTextAreaElement;
-    fireEvent.input(documentContent, { target: { value: 'Use strict types.' } });
-    await flush();
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'sharedContext.management.createVersion' }));
-    });
-    expect(createSharedDocumentVersionMock).toHaveBeenCalledWith('doc-1', { contentMd: 'Use strict types.' });
-
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.createBinding'));
-    });
-    expect(createSharedDocumentBindingMock).toHaveBeenCalled();
-  });
-
-  it('updates member role and enrolls a project', async () => {
-    render(<SharedContextManagementPanel />);
-    await flush();
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.tabs.members'));
-    });
-    await screen.findByText('sharedContext.management.promoteAdmin');
-
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.promoteAdmin'));
-    });
-    expect(updateTeamMemberRoleMock).toHaveBeenCalledWith('team-1', 'user-member', 'admin');
-
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.tabs.projects'));
-    });
-    const repoInput = screen.getByPlaceholderText('sharedContext.management.canonicalRepoId') as HTMLInputElement;
-    fireEvent.input(repoInput, { target: { value: 'github.com/acme/new-repo' } });
-    await flush();
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.enrollProject'));
-    });
-    expect(enrollSharedProjectMock).toHaveBeenCalledWith('team-1', expect.objectContaining({
-      canonicalRepoId: 'github.com/acme/new-repo',
-      scope: 'project_shared',
-    }));
-  });
-
-  it('loads the saved project policy instead of resetting to hardcoded defaults', async () => {
-    getSharedProjectPolicyMock.mockResolvedValue({
-      enrollmentId: 'enr-1',
-      enterpriseId: 'team-1',
-      allowDegradedProviderSupport: false,
-      allowLocalFallback: true,
-      requireFullProviderSupport: true,
-    });
-
-    render(<SharedContextManagementPanel />);
-    await flush();
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.tabs.projects'));
-    });
-
-    await waitFor(() => expect(getSharedProjectPolicyMock).toHaveBeenCalledWith('enr-1'));
-
-    expect(await screen.findByText('sharedContext.management.policyExplainTitle')).toBeDefined();
-    expect(await screen.findByText('sharedContext.management.allowDegradedHelp')).toBeDefined();
-    expect(await screen.findByText('sharedContext.management.allowLocalFallbackHelp')).toBeDefined();
-    expect(await screen.findByText('sharedContext.management.requireFullSupportHelp')).toBeDefined();
-
-    await waitFor(() => {
-      const degraded = screen.getByLabelText(/sharedContext.management.allowDegraded/i) as HTMLInputElement;
-      const localFallback = screen.getByLabelText(/sharedContext.management.allowLocalFallback/i) as HTMLInputElement;
-      const fullSupport = screen.getByLabelText(/sharedContext.management.requireFullSupport/i) as HTMLInputElement;
-      expect(degraded.checked).toBe(false);
-      expect(localFallback.checked).toBe(true);
-      expect(fullSupport.checked).toBe(true);
-    });
-  });
-
-  it('does not loop enterprise-change notifications when parent rerenders with a new callback identity', async () => {
-    const onEnterpriseChange = vi.fn();
-
-    function Wrapper() {
-      const [, setTick] = useState(0);
-      return (
-        <div>
-          <button type="button" onClick={() => setTick((prev) => prev + 1)}>rerender</button>
-          <SharedContextManagementPanel onEnterpriseChange={(enterpriseId) => onEnterpriseChange(enterpriseId)} />
-        </div>
-      );
+    // Switch through every tab to confirm no enterprise requests are triggered anywhere.
+    for (const tabKey of [
+      'sharedContext.management.tabs.processing',
+      'sharedContext.management.tabs.mcp',
+      'sharedContext.management.tabs.skills',
+      'sharedContext.management.tabs.memory',
+    ]) {
+      await act(async () => {
+        fireEvent.click(screen.getByText(tabKey));
+      });
     }
+    expect(screen.queryByText('sharedContext.management.processingSummaryLine3')).toBeNull();
 
-    render(<Wrapper />);
+    expect(listTeamsMock).not.toHaveBeenCalled();
+    expect(getTeamMock).not.toHaveBeenCalled();
+    expect(listSharedWorkspacesMock).not.toHaveBeenCalled();
+    expect(listSharedProjectsMock).not.toHaveBeenCalled();
+    expect(getSharedProjectPolicyMock).not.toHaveBeenCalled();
+    expect(listSharedDocumentsMock).not.toHaveBeenCalled();
+    expect(listSharedDocumentBindingsMock).not.toHaveBeenCalled();
+    expect(getEnterpriseSharedMemoryMock).not.toHaveBeenCalled();
+  });
+
+  it('wires the hero refresh button to the active tab', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const ws = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage() {
+        return () => undefined;
+      },
+    };
+
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
     await flush();
-    await waitFor(() => expect(getTeamMock).toHaveBeenCalledWith('team-1'));
-    expect(onEnterpriseChange).toHaveBeenCalledTimes(1);
-    expect(onEnterpriseChange).toHaveBeenLastCalledWith('team-1');
+
+    const cloudCallsBefore = getPersonalCloudMemoryMock.mock.calls.length;
+    const runtimeCallsBefore = fetchSharedContextRuntimeConfigMock.mock.calls.length;
+    const personalQueriesBefore = sent.filter((m) => m.type === MEMORY_WS.PERSONAL_QUERY).length;
 
     await act(async () => {
-      fireEvent.click(screen.getByText('rerender'));
+      fireEvent.click(screen.getAllByText('sharedContext.refresh')[0]);
     });
+    expect(getPersonalCloudMemoryMock.mock.calls.length).toBeGreaterThan(cloudCallsBefore);
+    expect(fetchSharedContextRuntimeConfigMock.mock.calls.length).toBeGreaterThan(runtimeCallsBefore);
+    expect(sent.filter((m) => m.type === MEMORY_WS.PERSONAL_QUERY).length).toBeGreaterThan(personalQueriesBefore);
 
-    expect(onEnterpriseChange).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    const runtimeCallsOnProcessing = fetchSharedContextRuntimeConfigMock.mock.calls.length;
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.refresh')[0]);
+    });
+    expect(fetchSharedContextRuntimeConfigMock.mock.calls.length).toBeGreaterThan(runtimeCallsOnProcessing);
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.mcp'));
+    });
+    const mcpQueriesBefore = sent.filter((m) => m.type === MEMORY_WS.MCP_STATUS_QUERY).length;
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.refresh')[0]);
+    });
+    expect(sent.filter((m) => m.type === MEMORY_WS.MCP_STATUS_QUERY).length).toBeGreaterThan(mcpQueriesBefore);
   });
 
   it('loads and saves server-backed processing config', async () => {
@@ -493,7 +458,7 @@ describe('SharedContextManagementPanel', () => {
       memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
       enablePersonalMemorySync: false,
     };
-    fetchSharedContextRuntimeConfigMock.mockResolvedValueOnce({
+    fetchSharedContextRuntimeConfigMock.mockResolvedValue({
       snapshot: {
         persisted: snapshot,
         effective: snapshot,
@@ -611,10 +576,12 @@ describe('SharedContextManagementPanel', () => {
   });
 
   it('renders a shortened server label in the header but keeps the full server scope in processing details', async () => {
-    render(<SharedContextManagementPanel serverId="6f380811d06730a7d21cba1c" />);
+    const { container } = render(<SharedContextManagementPanel serverId="6f380811d06730a7d21cba1c" />);
     await flush();
 
-    expect(await screen.findByText('6f380811…ba1c')).toBeDefined();
+    await waitFor(() => {
+      expect(container.querySelector('.shared-context-hero-tech')?.textContent).toContain('6f380811…ba1c');
+    });
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
@@ -975,7 +942,7 @@ describe('SharedContextManagementPanel', () => {
     expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('gpt-6-luna');
   });
 
-  it('loads local, cloud, and enterprise memory views and saves personal sync settings', async () => {
+  it('loads local and cloud personal memory views and saves personal sync settings', async () => {
     const sent: Array<Record<string, unknown>> = [];
     const messageHandlers = new Set<(message: unknown) => void>();
     const ws = {
@@ -999,7 +966,7 @@ describe('SharedContextManagementPanel', () => {
 
     await waitFor(() => expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1'));
     await waitFor(() => expect(getPersonalCloudMemoryMock).toHaveBeenCalledWith(expect.any(Object)));
-    await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
+    expect(getEnterpriseSharedMemoryMock).not.toHaveBeenCalled();
 
     const queryCommand = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
     expect(queryCommand).toBeDefined();
@@ -1063,14 +1030,6 @@ describe('SharedContextManagementPanel', () => {
     });
     expect(await screen.findByText('Cloud personal decision')).toBeDefined();
     expect((await screen.findAllByText('sharedContext.management.memoryDurableDescription')).length).toBeGreaterThan(0);
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.memoryTabEnterprise'));
-    });
-    expect(await screen.findByText('Shared coding standard reminder')).toBeDefined();
-    await act(async () => {
-      // Switch back to personal tab, then to unprocessed sub-tab
-      fireEvent.click(screen.getByText('sharedContext.management.memoryTabPersonal'));
-    });
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.memoryTabLocalPending'));
     });
@@ -1288,9 +1247,8 @@ describe('SharedContextManagementPanel', () => {
       };
     };
 
-    it('the memory tab keeps every section that loaded when the others answer 404 (older server / server the account does not own / left enterprise)', async () => {
+    it('the memory tab keeps every section that loaded when another answers 404 (older server / server the account does not own)', async () => {
       fetchSharedContextRuntimeConfigMock.mockRejectedValue(notFound());
-      getEnterpriseSharedMemoryMock.mockRejectedValue(notFound());
       const { ws, sent } = makeWs();
       render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
       await flush();
@@ -1299,26 +1257,27 @@ describe('SharedContextManagementPanel', () => {
       // Each failed request is its own line, in the cause's words, never the raw code.
       await waitFor(() => {
         const sections = [...document.querySelectorAll('[data-load-error]')].map((node) => node.getAttribute('data-load-error')).sort();
-        expect(sections).toEqual(['enterpriseMemory', 'runtimeConfig']);
+        expect(sections).toEqual(['runtimeConfig']);
       });
-      expect(screen.getAllByText('sharedContext.management.loadError.not_found')).toHaveLength(2);
+      expect(screen.getAllByText('sharedContext.management.loadError.not_found')).toHaveLength(1);
       expect(document.body.textContent).not.toContain('API 404');
       // The requests that did not fail still ran and rendered: the local query was sent
-      // and the personal cloud memory (called BEFORE the failing enterprise one) is on screen.
+      // and the personal cloud memory is on screen.
       expect(sent.some((message) => message.type === MEMORY_WS.PERSONAL_QUERY)).toBe(true);
       expect(getPersonalCloudMemoryMock).toHaveBeenCalled();
+      expect(getEnterpriseSharedMemoryMock).not.toHaveBeenCalled();
       expect(document.querySelector('[data-load-error="cloudMemory"]')).toBeNull();
     });
 
-    it('a failing personal cloud request does not stop the enterprise memory from loading', async () => {
+    it('a failing personal cloud request surfaces its load error without blocking local WS memory queries', async () => {
       getPersonalCloudMemoryMock.mockRejectedValue(notFound());
-      const { ws } = makeWs();
+      const { ws, sent } = makeWs();
       render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
       await flush();
       await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
-      await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
       await waitFor(() => expect(document.querySelector('[data-load-error="cloudMemory"]')).not.toBeNull());
-      expect(document.querySelector('[data-load-error="enterpriseMemory"]')).toBeNull();
+      expect(sent.some((message) => message.type === MEMORY_WS.PERSONAL_QUERY)).toBe(true);
+      expect(getEnterpriseSharedMemoryMock).not.toHaveBeenCalled();
     });
 
     it('a load error is shown only on the tabs that display what failed', async () => {
@@ -1328,24 +1287,18 @@ describe('SharedContextManagementPanel', () => {
       await flush();
       await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.processing')); });
       await waitFor(() => expect(document.querySelector('[data-load-error="runtimeConfig"]')).not.toBeNull());
-      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.enterprise')); });
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.skills')); });
       expect(document.querySelector('[data-load-error]')).toBeNull();
     });
 
-    it('a remembered enterprise the account no longer belongs to is replaced, not queried (it can only answer 404)', async () => {
-      getTeamMock.mockImplementation(async (id: string) => {
-        if (id === 'gone-team') throw notFound();
-        return { id, name: 'Acme', myRole: 'owner', members: [] };
-      });
+    it('a legacy enterpriseId prop never triggers team or enterprise memory requests', async () => {
       const { ws } = makeWs();
       render(<SharedContextManagementPanel enterpriseId="gone-team" serverId="srv-1" ws={ws as never} />);
       await flush();
-      await flush();
-      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
-      await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
-      expect(getEnterpriseSharedMemoryMock.mock.calls.some((call) => call[0] === 'gone-team')).toBe(false);
-      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.enterprise')); });
-      await waitFor(() => expect(getTeamMock).toHaveBeenCalledWith('team-1'));
+      await waitFor(() => expect(getPersonalCloudMemoryMock).toHaveBeenCalled());
+      expect(listTeamsMock).not.toHaveBeenCalled();
+      expect(getTeamMock).not.toHaveBeenCalled();
+      expect(getEnterpriseSharedMemoryMock).not.toHaveBeenCalled();
       expect(document.querySelector('[data-load-error]')).toBeNull();
     });
   });
@@ -1412,7 +1365,6 @@ describe('SharedContextManagementPanel', () => {
   });
 
   it('renders requested-on dependency-blocked memory features as blocked instead of plain disabled', async () => {
-    listTeamsMock.mockResolvedValueOnce([]);
     const sent: Array<Record<string, unknown>> = [];
     const messageHandlers = new Set<(message: unknown) => void>();
     const ws = {
@@ -1526,9 +1478,6 @@ describe('SharedContextManagementPanel', () => {
   it('ignores stale cloud memory responses after a newer project filter load starts', async () => {
     const firstCloud = deferred<Awaited<ReturnType<typeof getPersonalCloudMemoryMock>>>();
     const secondCloud = deferred<Awaited<ReturnType<typeof getPersonalCloudMemoryMock>>>();
-    getPersonalCloudMemoryMock
-      .mockReturnValueOnce(firstCloud.promise)
-      .mockReturnValueOnce(secondCloud.promise);
 
     const sent: Array<Record<string, unknown>> = [];
     const messageHandlers = new Set<(message: unknown) => void>();
@@ -1559,12 +1508,14 @@ describe('SharedContextManagementPanel', () => {
     );
     await flush();
 
+    getPersonalCloudMemoryMock
+      .mockReturnValueOnce(firstCloud.promise)
+      .mockReturnValueOnce(secondCloud.promise);
+
     await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+      fireEvent.click(screen.getByText('sharedContext.management.memoryShowArchived'));
     });
     await act(async () => {
-      // The active project is already auto-selected, so re-picking it is a no-op.
-      // Toggling "show archived" re-runs loadMemoryViews to start the second load.
       fireEvent.click(screen.getByText('sharedContext.management.memoryShowArchived'));
     });
 
@@ -1627,7 +1578,7 @@ describe('SharedContextManagementPanel', () => {
     expect(screen.queryByText('Stale cloud memory')).toBeNull();
   });
 
-  it('deletes local, cloud, and enterprise memory records', async () => {
+  it('deletes local and cloud personal memory records', async () => {
     const sent: Array<Record<string, unknown>> = [];
     const messageHandlers = new Set<(message: unknown) => void>();
     const ws = {
@@ -1725,15 +1676,7 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(cloudDeleteButtons[0]);
     });
     await waitFor(() => expect(deletePersonalCloudMemoryMock).toHaveBeenCalledWith('cloud-personal-1'));
-
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.memoryTabEnterprise'));
-    });
-    const enterpriseDeleteButtons = await screen.findAllByText('sharedContext.management.memoryDelete');
-    await act(async () => {
-      fireEvent.click(enterpriseDeleteButtons[0]);
-    });
-    await waitFor(() => expect(deleteEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', 'shared-1'));
+    expect(deleteEnterpriseSharedMemoryMock).not.toHaveBeenCalled();
   });
 
   it('resolves directory-only memory project options through the daemon before using the canonical id', async () => {

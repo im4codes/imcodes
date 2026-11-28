@@ -1153,7 +1153,7 @@
     "state_error_detail": "Error: {{error}}"
   },
   "ccPreset": {
-    "toolbarButton": "API Presets",
+    "toolbarButton": "BYOK",
     "managerTitle": "CC Preset Configuration",
     "managerSubtitle": "Manage custom Anthropic/OpenAI-compatible provider presets stored on this daemon.",
     "editorTitle": "Add / Edit Preset",
@@ -3454,8 +3454,8 @@
       "memoryPinned": "Memory pinned for future summaries."
     },
     "management": {
-      "title": "Shared Context",
-      "heroDescription": "Manage shared enterprises, enrolled projects, authored knowledge, and processing behavior from one place.",
+      "title": "Memory",
+      "heroDescription": "Manage personal memory, processing behavior, MCP servers, and skills from one place.",
       "inviteDescription": "Invite people into the enterprise as members. Promote them to admin later from the Members tab if needed.",
       "inviteFlowTitle": "Invitation flow",
       "memberRolesDescription": "Owners can promote admins. Admins manage projects and knowledge but cannot appoint other admins.",

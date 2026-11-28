@@ -39,7 +39,7 @@ import {
   type MemoryProjectResolutionStatus,
 } from '@shared/memory-project-options.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey, type MemoryFeatureFlag } from '@shared/feature-flags.js';
-import { AUTHORED_CONTEXT_SCOPES, canPromoteMemoryScope, MEMORY_SCOPES, type AuthoredContextScope, type MemoryScope } from '@shared/memory-scope.js';
+import { canPromoteMemoryScope, MEMORY_SCOPES, type MemoryScope } from '@shared/memory-scope.js';
 import { OBSERVATION_CLASSES, type ObservationClass } from '@shared/memory-observation.js';
 import {
   DEFAULT_MEMORY_RECALL_MIN_SCORE,
@@ -68,42 +68,12 @@ import {
 } from '@shared/shared-context-runtime-config.js';
 import {
   ApiError,
-  activateSharedDocumentVersion,
-  getEnterpriseSharedMemory,
   getPersonalCloudMemory,
-  createSharedDocument,
-  createSharedDocumentBinding,
-  createSharedDocumentVersion,
-  createSharedWorkspace,
-  createTeam,
-  deleteEnterpriseSharedMemory,
   deletePersonalCloudMemory,
-  createTeamInvite,
-  enrollSharedProject,
-  getSharedProjectPolicy,
-  getTeam,
-  joinTeamByToken,
-  listSharedDocumentBindings,
-  listSharedDocuments,
-  listSharedProjects,
-  listSharedWorkspaces,
-  listTeams,
-  markSharedProjectPendingRemoval,
   patchSharedContextMemorySettings,
-  removeSharedProject,
-  removeTeamMember,
   fetchSharedContextRuntimeConfig,
-  type SharedDocument,
-  type SharedDocumentBinding,
-  type SharedProject,
-  type SharedProjectPolicy,
   type SharedContextRuntimeConfigView,
-  type SharedWorkspace,
-  type TeamDetail,
-  type TeamSummary,
-  updateSharedProjectPolicy,
   updateSharedContextRuntimeConfig,
-  updateTeamMemberRole,
 } from '../api.js';
 import {
   RuntimeModelPresetSelector,
@@ -336,23 +306,6 @@ const pillStyle = {
   fontWeight: 500,
 } as const;
 
-const checkboxRowStyle = {
-  ...rowStyle,
-  alignItems: 'flex-start',
-} as const;
-
-const policyOptionStyle = {
-  flex: SC_IS_MOBILE ? '1 1 100%' : '1 1 260px',
-  minWidth: SC_IS_MOBILE ? 0 : 240,
-  padding: DT.space.md,
-  borderRadius: DT.radius.md,
-  border: `1px solid ${DT.border.subtle}`,
-  background: 'linear-gradient(180deg, rgba(8,13,22,0.82), rgba(15,23,42,0.72))',
-  display: 'flex',
-  flexDirection: 'column',
-  gap: DT.space.xs,
-} as const;
-
 const fieldLabelStyle = {
   display: 'flex',
   flexDirection: 'column',
@@ -556,13 +509,6 @@ const memoryContentExpandedStyle = {
   WebkitMaskImage: 'none',
 } as const;
 
-const splitSectionStyle = {
-  display: 'grid',
-  gridTemplateColumns: SC_IS_MOBILE ? '1fr' : 'repeat(auto-fit, minmax(320px, 1fr))',
-  gap: DT.space.md,
-  alignItems: 'start',
-} as const;
-
 const cardGridStyle = {
   display: 'grid',
   gridTemplateColumns: SC_IS_MOBILE ? '1fr' : 'repeat(auto-fit, minmax(260px, 1fr))',
@@ -667,14 +613,6 @@ function processingChipStyle(active: boolean) {
       };
 }
 
-const defaultPolicyState: SharedProjectPolicy = {
-  enrollmentId: '',
-  enterpriseId: '',
-  allowDegradedProviderSupport: true,
-  allowLocalFallback: false,
-  requireFullProviderSupport: false,
-};
-
 const PROCESSING_MODEL_OPTIONS_BY_BACKEND: Record<SharedContextRuntimeBackend, readonly string[]> = {
   'claude-code-sdk': CLAUDE_CODE_MODEL_IDS,
   'codex-sdk': Array.from(new Set([DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL, ...CODEX_MODEL_IDS])),
@@ -761,11 +699,8 @@ const deleteButtonStyle = {
   border: `1px solid rgba(239,68,68,0.3)`,
 } as const;
 
-type KindOption = SharedDocument['kind'];
-type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing' | 'memory' | 'mcp' | 'skills';
-type MemoryTopTab = 'personal' | 'enterprise-memory';
+type ManagementTab = 'memory' | 'processing' | 'mcp' | 'skills';
 type MemoryPersonalSubTab = 'unprocessed' | 'processed' | 'cloud';
-type MemoryEnterpriseSubTab = 'shared-memory' | 'authored-context';
 type MemoryToolTab = 'status' | 'preferences' | 'skills' | 'md-ingest' | 'observations';
 type MemoryObservationClassFilter = '' | ObservationClass;
 type MemoryResponseStatus = 'idle' | 'loading' | 'ready' | 'unavailable' | 'timeout' | 'error';
@@ -829,8 +764,6 @@ interface TabDef {
   id: ManagementTab;
   label: string;
 }
-
-type SharedScopeValue = AuthoredContextScope;
 
 function InfoCard(props: { title: string; children: ComponentChildren }) {
   return (
@@ -1093,14 +1026,6 @@ const adminFormRowStyle = {
   padding: SC_IS_MOBILE ? 0 : `${DT.space.xs}px 0`,
 } as const;
 
-function formatMemberIdentity(member: TeamDetail['members'][number]): string {
-  const displayName = member.display_name?.trim();
-  if (displayName) return displayName;
-  const username = member.username?.trim();
-  if (username) return `@${username}`;
-  return member.user_id.length > 16 ? `${member.user_id.slice(0, 8)}…${member.user_id.slice(-4)}` : member.user_id;
-}
-
 const EMPTY_MEMORY_VIEW: ContextMemoryView = {
   stats: {
     totalRecords: 0,
@@ -1311,10 +1236,8 @@ function mergeMemoryProjectOption(
   target.set(id, { ...merged, id });
 }
 
-export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, serverId, ws, onEnterpriseChange, memoryProjectCandidates = [], activeProjectDir }: Props) {
+export function SharedContextManagementPanel({ serverId, ws, memoryProjectCandidates = [], activeProjectDir }: Props) {
   const { t } = useTranslation();
-  const onEnterpriseChangeRef = useRef(onEnterpriseChange);
-  onEnterpriseChangeRef.current = onEnterpriseChange;
   const personalMemoryRequestIdRef = useRef<string | null>(null);
   const memoryViewGenerationRef = useRef(0);
   const personalMemoryStatusTimerRef = useRef<TimeoutHandle | null>(null);
@@ -1343,42 +1266,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     mcpStatus: null,
   });
 
-  const [teams, setTeams] = useState<TeamSummary[]>([]);
-  const [enterpriseId, setEnterpriseId] = useState(initialEnterpriseId ?? '');
-  const [team, setTeam] = useState<TeamDetail | null>(null);
-  const [workspaces, setWorkspaces] = useState<SharedWorkspace[]>([]);
-  const [projects, setProjects] = useState<SharedProject[]>([]);
-  const [documents, setDocuments] = useState<SharedDocument[]>([]);
-  const [bindings, setBindings] = useState<SharedDocumentBinding[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [policyLoading, setPolicyLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /** One failed load per section, so an unrelated request neither hides nor shows another's failure. */
   const [loadErrors, setLoadErrors] = useState<Partial<Record<PanelLoadSection, unknown>>>({});
-  /** Ids of the enterprises the account belongs to; null until the list has loaded (a ref: reading it must not re-run the memory load). */
-  const knownTeamIdsRef = useRef<ReadonlySet<string> | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<ManagementTab>('enterprise');
-
-  const [newEnterpriseName, setNewEnterpriseName] = useState('');
-  const [inviteEmail, setInviteEmail] = useState('');
-  const [lastInviteToken, setLastInviteToken] = useState<string | null>(null);
-  const [joinToken, setJoinToken] = useState('');
-  const [workspaceName, setWorkspaceName] = useState('');
-  const [canonicalRepoId, setCanonicalRepoId] = useState('');
-  const [displayName, setDisplayName] = useState('');
-  const [scope, setScope] = useState<SharedScopeValue>('project_shared');
-  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState('');
-  const [selectedEnrollmentId, setSelectedEnrollmentId] = useState('');
-  const [policy, setPolicy] = useState<SharedProjectPolicy>(defaultPolicyState);
-  const [documentKind, setDocumentKind] = useState<KindOption>('coding_standard');
-  const [documentTitle, setDocumentTitle] = useState('');
-  const [selectedDocumentId, setSelectedDocumentId] = useState('');
-  const [selectedVersionId, setSelectedVersionId] = useState('');
-  const [documentContent, setDocumentContent] = useState('');
-  const [bindingMode, setBindingMode] = useState<'required' | 'advisory'>('required');
-  const [bindingLanguage, setBindingLanguage] = useState('');
-  const [bindingPathPattern, setBindingPathPattern] = useState('');
+  const [activeTab, setActiveTab] = useState<ManagementTab>('memory');
   const [processingLoading, setProcessingLoading] = useState(false);
   const [processingSaving, setProcessingSaving] = useState(false);
   const [processingSnapshot, setProcessingSnapshot] = useState<SharedContextRuntimeConfigSnapshot | null>(null);
@@ -1441,12 +1333,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [localPersonalMemory, setLocalPersonalMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
   const [localPersonalMemoryStatus, setLocalPersonalMemoryStatus] = useState<MemoryResponseStatus>('idle');
   const [cloudPersonalMemory, setCloudPersonalMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
-  const [sharedMemory, setSharedMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
   const [expandedMemoryRecordIds, setExpandedMemoryRecordIds] = useState<Set<string>>(new Set());
-  const [memoryTopTab, setMemoryTopTab] = useState<MemoryTopTab>('personal');
   const [memoryToolTab, setMemoryToolTab] = useState<MemoryToolTab>('status');
   const [memoryPersonalSubTab, setMemoryPersonalSubTab] = useState<MemoryPersonalSubTab>('processed');
-  const [memoryEnterpriseSubTab, setMemoryEnterpriseSubTab] = useState<MemoryEnterpriseSubTab>('shared-memory');
   const [showArchived, setShowArchived] = useState(false);
   const [deletingMemoryIds, setDeletingMemoryIds] = useState<Set<string>>(new Set());
   const [memoryFeatureRecords, setMemoryFeatureRecords] = useState<MemoryFeatureAdminRecord[]>([]);
@@ -1836,34 +1725,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     );
   }, [deletingMemoryIds, editingMemoryId, editingMemoryText, expandedMemoryRecordIds, t, showArchived]);
 
-  const selectedDocument = useMemo(
-    () => documents.find((entry) => entry.id === selectedDocumentId) ?? null,
-    [documents, selectedDocumentId],
-  );
-  const selectedProject = useMemo(
-    () => projects.find((entry) => entry.id === selectedEnrollmentId) ?? null,
-    [projects, selectedEnrollmentId],
-  );
-  const workspaceNameById = useMemo(
-    () => new Map(workspaces.map((workspace) => [workspace.id, workspace.name])),
-    [workspaces],
-  );
-  const scopePresentation = useMemo<Record<SharedScopeValue, { label: string; description: string }>>(() => ({
-    project_shared: {
-      label: t('sharedContext.management.scopeProjectLabel'),
-      description: t('sharedContext.management.scopeProjectDescription'),
-    },
-    workspace_shared: {
-      label: t('sharedContext.management.scopeWorkspaceLabel'),
-      description: t('sharedContext.management.scopeWorkspaceDescription'),
-    },
-    org_shared: {
-      label: t('sharedContext.management.scopeEnterpriseLabel'),
-      description: t('sharedContext.management.scopeEnterpriseDescription'),
-    },
-  }), [t]);
-  const currentScopePresentation = scopePresentation[scope];
-
   const panelLoadErrorLines = useMemo(() => (
     (Object.entries(loadErrors) as Array<[PanelLoadSection, unknown]>)
       .filter(([section]) => PANEL_LOAD_SECTION_TABS[section].includes(activeTab))
@@ -1882,31 +1743,17 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   ), [activeTab, loadErrors, t]);
 
   const tabs = useMemo<TabDef[]>(() => [
-    { id: 'enterprise', label: t('sharedContext.management.tabs.enterprise') },
-    { id: 'members', label: t('sharedContext.management.tabs.members') },
-    { id: 'projects', label: t('sharedContext.management.tabs.projects') },
-    { id: 'knowledge', label: t('sharedContext.management.tabs.knowledge') },
-    { id: 'processing', label: t('sharedContext.management.tabs.processing') },
     { id: 'memory', label: t('sharedContext.management.tabs.memory') },
+    { id: 'processing', label: t('sharedContext.management.tabs.processing') },
     { id: 'mcp', label: t('sharedContext.management.tabs.mcp') },
     { id: 'skills', label: t('sharedContext.management.tabs.skills') },
   ], [t]);
 
-  const memoryTopTabs = useMemo(() => [
-    { id: 'personal' as const, label: t('sharedContext.management.memoryTabPersonal'), count: localPersonalMemoryStatus === 'ready' || cloudPersonalMemory.stats.totalRecords > 0
-      ? (localPersonalMemoryStatus === 'ready' ? localPersonalMemory.stats.totalRecords + (localPersonalMemory.pendingRecords?.length ?? 0) : 0) + cloudPersonalMemory.stats.totalRecords
-      : undefined },
-    { id: 'enterprise-memory' as const, label: t('sharedContext.management.memoryTabEnterprise'), count: sharedMemory.stats.totalRecords },
-  ], [t, localPersonalMemory, localPersonalMemoryStatus, cloudPersonalMemory, sharedMemory]);
   const memoryPersonalSubTabs = useMemo(() => [
     { id: 'unprocessed' as const, label: t('sharedContext.management.memoryTabLocalPending'), count: localPersonalMemoryStatus === 'ready' ? localPersonalMemory.pendingRecords?.length ?? 0 : undefined },
     { id: 'processed' as const, label: t('sharedContext.management.memoryTabLocalProcessed'), count: localPersonalMemoryStatus === 'ready' ? localPersonalMemory.stats.totalRecords : undefined },
     { id: 'cloud' as const, label: t('sharedContext.management.memoryTabCloud'), count: cloudPersonalMemory.stats.totalRecords },
   ], [t, localPersonalMemory, localPersonalMemoryStatus, cloudPersonalMemory]);
-  const memoryEnterpriseSubTabs = useMemo(() => [
-    { id: 'shared-memory' as const, label: t('sharedContext.management.memoryTabSharedMemory'), count: sharedMemory.stats.totalRecords },
-    { id: 'authored-context' as const, label: t('sharedContext.management.memoryTabAuthoredContext') },
-  ], [t, sharedMemory]);
 
   const memoryProjectOptions = useMemo<MemoryProjectOption[]>(() => {
     const options = new Map<string, MemoryProjectOption>();
@@ -1928,19 +1775,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       });
     }
 
-    for (const project of projects) {
-      if (project.status !== 'active') continue;
-      const canonicalRepoId = project.canonicalRepoId.trim();
-      if (!canonicalRepoId) continue;
-      mergeMemoryProjectOption(options, {
-        id: canonicalRepoId,
-        displayName: project.displayName?.trim() || canonicalRepoId,
-        canonicalRepoId,
-        source: 'enterprise_enrollment',
-        status: 'canonical_only',
-      });
-    }
-
     for (const option of Object.values(memoryIndexedProjects)) {
       mergeMemoryProjectOption(options, option);
     }
@@ -1954,7 +1788,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       if (b.projectDir === activeProjectDir) return 1;
       return (b.lastSeenAt ?? 0) - (a.lastSeenAt ?? 0) || a.displayName.localeCompare(b.displayName);
     });
-  }, [activeProjectDir, memoryIndexedProjects, memoryProjectCandidates, projects, resolvedMemoryProjects]);
+  }, [activeProjectDir, memoryIndexedProjects, memoryProjectCandidates, resolvedMemoryProjects]);
 
   const selectedMemoryProject = useMemo(
     () => memoryProjectOptions.find((option) => option.id === selectedMemoryProjectId) ?? null,
@@ -2081,109 +1915,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       return next;
     });
   }, []);
-  const refreshEnterpriseData = useCallback(async (nextEnterpriseId = enterpriseId) => {
-    if (!nextEnterpriseId) {
-      setTeam(null);
-      setWorkspaces([]);
-      setProjects([]);
-      setDocuments([]);
-      setBindings([]);
-      setSelectedWorkspaceId('');
-      setSelectedEnrollmentId('');
-      setSelectedDocumentId('');
-      setSelectedVersionId('');
-      setPolicy(defaultPolicyState);
-      return;
-    }
-    setLoading(true);
-    clearLoadError(PANEL_LOAD_SECTIONS.ENTERPRISE);
-    try {
-      const [teamDetail, nextWorkspaces, nextProjects, nextDocuments, nextBindings] = await Promise.all([
-        getTeam(nextEnterpriseId),
-        listSharedWorkspaces(nextEnterpriseId),
-        listSharedProjects(nextEnterpriseId),
-        listSharedDocuments(nextEnterpriseId),
-        listSharedDocumentBindings(nextEnterpriseId),
-      ]);
-      setTeam(teamDetail);
-      setWorkspaces(nextWorkspaces);
-      setProjects(nextProjects);
-      setDocuments(nextDocuments);
-      setBindings(nextBindings);
-      setSelectedWorkspaceId((prev) => (
-        prev && nextWorkspaces.some((workspace) => workspace.id === prev)
-          ? prev
-          : (nextWorkspaces[0]?.id ?? '')
-      ));
-      setSelectedEnrollmentId((prev) => (
-        prev && nextProjects.some((project) => project.id === prev)
-          ? prev
-          : (nextProjects[0]?.id ?? '')
-      ));
-      setSelectedDocumentId((prev) => (
-        prev && nextDocuments.some((document) => document.id === prev)
-          ? prev
-          : (nextDocuments[0]?.id ?? '')
-      ));
-    } catch (err) {
-      reportLoadError(PANEL_LOAD_SECTIONS.ENTERPRISE, err);
-    } finally {
-      setLoading(false);
-    }
-  }, [clearLoadError, enterpriseId, reportLoadError]);
-
-  useEffect(() => {
-    void listTeams()
-      .then((nextTeams) => {
-        setTeams(nextTeams);
-        knownTeamIdsRef.current = new Set(nextTeams.map((candidate) => candidate.id));
-        clearLoadError(PANEL_LOAD_SECTIONS.TEAMS);
-        // A remembered enterprise (pinned panel props) the account has since left or that
-        // was deleted only answers 404: fall back to one the account really belongs to.
-        if ((!enterpriseId || !nextTeams.some((candidate) => candidate.id === enterpriseId)) && nextTeams[0]) {
-          setEnterpriseId(nextTeams[0].id);
-        } else if (enterpriseId && !nextTeams.some((candidate) => candidate.id === enterpriseId)) {
-          setEnterpriseId('');
-        }
-      })
-      .catch((err) => reportLoadError(PANEL_LOAD_SECTIONS.TEAMS, err));
-  }, []);
-
-  useEffect(() => {
-    if (!enterpriseId) return;
-    onEnterpriseChangeRef.current?.(enterpriseId);
-    void refreshEnterpriseData(enterpriseId);
-  }, [enterpriseId]);
-
-  useEffect(() => {
-    const versions = selectedDocument?.versions ?? [];
-    if (versions.length === 0) {
-      setSelectedVersionId('');
-      return;
-    }
-    setSelectedVersionId((prev) => (
-      prev && versions.some((version) => version.id === prev)
-        ? prev
-        : versions[0].id
-    ));
-  }, [selectedDocument]);
-
-  useEffect(() => {
-    if (!selectedEnrollmentId) {
-      setPolicy(defaultPolicyState);
-      return;
-    }
-    setPolicyLoading(true);
-    clearLoadError(PANEL_LOAD_SECTIONS.POLICY);
-    void getSharedProjectPolicy(selectedEnrollmentId)
-      .then((nextPolicy) => setPolicy(nextPolicy))
-      .catch((err) => {
-        setPolicy(defaultPolicyState);
-        reportLoadError(PANEL_LOAD_SECTIONS.POLICY, err);
-      })
-      .finally(() => setPolicyLoading(false));
-  }, [selectedEnrollmentId]);
-
   const handleAction = useCallback(async (label: string, fn: () => Promise<void>) => {
     setError(null);
     setNotice(null);
@@ -2394,11 +2125,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         setLocalPersonalMemoryStatus('unavailable');
       }
 
-      // The cloud and enterprise views are independent requests: one answering 404 (a server
-      // older than this page, or an enterprise the account is no longer in) must not blank
-      // the other, nor the local memory above, nor surface as a bare "API 404: not_found".
       clearLoadError(PANEL_LOAD_SECTIONS.CLOUD_MEMORY);
-      clearLoadError(PANEL_LOAD_SECTIONS.ENTERPRISE_MEMORY);
       try {
         const cloudView = normalizeMemoryView(await getPersonalCloudMemory(queryInput));
         if (memoryViewGenerationRef.current !== generation) return;
@@ -2408,36 +2135,13 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         if (memoryViewGenerationRef.current !== generation) return;
         reportLoadError(PANEL_LOAD_SECTIONS.CLOUD_MEMORY, err);
       }
-
-      // Skip an enterprise the account's own team list says it does not belong to: that request
-      // can only answer 404 (same-shape not-found, by design).
-      const enterpriseKnown = !knownTeamIdsRef.current || knownTeamIdsRef.current.has(enterpriseId);
-      if (enterpriseId && enterpriseKnown) {
-        try {
-          const enterpriseView = normalizeMemoryView(await getEnterpriseSharedMemory(enterpriseId, {
-            ...(browseCanonicalRepoId ? { canonicalRepoId: browseCanonicalRepoId } : {}),
-            projectionClass: memoryProjectionClass || undefined,
-            query: memoryQuery.trim() || undefined,
-            limit: 25,
-          }));
-          if (memoryViewGenerationRef.current !== generation) return;
-          rememberMemoryProjectIndex(enterpriseView.projects ?? []);
-          setSharedMemory(enterpriseView);
-        } catch (err) {
-          if (memoryViewGenerationRef.current !== generation) return;
-          reportLoadError(PANEL_LOAD_SECTIONS.ENTERPRISE_MEMORY, err);
-        }
-      } else {
-        if (memoryViewGenerationRef.current !== generation) return;
-        setSharedMemory(EMPTY_MEMORY_VIEW);
-      }
     } catch (err) {
       // Only the local query setup can throw out here (sending on a dead socket).
       if (memoryViewGenerationRef.current === generation) setError(err instanceof Error ? err.message : String(err));
     } finally {
       if (memoryViewGenerationRef.current === generation) setMemoryLoading(false);
     }
-  }, [browseCanonicalRepoId, clearLoadError, enterpriseId, memoryProjectionClass, memoryQuery, rememberMemoryProjectIndex, reportLoadError, showArchived, ws]);
+  }, [browseCanonicalRepoId, clearLoadError, memoryProjectionClass, memoryQuery, rememberMemoryProjectIndex, reportLoadError, showArchived, ws]);
 
   const loadMemoryAdminViews = useCallback(() => {
     if (!ws) {
@@ -2889,18 +2593,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     }
   }, [confirmMemoryDelete, finishMemoryDelete, loadMemoryViews]);
 
-  const handleEnterpriseMemoryDelete = useCallback(async (id: string) => {
-    if (!enterpriseId || !confirmMemoryDelete(id)) return;
-    try {
-      await deleteEnterpriseSharedMemory(enterpriseId, id);
-      await loadMemoryViews();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      finishMemoryDelete(id);
-    }
-  }, [confirmMemoryDelete, enterpriseId, finishMemoryDelete, loadMemoryViews]);
-
   const getProcessingPresetValue = useCallback((
     backend: SharedContextRuntimeBackend,
     model: string,
@@ -3270,6 +2962,23 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     </div>
   );
 
+  const refreshActiveTab = useCallback(() => {
+    if (activeTab === 'memory') {
+      void loadMemoryViews();
+      loadMemoryAdminViews();
+      if (serverId) void reloadProcessingConfig();
+      return;
+    }
+    if (activeTab === 'processing') {
+      void reloadProcessingConfig();
+      return;
+    }
+    if (activeTab === 'mcp') {
+      loadMemoryAdminViews();
+      loadMcpStatus();
+    }
+  }, [activeTab, loadMcpStatus, loadMemoryAdminViews, loadMemoryViews, reloadProcessingConfig, serverId]);
+
   return (
     <div className="shared-context-shell-tech" style={shellStyle}>
       <div className="shared-context-hero-tech" style={heroStyle}>
@@ -3282,47 +2991,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               {t('sharedContext.management.heroDescription')}
             </span>
           </div>
-          <button style={subtleButtonStyle} onClick={() => void refreshEnterpriseData()}>
+          <button style={subtleButtonStyle} onClick={refreshActiveTab}>
             {t('sharedContext.refresh')}
           </button>
         </div>
-        <div style={rowStyle}>
-          <select value={enterpriseId} onChange={(e) => setEnterpriseId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
-            <option value="">{t('sharedContext.management.selectEnterprise')}</option>
-            {teams.map((entry) => (
-              <option key={entry.id} value={entry.id}>{entry.name} ({entry.role})</option>
-            ))}
-          </select>
-          <input
-            value={newEnterpriseName}
-            onInput={(e) => setNewEnterpriseName((e.currentTarget as HTMLInputElement).value)}
-            placeholder={t('sharedContext.management.enterpriseNamePlaceholder')}
-            style={inputStyle}
-          />
-          <button
-            style={buttonStyle}
-            onClick={() => void handleAction(t('sharedContext.notice.enterpriseCreated'), async () => {
-              const created = await createTeam(newEnterpriseName.trim());
-              const nextTeams = await listTeams();
-              setTeams(nextTeams);
-              setEnterpriseId(created.id);
-              setNewEnterpriseName('');
-            })}
-          >
-            {t('sharedContext.management.createEnterprise')}
-          </button>
-        </div>
         <div style={statGridStyle}>
-          <StatCard
-            label={t('sharedContext.management.statEnterprise')}
-            value={team?.name ?? t('sharedContext.management.noneValue')}
-            detail={team
-              ? t('sharedContext.management.statRole', { role: t(`sharedContext.roles.${team.myRole}`) })
-              : t('sharedContext.management.statChooseOrCreateEnterprise')}
-          />
-          <StatCard label={t('sharedContext.management.statMembers')} value={team?.members?.length ?? 0} />
-          <StatCard label={t('sharedContext.management.statProjects')} value={projects.length} />
-          <StatCard label={t('sharedContext.management.statKnowledgeDocs')} value={documents.length} />
           <StatCard
             label={t('sharedContext.management.statServer')}
             value={formatServerScopeValue(serverId, t('sharedContext.management.serverUnbound'))}
@@ -3350,512 +3023,15 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           </button>
         ))}
       </div>
-      {loading && <div style={helperTextStyle}>{t('sharedContext.loading')}</div>}
       {error && <div style={{ color: '#fca5a5' }}>{error}</div>}
       {panelLoadErrorLines.map((line) => <div key={line.section} data-load-error={line.section} style={{ color: '#fca5a5' }}>{line.text}</div>)}
       {notice && <div style={{ color: '#86efac' }}>{notice}</div>}
-
-      {activeTab === 'enterprise' && (
-        <div style={splitSectionStyle}>
-          <div style={sectionStyle}>
-            <SectionHeading
-              title={t('sharedContext.management.invites')}
-              description={t('sharedContext.management.inviteDescription')}
-            />
-            <InfoCard title={t('sharedContext.management.inviteFlowTitle')}>
-              <div>{t('sharedContext.management.inviteFlowLine1')}</div>
-              <div>{t('sharedContext.management.inviteFlowLine2')}</div>
-            </InfoCard>
-            <div style={rowStyle}>
-              <input
-                value={inviteEmail}
-                onInput={(e) => setInviteEmail((e.currentTarget as HTMLInputElement).value)}
-                placeholder={t('sharedContext.management.inviteEmailPlaceholder')}
-                style={inputStyle}
-              />
-              <button
-                style={buttonStyle}
-                disabled={!enterpriseId}
-                onClick={() => void handleAction(t('sharedContext.notice.inviteCreated'), async () => {
-                  const created = await createTeamInvite(enterpriseId, 'member', inviteEmail.trim() || undefined);
-                  setLastInviteToken(created.token);
-                })}
-              >
-                {t('sharedContext.management.createInvite')}
-              </button>
-            </div>
-            {lastInviteToken && (
-              <div style={{ ...resourceCardStyle, gap: 6 }}>
-                <span style={{ color: '#94a3b8', fontSize: 12 }}>{t('sharedContext.management.inviteToken')}</span>
-                <code style={{ color: '#e2e8f0', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{lastInviteToken}</code>
-              </div>
-            )}
-            <div style={rowStyle}>
-              <input
-                value={joinToken}
-                onInput={(e) => setJoinToken((e.currentTarget as HTMLInputElement).value)}
-                placeholder={t('sharedContext.management.joinTokenPlaceholder')}
-                style={inputStyle}
-              />
-              <button
-                style={subtleButtonStyle}
-                onClick={() => void handleAction(t('sharedContext.notice.joinedEnterprise'), async () => {
-                  const joined = await joinTeamByToken(joinToken.trim());
-                  setJoinToken('');
-                  const nextTeams = await listTeams();
-                  setTeams(nextTeams);
-                  setEnterpriseId(joined.teamId);
-                })}
-              >
-                {t('sharedContext.management.joinEnterprise')}
-              </button>
-            </div>
-          </div>
-
-          <div style={sectionStyle}>
-            <SectionHeading
-              title={t('sharedContext.management.workspaces')}
-              description={t('sharedContext.management.workspaceDescription')}
-            />
-            <div style={rowStyle}>
-              <input
-                value={workspaceName}
-                onInput={(e) => setWorkspaceName((e.currentTarget as HTMLInputElement).value)}
-                placeholder={t('sharedContext.management.workspaceNamePlaceholder')}
-                style={inputStyle}
-              />
-              <button
-                style={buttonStyle}
-                disabled={!enterpriseId}
-                onClick={() => void handleAction(t('sharedContext.notice.workspaceCreated'), async () => {
-                  await createSharedWorkspace(enterpriseId, workspaceName.trim());
-                  setWorkspaceName('');
-                  await refreshEnterpriseData();
-                })}
-              >
-                {t('sharedContext.management.createWorkspace')}
-              </button>
-            </div>
-            {workspaces.length > 0 ? (
-              <div style={cardGridStyle}>
-                {workspaces.map((workspace) => (
-                  <div key={workspace.id} style={resourceCardStyle}>
-                    <strong>{workspace.name}</strong>
-                    <div style={metaGridStyle}>
-                      <MetaCard label={t('sharedContext.management.workspaceId')} value={<code>{workspace.id}</code>} />
-                      <MetaCard label={t('sharedContext.management.projects')} value={projects.filter((project) => project.workspaceId === workspace.id).length} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : <div style={helperTextStyle}>{t('sharedContext.empty')}</div>}
-          </div>
-        </div>
-      )}
-
-      {activeTab === 'members' && (
-        <div style={sectionStyle}>
-          <SectionHeading
-            title={t('sharedContext.management.members')}
-            description={t('sharedContext.management.memberRolesDescription')}
-            action={<span style={pillStyle}>{t('sharedContext.management.activeCount', { count: team?.members?.length ?? 0 })}</span>}
-          />
-          {team?.members?.length ? (
-            <div style={resourceListStyle}>
-              {team.members.map((member) => (
-                <div key={member.user_id} style={resourceCardStyle}>
-                  <div style={{ ...rowStyle, justifyContent: 'space-between' }}>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      <strong>{formatMemberIdentity(member)}</strong>
-                      <span style={helperTextStyle}>{member.username ? `@${member.username}` : member.user_id}</span>
-                    </div>
-                    <div style={metaGridStyle}>
-                      <MetaCard label={t('sharedContext.management.role')} value={t(`sharedContext.roles.${member.role}`)} />
-                      <MetaCard label={t('sharedContext.management.joined')} value={new Date(member.joined_at).toLocaleString()} />
-                    </div>
-                    {member.role !== 'owner' && (
-                      <div style={rowStyle}>
-                        <button
-                          style={subtleButtonStyle}
-                          onClick={() => void handleAction(t('sharedContext.notice.memberUpdated'), async () => {
-                            await updateTeamMemberRole(enterpriseId, member.user_id, member.role === 'admin' ? 'member' : 'admin');
-                            await refreshEnterpriseData();
-                          })}
-                        >
-                          {member.role === 'admin' ? t('sharedContext.management.demoteMember') : t('sharedContext.management.promoteAdmin')}
-                        </button>
-                        <button
-                          style={subtleButtonStyle}
-                          onClick={() => void handleAction(t('sharedContext.notice.memberRemoved'), async () => {
-                            await removeTeamMember(enterpriseId, member.user_id);
-                            await refreshEnterpriseData();
-                          })}
-                        >
-                          {t('sharedContext.management.removeMember')}
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : <div style={helperTextStyle}>{t('sharedContext.empty')}</div>}
-        </div>
-      )}
-
-      {activeTab === 'projects' && (
-        <>
-          <InfoCard title={t('sharedContext.management.projectRelationshipTitle')}>
-            <div>{t('sharedContext.management.projectRelationshipLine1')}</div>
-            <div>{t('sharedContext.management.projectRelationshipLine2')}</div>
-            <div>{t('sharedContext.management.projectRelationshipLine3')}</div>
-            <div>{t('sharedContext.management.projectRelationshipLine4')}</div>
-          </InfoCard>
-
-          <div style={splitSectionStyle}>
-            <InfoCard title={t('sharedContext.management.belongsToTitle')}>
-              <div><strong>{t('sharedContext.management.belongsToEnterprise')}</strong> {team?.name ?? t('sharedContext.management.notSelected')}</div>
-              <div><strong>{t('sharedContext.management.belongsToWorkspace')}</strong> {t('sharedContext.management.belongsToWorkspaceValue')}</div>
-              <div><strong>{t('sharedContext.management.belongsToProject')}</strong> {t('sharedContext.management.belongsToProjectValue')}</div>
-            </InfoCard>
-
-            <InfoCard title={t('sharedContext.management.sharesWithTitle')}>
-              <div><strong>{t('sharedContext.management.scopeProjectLabel')}</strong>: {t('sharedContext.management.sharesWithProjectValue')}</div>
-              <div><strong>{t('sharedContext.management.scopeWorkspaceLabel')}</strong>: {t('sharedContext.management.sharesWithWorkspaceValue')}</div>
-              <div><strong>{t('sharedContext.management.scopeEnterpriseLabel')}</strong>: {t('sharedContext.management.sharesWithEnterpriseValue')}</div>
-            </InfoCard>
-          </div>
-
-          <div style={splitSectionStyle}>
-            <div style={sectionStyle}>
-            <SectionHeading
-              title={t('sharedContext.management.projects')}
-              description={t('sharedContext.management.enrollDescription')}
-              action={selectedProject ? (
-                <span style={pillStyle}>
-                  {selectedProject.displayName ?? selectedProject.canonicalRepoId} · {selectedProject.status}
-                </span>
-              ) : undefined}
-            />
-            <InfoCard title={t('sharedContext.management.chooseSharingLevelTitle')}>
-              <div><strong>{t('sharedContext.management.scopeProjectLabel')}</strong>: {t('sharedContext.management.chooseSharingLevelProject')}</div>
-              <div><strong>{t('sharedContext.management.scopeWorkspaceLabel')}</strong>: {t('sharedContext.management.chooseSharingLevelWorkspace')}</div>
-              <div><strong>{t('sharedContext.management.scopeEnterpriseLabel')}</strong>: {t('sharedContext.management.chooseSharingLevelEnterprise')}</div>
-            </InfoCard>
-            <div style={rowStyle}>
-              <input value={canonicalRepoId} onInput={(e) => setCanonicalRepoId((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.canonicalRepoId')} style={inputStyle} />
-              <input value={displayName} onInput={(e) => setDisplayName((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.displayName')} style={inputStyle} />
-              <select value={scope} onChange={(e) => setScope((e.currentTarget as HTMLSelectElement).value as SharedScopeValue)} style={inputStyle}>
-                {AUTHORED_CONTEXT_SCOPES.map((scopeValue) => (
-                  <option key={scopeValue} value={scopeValue}>{scopePresentation[scopeValue].label}</option>
-                ))}
-              </select>
-              <select value={selectedWorkspaceId} onChange={(e) => setSelectedWorkspaceId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
-                <option value="">{t('sharedContext.management.noWorkspace')}</option>
-                {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
-              </select>
-              <button
-                style={buttonStyle}
-                disabled={!enterpriseId || !canonicalRepoId.trim()}
-                onClick={() => void handleAction(t('sharedContext.notice.projectEnrolled'), async () => {
-                  await enrollSharedProject(enterpriseId, {
-                    canonicalRepoId: canonicalRepoId.trim(),
-                    displayName: displayName.trim() || undefined,
-                    workspaceId: selectedWorkspaceId || undefined,
-                    scope,
-                  });
-                  setCanonicalRepoId('');
-                  setDisplayName('');
-                  await refreshEnterpriseData();
-                })}
-              >
-                {t('sharedContext.management.enrollProject')}
-              </button>
-            </div>
-            <div style={{ ...resourceCardStyle, gap: 6 }}>
-              <strong>{currentScopePresentation.label}</strong>
-              <span style={helperTextStyle}>{currentScopePresentation.description}</span>
-              <span style={helperTextStyle}>
-                {selectedWorkspaceId
-                  ? t('sharedContext.management.scopeSourceWithWorkspace', {
-                      workspace: workspaceNameById.get(selectedWorkspaceId) ?? selectedWorkspaceId,
-                      enterprise: team?.name ?? t('sharedContext.management.selectedEnterprise'),
-                    })
-                  : t('sharedContext.management.scopeSourceWithoutWorkspace', {
-                      enterprise: team?.name ?? t('sharedContext.management.selectedEnterprise'),
-                    })}
-              </span>
-            </div>
-            <div style={resourceListStyle}>
-              {projects.map((project) => (
-                <div key={project.id} style={resourceCardStyle}>
-                  <div style={{ ...rowStyle, justifyContent: 'space-between' }}>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      <strong>{project.displayName ?? project.canonicalRepoId}</strong>
-                      <span style={helperTextStyle}>
-                        {scopePresentation[project.scope as SharedScopeValue].label}
-                      </span>
-                      <div style={metaGridStyle}>
-                        <MetaCard label={t('sharedContext.management.workspaceLabel')} value={project.workspaceId ? (workspaceNameById.get(project.workspaceId) ?? project.workspaceId) : t('sharedContext.management.noWorkspaceAssigned')} />
-                        <MetaCard label={t('sharedContext.management.statusLabel')} value={project.status} />
-                        <MetaCard label={t('sharedContext.management.scopeLabel')} value={scopePresentation[project.scope as SharedScopeValue].label} />
-                        <MetaCard label={t('sharedContext.management.meaningLabel')} value={scopePresentation[project.scope as SharedScopeValue].description} />
-                      </div>
-                    </div>
-                    <div style={rowStyle}>
-                      <button
-                        style={subtleButtonStyle}
-                        onClick={() => {
-                          setSelectedEnrollmentId(project.id);
-                          setActiveTab('projects');
-                        }}
-                      >
-                        {t('sharedContext.management.editPolicy')}
-                      </button>
-                      <button
-                        style={subtleButtonStyle}
-                        onClick={() => void handleAction(t('sharedContext.notice.projectPendingRemoval'), async () => {
-                          await markSharedProjectPendingRemoval(project.id);
-                          await refreshEnterpriseData();
-                        })}
-                      >
-                        {t('sharedContext.management.pendingRemoval')}
-                      </button>
-                      <button
-                        style={subtleButtonStyle}
-                        onClick={() => void handleAction(t('sharedContext.notice.projectRemoved'), async () => {
-                          await removeSharedProject(project.id);
-                          await refreshEnterpriseData();
-                        })}
-                      >
-                        {t('sharedContext.management.removeProject')}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-            </div>
-
-            <div style={sectionStyle}>
-              <SectionHeading
-                title={t('sharedContext.management.policyTitle')}
-                description={t('sharedContext.management.policyDescription')}
-                action={policyLoading ? <span style={pillStyle}>{t('sharedContext.management.policyLoading')}</span> : undefined}
-              />
-              <InfoCard title={t('sharedContext.management.policyExplainTitle')}>
-                <div>{t('sharedContext.management.policyExplainLine1')}</div>
-                <div>{t('sharedContext.management.policyExplainLine2')}</div>
-              </InfoCard>
-              <div style={rowStyle}>
-                <select value={selectedEnrollmentId} onChange={(e) => setSelectedEnrollmentId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
-                  <option value="">{t('sharedContext.management.selectProject')}</option>
-                  {projects.map((project) => <option key={project.id} value={project.id}>{project.displayName ?? project.canonicalRepoId}</option>)}
-                </select>
-              </div>
-              <div style={checkboxRowStyle}>
-                <label style={policyOptionStyle}>
-                  <span>
-                    <input type="checkbox" checked={policy.allowDegradedProviderSupport} onChange={(e) => setPolicy((prev) => ({ ...prev, allowDegradedProviderSupport: (e.currentTarget as HTMLInputElement).checked }))} />
-                    {' '}
-                    {t('sharedContext.management.allowDegraded')}
-                  </span>
-                  <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('sharedContext.management.allowDegradedHelp')}</span>
-                </label>
-                <label style={policyOptionStyle}>
-                  <span>
-                    <input type="checkbox" checked={policy.allowLocalFallback} onChange={(e) => setPolicy((prev) => ({ ...prev, allowLocalFallback: (e.currentTarget as HTMLInputElement).checked }))} />
-                    {' '}
-                    {t('sharedContext.management.allowLocalFallback')}
-                  </span>
-                  <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('sharedContext.management.allowLocalFallbackHelp')}</span>
-                </label>
-                <label style={policyOptionStyle}>
-                  <span>
-                    <input type="checkbox" checked={policy.requireFullProviderSupport} onChange={(e) => setPolicy((prev) => ({ ...prev, requireFullProviderSupport: (e.currentTarget as HTMLInputElement).checked }))} />
-                    {' '}
-                    {t('sharedContext.management.requireFullSupport')}
-                  </span>
-                  <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('sharedContext.management.requireFullSupportHelp')}</span>
-                </label>
-              </div>
-              <button
-                style={buttonStyle}
-                disabled={!selectedEnrollmentId}
-                onClick={() => void handleAction(t('sharedContext.notice.policySaved'), async () => {
-                  await updateSharedProjectPolicy(selectedEnrollmentId, {
-                    allowDegradedProviderSupport: policy.allowDegradedProviderSupport,
-                    allowLocalFallback: policy.allowLocalFallback,
-                    requireFullProviderSupport: policy.requireFullProviderSupport,
-                  });
-                  await refreshEnterpriseData();
-                })}
-              >
-                {t('sharedContext.management.savePolicy')}
-              </button>
-            </div>
-          </div>
-        </>
-      )}
-
-      {activeTab === 'knowledge' && (
-        <div style={splitSectionStyle}>
-          <div style={sectionStyle}>
-            <SectionHeading
-              title={t('sharedContext.management.documents')}
-              description={t('sharedContext.management.knowledgeDescription')}
-            />
-            <div style={rowStyle}>
-              <select value={documentKind} onChange={(e) => setDocumentKind((e.currentTarget as HTMLSelectElement).value as KindOption)} style={inputStyle}>
-                <option value="coding_standard">{t('sharedContext.management.documentKind.coding_standard')}</option>
-                <option value="architecture_guideline">{t('sharedContext.management.documentKind.architecture_guideline')}</option>
-                <option value="repo_playbook">{t('sharedContext.management.documentKind.repo_playbook')}</option>
-                <option value="knowledge_doc">{t('sharedContext.management.documentKind.knowledge_doc')}</option>
-              </select>
-              <input value={documentTitle} onInput={(e) => setDocumentTitle((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.documentTitle')} style={inputStyle} />
-              <button
-                style={buttonStyle}
-                disabled={!enterpriseId || !documentTitle.trim()}
-                onClick={() => void handleAction(t('sharedContext.notice.documentCreated'), async () => {
-                  const created = await createSharedDocument(enterpriseId, { kind: documentKind, title: documentTitle.trim() });
-                  setDocumentTitle('');
-                  await refreshEnterpriseData();
-                  setSelectedDocumentId(created.id);
-                })}
-              >
-                {t('sharedContext.management.createDocument')}
-              </button>
-            </div>
-            <div style={resourceListStyle}>
-              {documents.map((document) => (
-                <div key={document.id} style={resourceCardStyle}>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    <strong>{document.title}</strong>
-                    <span style={helperTextStyle}>{document.kind}</span>
-                  </div>
-                  <div style={metaGridStyle}>
-                    {document.createdByUserId ? (
-                      <MetaCard label={t('sharedContext.management.memoryRecordCreatedBy')} value={document.createdByUserId} />
-                    ) : null}
-                    <MetaCard label={t('sharedContext.management.versions')} value={document.versions.length} />
-                    <MetaCard label={t('sharedContext.management.activeVersion')} value={document.versions.find((version) => version.status === 'active')?.versionNumber ? `v${document.versions.find((version) => version.status === 'active')?.versionNumber}` : t('sharedContext.management.noneValue')} />
-                  </div>
-                  <div style={rowStyle}>
-                    {document.versions.map((version) => (
-                      <button
-                        key={version.id}
-                        style={version.status === 'active' ? buttonStyle : subtleButtonStyle}
-                        onClick={() => void handleAction(t('sharedContext.notice.versionActivated'), async () => {
-                          await activateSharedDocumentVersion(version.id);
-                          await refreshEnterpriseData();
-                          setSelectedDocumentId(document.id);
-                          setSelectedVersionId(version.id);
-                        })}
-                      >
-                        v{version.versionNumber} · {version.status}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                ))}
-              </div>
-            <div style={{ ...resourceCardStyle, gap: 10 }}>
-              <SectionHeading
-                title={t('sharedContext.management.createVersion')}
-                description={t('sharedContext.management.versionDescription')}
-              />
-              <div style={{ ...rowStyle, alignItems: 'stretch' }}>
-              <select value={selectedDocumentId} onChange={(e) => setSelectedDocumentId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
-                <option value="">{t('sharedContext.management.selectDocument')}</option>
-                {documents.map((document) => <option key={document.id} value={document.id}>{document.title}</option>)}
-              </select>
-              <select value={selectedVersionId} onChange={(e) => setSelectedVersionId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
-                <option value="">{t('sharedContext.management.selectVersion')}</option>
-                {(selectedDocument?.versions ?? []).map((version) => <option key={version.id} value={version.id}>v{version.versionNumber} · {version.status}</option>)}
-              </select>
-              <textarea value={documentContent} onInput={(e) => setDocumentContent((e.currentTarget as HTMLTextAreaElement).value)} placeholder={t('sharedContext.management.documentContent')} style={{ ...inputStyle, minHeight: 92 }} />
-              <button
-                style={buttonStyle}
-                disabled={!selectedDocumentId || !documentContent.trim()}
-                onClick={() => void handleAction(t('sharedContext.notice.versionCreated'), async () => {
-                  const created = await createSharedDocumentVersion(selectedDocumentId, { contentMd: documentContent.trim() });
-                  setDocumentContent('');
-                  await refreshEnterpriseData();
-                  setSelectedVersionId(created.id);
-                })}
-              >
-                {t('sharedContext.management.createVersion')}
-              </button>
-              </div>
-            </div>
-          </div>
-
-          <div style={sectionStyle}>
-            <SectionHeading
-              title={t('sharedContext.management.bindings')}
-              description={t('sharedContext.management.bindingDescription')}
-            />
-            <div style={rowStyle}>
-              <select value={selectedVersionId} onChange={(e) => setSelectedVersionId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
-                <option value="">{t('sharedContext.management.selectVersion')}</option>
-                {documents.flatMap((document) => document.versions.map((version) => (
-                  <option key={version.id} value={version.id}>{document.title} · v{version.versionNumber}</option>
-                )))}
-              </select>
-              <select value={bindingMode} onChange={(e) => setBindingMode((e.currentTarget as HTMLSelectElement).value as 'required' | 'advisory')} style={inputStyle}>
-                <option value="required">{t('sharedContext.management.required')}</option>
-                <option value="advisory">{t('sharedContext.management.advisory')}</option>
-              </select>
-              <input value={bindingLanguage} onInput={(e) => setBindingLanguage((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.language')} style={inputStyle} />
-              <input value={bindingPathPattern} onInput={(e) => setBindingPathPattern((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.pathPattern')} style={inputStyle} />
-              <button
-                style={buttonStyle}
-                disabled={!enterpriseId || !selectedDocumentId || !selectedVersionId}
-                onClick={() => void handleAction(t('sharedContext.notice.bindingCreated'), async () => {
-                  await createSharedDocumentBinding(enterpriseId, {
-                    documentId: selectedDocumentId,
-                    versionId: selectedVersionId,
-                    workspaceId: selectedWorkspaceId || undefined,
-                    enrollmentId: selectedEnrollmentId || undefined,
-                    mode: bindingMode,
-                    applicabilityRepoId: canonicalRepoId.trim() || undefined,
-                    applicabilityLanguage: bindingLanguage.trim() || undefined,
-                    applicabilityPathPattern: bindingPathPattern.trim() || undefined,
-                  });
-                  await refreshEnterpriseData();
-                })}
-              >
-                {t('sharedContext.management.createBinding')}
-              </button>
-            </div>
-            {bindings.length > 0 ? (
-              <div style={resourceListStyle}>
-                {bindings.map((binding) => (
-                  <div key={binding.id} style={resourceCardStyle}>
-                    <strong>{binding.mode} · {binding.status}</strong>
-                    <div style={metaGridStyle}>
-                      <MetaCard label={t('sharedContext.management.documentLabel')} value={binding.documentId} />
-                      <MetaCard label={t('sharedContext.management.versionLabel')} value={binding.versionId} />
-                      <MetaCard label={t('sharedContext.management.language')} value={binding.applicabilityLanguage || t('sharedContext.management.anyValue')} />
-                      <MetaCard label={t('sharedContext.management.pathLabel')} value={binding.applicabilityPathPattern || t('sharedContext.management.anyValue')} />
-                      {binding.createdByUserId ? (
-                        <MetaCard label={t('sharedContext.management.memoryRecordCreatedBy')} value={binding.createdByUserId} />
-                      ) : null}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : <div style={helperTextStyle}>{t('sharedContext.empty')}</div>}
-          </div>
-        </div>
-      )}
 
       {activeTab === 'processing' && (
         <>
           <InfoCard title={t('sharedContext.management.processingSummaryTitle')}>
             <div>{t('sharedContext.management.processingSummaryLine1')}</div>
             <div>{t('sharedContext.management.processingSummaryLine2')}</div>
-            <div>{t('sharedContext.management.processingSummaryLine3')}</div>
           </InfoCard>
 
           <InfoCard title={t('sharedContext.management.processingModelTitle')}>
@@ -4168,7 +3344,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <InfoCard title={t('sharedContext.management.memorySummaryTitle')}>
             <div>{t('sharedContext.management.memorySummaryLine1')}</div>
             <div>{t('sharedContext.management.memorySummaryLine2')}</div>
-            <div>{t('sharedContext.management.memorySummaryLine3')}</div>
           </InfoCard>
 
           <div style={memorySectionStyle}>
@@ -5080,50 +4255,20 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <div style={{ ...memorySectionStyle, gap: DT.space.md }}>
             <div style={memoryTabStackStyle}>
               <div style={memoryToolTabBarStyle}>
-                {memoryTopTabs.map((tab) => (
+                {memoryPersonalSubTabs.map((tab) => (
                   <button
                     key={tab.id}
                     type="button"
-                    style={memoryTopTab === tab.id ? tabActiveStyle : tabStyle}
-                    onClick={() => setMemoryTopTab(tab.id)}
+                    style={memoryPersonalSubTab === tab.id ? tabActiveStyle : tabStyle}
+                    onClick={() => setMemoryPersonalSubTab(tab.id)}
                   >
                     {tab.label}{tab.count != null ? <span style={tabBadgeStyle}>{tab.count}</span> : null}
                   </button>
                 ))}
               </div>
-
-              {memoryTopTab === 'personal' ? (
-                <div style={memoryToolTabBarStyle}>
-                  {memoryPersonalSubTabs.map((tab) => (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      style={memoryPersonalSubTab === tab.id ? tabActiveStyle : tabStyle}
-                      onClick={() => setMemoryPersonalSubTab(tab.id)}
-                    >
-                      {tab.label}{tab.count != null ? <span style={tabBadgeStyle}>{tab.count}</span> : null}
-                    </button>
-                  ))}
-                </div>
-              ) : null}
-
-              {memoryTopTab === 'enterprise-memory' ? (
-                <div style={memoryToolTabBarStyle}>
-                  {memoryEnterpriseSubTabs.map((tab) => (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      style={memoryEnterpriseSubTab === tab.id ? tabActiveStyle : tabStyle}
-                      onClick={() => setMemoryEnterpriseSubTab(tab.id)}
-                    >
-                      {tab.label}{'count' in tab && tab.count != null ? <span style={tabBadgeStyle}>{tab.count}</span> : null}
-                    </button>
-                  ))}
-                </div>
-              ) : null}
             </div>
 
-            {memoryTopTab === 'personal' && memoryPersonalSubTab === 'processed' ? (
+            {memoryPersonalSubTab === 'processed' ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 <SectionHeading
                   title={t('sharedContext.management.memoryLocalTitle')}
@@ -5222,7 +4367,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               </div>
             ) : null}
 
-            {memoryTopTab === 'personal' && memoryPersonalSubTab === 'unprocessed' ? (
+            {memoryPersonalSubTab === 'unprocessed' ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 <SectionHeading
                   title={t('sharedContext.management.memoryPendingTitle')}
@@ -5277,7 +4422,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               </div>
             ) : null}
 
-            {memoryTopTab === 'personal' && memoryPersonalSubTab === 'cloud' ? (
+            {memoryPersonalSubTab === 'cloud' ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 <SectionHeading
                   title={t('sharedContext.management.memoryCloudTitle')}
@@ -5298,38 +4443,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               </div>
             ) : null}
 
-            {memoryTopTab === 'enterprise-memory' && memoryEnterpriseSubTab === 'shared-memory' ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <SectionHeading
-                  title={t('sharedContext.management.memorySharedTitle')}
-                  description={t('sharedContext.management.memoryProcessedDescription')}
-                  action={<span style={pillStyle}>{sharedMemory.records.length}</span>}
-                />
-                <div style={statGridStyle}>
-                  <StatCard label={t('sharedContext.management.memoryStatTotal')} value={sharedMemory.stats.totalRecords} />
-                  {memoryQuery.trim() ? <StatCard label={t('sharedContext.management.memoryStatHits')} value={sharedMemory.stats.matchedRecords} /> : null}
-                  <StatCard label={t('sharedContext.management.memoryStatRecent')} value={sharedMemory.stats.recentSummaryCount} />
-                  <StatCard
-                    label={t('sharedContext.management.memoryStatDurable')}
-                    value={sharedMemory.stats.durableCandidateCount}
-                    detail={`${t('sharedContext.management.memoryStatProjects')}: ${sharedMemory.stats.projectCount}`}
-                  />
-                </div>
-                {renderProcessedMemoryRecords(sharedMemory, { allowDelete: team?.myRole === 'owner' || team?.myRole === 'admin', onDelete: handleEnterpriseMemoryDelete })}
-              </div>
-            ) : null}
-
-            {memoryTopTab === 'enterprise-memory' && memoryEnterpriseSubTab === 'authored-context' ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <SectionHeading
-                  title={t('sharedContext.management.memoryAuthoredTitle')}
-                  description={t('sharedContext.management.memoryAuthoredDescription')}
-                />
-                <div style={helperTextStyle}>
-                  {t('sharedContext.management.memoryAuthoredSeeKnowledge')}
-                </div>
-              </div>
-            ) : null}
           </div>
         </>
       )}

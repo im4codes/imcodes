@@ -369,7 +369,7 @@ registerPanelType(LOCAL_WEB_PREVIEW_PANEL_TYPE, {
 });
 
 registerPanelType(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, {
-  title: (_panel, ctx) => ctx?.t('sharedContext.management.title') ?? 'Shared Context',
+  title: (_panel, ctx) => ctx?.t('sharedContext.management.title') ?? 'Memory',
   render: (panel, ctx) => {
     if (!hasPinnedPanelServerProvenance(panel, ctx.serverId)) {
       return <div class="sidebar-pinned-unavailable">No server selected</div>;

@@ -1153,7 +1153,7 @@
     "state_error_detail": "Error: {{error}}"
   },
   "ccPreset": {
-    "toolbarButton": "Presets API",
+    "toolbarButton": "BYOK",
     "managerTitle": "Configuración de CC Preset",
     "managerSubtitle": "Administra los presets compatibles con Anthropic/OpenAI almacenados localmente en este daemon.",
     "editorTitle": "Agregar / Editar Preset",
@@ -3454,8 +3454,8 @@
       "memoryPinned": "Memoria fijada para futuros resúmenes."
     },
     "management": {
-      "title": "Contexto compartido",
-      "heroDescription": "Gestione empresas compartidas, proyectos registrados, conocimiento y comportamiento de procesamiento desde un solo lugar.",
+      "title": "Memoria",
+      "heroDescription": "Gestione la memoria personal, el comportamiento de procesamiento, MCP y las habilidades desde un solo lugar.",
       "inviteDescription": "Invite personas a la empresa como miembros. Promuévalos a administrador más tarde desde la pestaña Miembros si es necesario.",
       "inviteFlowTitle": "Flujo de invitación",
       "memberRolesDescription": "Los propietarios pueden promover administradores. Los administradores gestionan proyectos y conocimiento pero no pueden nombrar otros administradores.",

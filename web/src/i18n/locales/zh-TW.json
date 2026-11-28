@@ -1153,7 +1153,7 @@
     "state_error_detail": "錯誤：{{error}}"
   },
   "ccPreset": {
-    "toolbarButton": "API 預設",
+    "toolbarButton": "BYOK",
     "managerTitle": "CC Preset 設定",
     "managerSubtitle": "管理儲存在目前守護程序本機的自訂 Anthropic/OpenAI 相容 API 預設。",
     "editorTitle": "新增 / 編輯預設",
@@ -3454,8 +3454,8 @@
       "memoryPinned": "記憶已置頂，將用於後續摘要。"
     },
     "management": {
-      "title": "共享上下文",
-      "heroDescription": "在一個地方管理共享企業、註冊專案、編撰知識和處理行為。",
+      "title": "記憶",
+      "heroDescription": "在一個地方管理個人記憶、處理行為、MCP 服務與技能。",
       "inviteDescription": "以成員身分邀請人員加入企業。如需要可稍後在成員分頁中提升為管理員。",
       "inviteFlowTitle": "邀請流程",
       "memberRolesDescription": "擁有者可以提升管理員。管理員可以管理專案和知識但不能任命其他管理員。",

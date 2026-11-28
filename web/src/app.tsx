@@ -12839,7 +12839,7 @@ function InternalMainApp() {
                       closeSidebar();
                     }}
                     title={trans('sharedContext.management.title')}
-                  >CTX</button>
+                  >MEM</button>
                 )}
                 {selectedServerId && !selectedShareTarget && matchingWs && (
                   <button
@@ -12852,7 +12852,7 @@ function InternalMainApp() {
                     }}
                     title={trans('ccPreset.managerTitle')}
                     aria-label={trans('ccPreset.managerTitle')}
-                  >API</button>
+                  >BYOK</button>
                 )}
                 {(unifiedServers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || restrictedSharedEntries.length > 0) && (
                   <button

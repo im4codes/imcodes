@@ -1153,7 +1153,7 @@
     "state_error_detail": "오류: {{error}}"
   },
   "ccPreset": {
-    "toolbarButton": "API 프리셋",
+    "toolbarButton": "BYOK",
     "managerTitle": "CC Preset 설정",
     "managerSubtitle": "이 데몬에 저장된 사용자 지정 Anthropic/OpenAI 호환 공급자 프리셋을 관리합니다.",
     "editorTitle": "프리셋 추가 / 편집",
@@ -3454,8 +3454,8 @@
       "memoryPinned": "향후 요약을 위해 메모리를 고정했습니다."
     },
     "management": {
-      "title": "공유 컨텍스트",
-      "heroDescription": "공유 기업, 등록된 프로젝트, 작성된 지식 및 처리 동작을 한 곳에서 관리합니다.",
+      "title": "메모리",
+      "heroDescription": "개인 메모리, 처리 동작, MCP 및 스킬을 한 곳에서 관리합니다.",
       "inviteDescription": "멤버로 기업에 초대합니다. 필요한 경우 멤버 탭에서 나중에 관리자로 승격할 수 있습니다.",
       "inviteFlowTitle": "초대 흐름",
       "memberRolesDescription": "소유자는 관리자를 승격할 수 있습니다. 관리자는 프로젝트와 지식을 관리할 수 있지만 다른 관리자를 임명할 수 없습니다.",
