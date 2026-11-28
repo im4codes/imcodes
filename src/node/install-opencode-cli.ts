@@ -53,6 +53,7 @@ export interface InstallOpenCodeOptions {
   fetchImpl?: typeof fetch;
   checkFileExecutable?: (filePath: string) => Promise<boolean>;
   verifyVersion?: (binPath: string, timeoutMs: number) => string | undefined;
+  linkFile?: (existingPath: string, newPath: string) => void;
   logger?: {
     info?: (msg: string) => void;
     warn?: (msg: string) => void;
@@ -594,6 +595,7 @@ export async function installOpenCodeCli(opts: InstallOpenCodeOptions = {}): Pro
   const pathMod = getPathModule(platform);
   const fetchFn = opts.fetchImpl ?? fetch;
   const verifyVer = opts.verifyVersion ?? defaultVerifyVersion;
+  const linkFn = opts.linkFile ?? linkSync;
   const metadataTimeoutMs = opts.metadataTimeoutMs ?? DEFAULT_METADATA_TIMEOUT_MS;
   const tarballTimeoutMs = opts.tarballTimeoutMs ?? DEFAULT_TARBALL_TIMEOUT_MS;
   const versionTimeoutMs = opts.versionTimeoutMs ?? DEFAULT_VERSION_TIMEOUT_MS;
@@ -722,27 +724,11 @@ export async function installOpenCodeCli(opts: InstallOpenCodeOptions = {}): Pro
 
         let publishedAsExisting = false;
         try {
-          linkSync(tmpPath, destPath);
+          linkFn(tmpPath, destPath);
         } catch (linkErr: unknown) {
           const code = (linkErr as NodeJS.ErrnoException | undefined)?.code;
           if (code === 'EEXIST') {
             publishedAsExisting = true;
-          } else if (code === 'EXDEV' || code === 'EPERM' || code === 'ENOTSUP' || code === 'EACCES') {
-            try {
-              writeFileSync(destPath, binaryBuf, {
-                flag: 'wx',
-                ...(platform !== 'win32' ? { mode: 0o755 } : {}),
-              });
-              if (platform !== 'win32') {
-                chmodSync(destPath, 0o755);
-              }
-            } catch (wxErr: unknown) {
-              if ((wxErr as NodeJS.ErrnoException | undefined)?.code === 'EEXIST') {
-                publishedAsExisting = true;
-              } else {
-                throw wxErr;
-              }
-            }
           } else {
             throw linkErr;
           }

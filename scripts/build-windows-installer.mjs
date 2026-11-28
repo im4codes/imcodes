@@ -34,7 +34,7 @@ import {
 export function renderWindowsPhaseAInstallerPs1({ version, cliWrapperContent, minVersion = '', trustedSignerSha256 = '' }) {
   const wrapperB64 = Buffer.from(cliWrapperContent, 'utf8').toString('base64');
   return `param(
-  [ValidateSet('Probe', 'Plan', 'PreInstall', 'PostInstall', 'InstallOpenCode', 'ApplyServices', 'CleanupTmp', 'Rollback')]
+  [ValidateSet('Probe', 'Plan', 'PreInstall', 'PostInstall', 'InstallOpenCode', 'CleanupTmp', 'Rollback')]
   [string]$Mode = 'Plan',
 
   [string]$Version = ${JSON.stringify(version)},
@@ -303,9 +303,8 @@ foreach ($ep in @($CliWrapperPath, $AutostartPath, $StartMenuShortcutPath, $Desk
 if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
   Assert-SafeTargetPath $LogPath $RealProfile -EntryMode
   $script:InstallerLogFile = $LogPath
-} elseif ($Mode -in @('PreInstall', 'PostInstall', 'ApplyServices', 'Rollback')) {
-  $logModeName = if ($Mode -eq 'ApplyServices') { 'postinstall' } else { $Mode.ToLowerInvariant() }
-  $defaultLog = Join-Path $NodeRoot ('installer-' + $logModeName + '.log')
+} elseif ($Mode -in @('PreInstall', 'PostInstall', 'Rollback')) {
+  $defaultLog = Join-Path $NodeRoot ('installer-' + $Mode.ToLowerInvariant() + '.log')
   Assert-SafeTargetPath $defaultLog $RealProfile -EntryMode
   $script:InstallerLogFile = $defaultLog
 } elseif ($Mode -eq 'InstallOpenCode') {
@@ -1068,7 +1067,7 @@ function Stop-ControlledNodeAndSidecarsForInstall {
   throw "controlled_node_binary_locked: managed process or file lock did not clear under $NodeRoot"
 }
 
-function Save-RollbackSnapshot($Plan, $ServiceSnapshot, [bool]$StoppedDaemon = $false) {
+function Save-RollbackSnapshot($Plan, $ServiceSnapshot) {
   $manifestPath = Join-Path $SnapshotDir 'snapshot.json'
   $filesDir = Join-Path $SnapshotDir 'files'
   $svcDir = Join-Path $SnapshotDir 'services'
@@ -1148,7 +1147,6 @@ function Save-RollbackSnapshot($Plan, $ServiceSnapshot, [bool]$StoppedDaemon = $
     preservedDatabases = $preservedDatabases
     services = [ordered]@{
       applyRecorded = [bool]$ApplyServices
-      stoppedDaemon = [bool]$StoppedDaemon
       userDaemonWasRunning = [bool]($ServiceSnapshot -and $ServiceSnapshot.userDaemonWasRunning)
       tasks = $savedTasks
     }
@@ -1410,6 +1408,7 @@ Write-HealthLog 'restart_requested'
     }
   }
   if ((-not $Plan.preserveUserDaemonAutostart) -or $RestartDaemon) {
+    Sync-OpenCodeProcessPath
     $handledDaemon = Invoke-ServiceAction 'ActivateUserDaemon' @{ autostartPath = $AutostartPath; currentDir = $CurrentDir }
     if (-not $handledDaemon -and (Test-Path -LiteralPath $AutostartPath -PathType Leaf)) {
       Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c call "' + $AutostartPath + '"') -WindowStyle Hidden | Out-Null
@@ -1601,175 +1600,59 @@ function Test-IsElevatedOrSystemProcess {
   }
 }
 
-function Format-QuotedWinArgs([string[]]$ArgList) {
-  $quoted = @()
-  foreach ($a in $ArgList) {
-    $s = if ($null -eq $a) { '' } else { [string]$a }
-    $escaped = $s -replace '(\\\\*)"', '$1$1\\"' -replace '(\\\\+)$', '$1$1'
-    $quoted += ('"' + $escaped + '"')
+function Sync-OpenCodeProcessPath {
+  $existingParts = @()
+  if (-not [string]::IsNullOrWhiteSpace($env:PATH)) {
+    $existingParts = @($env:PATH.Split(';') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
   }
-  return ($quoted -join ' ')
-}
-
-function Invoke-NonElevatedInteractiveCommand([string]$Executable, [string[]]$ArgList, [string]$WorkingDir) {
-  if (-not ([System.Management.Automation.PSTypeName]'IMCodesUnElevRunner').Type) {
-    $csharp = @'
-using System;
-using System.ComponentModel;
-using System.Diagnostics;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Security.Principal;
-using Microsoft.Win32.SafeHandles;
-
-public static class IMCodesUnElevRunner {
-  [StructLayout(LayoutKind.Sequential)]
-  private struct SECURITY_ATTRIBUTES {
-    public int nLength;
-    public IntPtr lpSecurityDescriptor;
-    public bool bInheritHandle;
+  $merged = New-Object System.Collections.Generic.List[string]
+  $seen = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($entry in $existingParts) {
+    $norm = $entry.Trim().TrimEnd('\\')
+    if (-not [string]::IsNullOrWhiteSpace($norm) -and $seen.Add($norm)) {
+      $merged.Add($entry.Trim())
+    }
   }
-
-  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-  private struct STARTUPINFO {
-    public int cb;
-    public string lpReserved;
-    public string lpDesktop;
-    public string lpTitle;
-    public int dwX;
-    public int dwY;
-    public int dwXSize;
-    public int dwYSize;
-    public int dwXCountChars;
-    public int dwYCountChars;
-    public int dwFillAttribute;
-    public int dwFlags;
-    public short wShowWindow;
-    public short cbReserved2;
-    public IntPtr lpReserved2;
-    public IntPtr hStdInput;
-    public IntPtr hStdOutput;
-    public IntPtr hStdError;
-  }
-
-  [StructLayout(LayoutKind.Sequential)]
-  private struct PROCESS_INFORMATION {
-    public IntPtr hProcess;
-    public IntPtr hThread;
-    public int dwProcessId;
-    public int dwThreadId;
-  }
-
-  [DllImport("kernel32.dll", SetLastError = true)]
-  private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-
-  [DllImport("advapi32.dll", SetLastError = true)]
-  private static extern bool OpenProcessToken(IntPtr proc, uint access, out IntPtr token);
-
-  [DllImport("advapi32.dll", SetLastError = true)]
-  private static extern bool DuplicateTokenEx(IntPtr hExisting, uint access, IntPtr attrs, int impLevel, int tokenType, out IntPtr hNew);
-
-  [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-  private static extern bool CreateProcessWithTokenW(
-    IntPtr hToken, uint logonFlags, string appName, string cmdLine,
-    uint creationFlags, IntPtr env, string curDir, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
-
-  [DllImport("kernel32.dll", SetLastError = true)]
-  private static extern bool CreatePipe(out IntPtr hRead, out IntPtr hWrite, ref SECURITY_ATTRIBUTES sa, uint size);
-
-  [DllImport("kernel32.dll", SetLastError = true)]
-  private static extern bool SetHandleInformation(IntPtr hObject, uint mask, uint flags);
-
-  [DllImport("kernel32.dll", SetLastError = true)]
-  private static extern uint WaitForSingleObject(IntPtr hHandle, uint ms);
-
-  [DllImport("kernel32.dll", SetLastError = true)]
-  private static extern bool GetExitCodeProcess(IntPtr hProcess, out int code);
-
-  [DllImport("kernel32.dll", SetLastError = true)]
-  private static extern bool TerminateProcess(IntPtr hProcess, uint code);
-
-  [DllImport("kernel32.dll", SetLastError = true)]
-  private static extern bool CloseHandle(IntPtr h);
-
-  public static string Run(string cmdLine, string workingDir, out int exitCode) {
-    exitCode = -1;
-    IntPtr selectedToken = IntPtr.Zero;
-    foreach (var p in Process.GetProcessesByName("explorer")) {
-      IntPtr hProc = IntPtr.Zero, hTok = IntPtr.Zero, hDup = IntPtr.Zero;
-      try {
-        hProc = OpenProcess(0x0400, false, p.Id);
-        if (hProc == IntPtr.Zero) continue;
-        if (!OpenProcessToken(hProc, 0x0002 | 0x0008, out hTok)) continue;
-        if (!DuplicateTokenEx(hTok, 0x02000000, IntPtr.Zero, 2, 1, out hDup)) continue;
-        using (var wi = new WindowsIdentity(hDup)) {
-          string sid = wi.User != null ? wi.User.Value : "";
-          if (sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20") continue;
-          var wp = new WindowsPrincipal(wi);
-          if (wp.IsInRole(WindowsBuiltInRole.Administrator)) continue;
+  if ($AllowSystemRoot -and [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if (-not [string]::IsNullOrWhiteSpace($userPath)) {
+      foreach ($uEntry in $userPath.Split(';')) {
+        $normU = $uEntry.Trim().TrimEnd('\\')
+        if (-not [string]::IsNullOrWhiteSpace($normU) -and $seen.Add($normU)) {
+          $merged.Add($uEntry.Trim())
         }
-        selectedToken = hDup;
-        hDup = IntPtr.Zero;
-        break;
-      } catch {
-      } finally {
-        if (hDup != IntPtr.Zero) CloseHandle(hDup);
-        if (hTok != IntPtr.Zero) CloseHandle(hTok);
-        if (hProc != IntPtr.Zero) CloseHandle(hProc);
       }
     }
-    if (selectedToken == IntPtr.Zero) {
-      throw new InvalidOperationException("no_non_elevated_interactive_token");
+  }
+  if (-not [string]::IsNullOrWhiteSpace($HomeDir)) {
+    $ocBinDir = Join-Path (Join-Path $HomeDir '.opencode') 'bin'
+    $ocExePath = Join-Path $ocBinDir 'opencode.exe'
+    if (Test-Path -LiteralPath $ocExePath -PathType Leaf) {
+      $normOc = $ocBinDir.TrimEnd('\\')
+      if ($seen.Add($normOc)) {
+        $merged.Add($ocBinDir)
+      }
     }
-
-    IntPtr hRead = IntPtr.Zero, hWrite = IntPtr.Zero;
-    var pi = new PROCESS_INFORMATION();
-    try {
-      var sa = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), bInheritHandle = true };
-      if (!CreatePipe(out hRead, out hWrite, ref sa, 0)) throw new Win32Exception(Marshal.GetLastWin32Error());
-      SetHandleInformation(hRead, 1, 0);
-
-      var si = new STARTUPINFO();
-      si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
-      si.dwFlags = 0x00000101;
-      si.wShowWindow = 0;
-      si.hStdOutput = hWrite;
-      si.hStdError = hWrite;
-
-      if (!CreateProcessWithTokenW(selectedToken, 1, null, cmdLine, 0x08000000, IntPtr.Zero, workingDir, ref si, out pi)) {
-        throw new Win32Exception(Marshal.GetLastWin32Error());
-      }
-      CloseHandle(hWrite);
-      hWrite = IntPtr.Zero;
-
-      string output;
-      using (var sr = new StreamReader(new FileStream(new SafeFileHandle(hRead, true), FileAccess.Read))) {
-        hRead = IntPtr.Zero;
-        output = sr.ReadToEnd();
-      }
-      uint waitRes = WaitForSingleObject(pi.hProcess, 120000);
-      if (waitRes != 0) {
-        TerminateProcess(pi.hProcess, 1);
-        throw new TimeoutException("non_elevated_opencode_install_timeout");
-      }
-      if (!GetExitCodeProcess(pi.hProcess, out exitCode)) exitCode = 1;
-      return output;
-    } finally {
-      if (hRead != IntPtr.Zero) CloseHandle(hRead);
-      if (hWrite != IntPtr.Zero) CloseHandle(hWrite);
-      if (pi.hThread != IntPtr.Zero) CloseHandle(pi.hThread);
-      if (pi.hProcess != IntPtr.Zero) CloseHandle(pi.hProcess);
-      if (selectedToken != IntPtr.Zero) CloseHandle(selectedToken);
-    }
+  }
+  if ($merged.Count -gt 0) {
+    $env:PATH = ($merged -join ';')
   }
 }
-'@
-    Add-Type -TypeDefinition $csharp -Language CSharp
+
+function Test-PathHasReparsePoint([string]$CandidatePath) {
+  if ([string]::IsNullOrWhiteSpace($CandidatePath)) { return $false }
+  if (Test-Path -LiteralPath $CandidatePath) {
+    try {
+      $item = Get-Item -LiteralPath $CandidatePath -Force -ErrorAction Stop
+      if ($null -ne $item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $true }
+    } catch {}
+  } else {
+    try {
+      $attrs = [System.IO.File]::GetAttributes($CandidatePath)
+      if ([int]$attrs -ne -1 -and ($attrs -band [System.IO.FileAttributes]::ReparsePoint)) { return $true }
+    } catch {}
   }
-  $cmdLine = Format-QuotedWinArgs (@($Executable) + $ArgList)
-  $code = -1
-  $out = [IMCodesUnElevRunner]::Run($cmdLine, $WorkingDir, [ref]$code)
-  return [ordered]@{ exitCode = $code; output = $out }
+  return $false
 }
 
 function Format-OpenCodeLogDetail([string]$RawOutput) {
@@ -1798,19 +1681,29 @@ function Install-OpenCodeCliBestEffort {
     $ocBaseDir = Join-Path $HomeDir '.opencode'
     $ocBinDir = Join-Path $ocBaseDir 'bin'
     $ocExePath = Join-Path $ocBinDir 'opencode.exe'
+    foreach ($ocCheckPath in @($ocBaseDir, $ocBinDir, $ocExePath)) {
+      if (Test-PathHasReparsePoint $ocCheckPath) {
+        Write-InstallerLog ("WARNING: refusing symlink/reparse OpenCode target $ocCheckPath; skipping OpenCode CLI install (non-blocking)")
+        return
+      }
+    }
     if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
       Assert-SafeTargetPath $ocBaseDir $RealProfile -EntryMode
       Assert-SafeTargetPath $ocBinDir $RealProfile -EntryMode
       Assert-SafeTargetPath $ocExePath $RealProfile -EntryMode
     }
 
-    $isElevated = Test-IsElevatedOrSystemProcess
-    $nodeExe = Join-Path $CurrentDir 'node.exe'
-    $ocInstallerJs = Join-Path $CurrentDir 'package\\dist\\src\\node\\install-opencode-cli.js'
+    if (Test-IsElevatedOrSystemProcess) {
+      Write-InstallerLog 'WARNING: unable to confirm non-elevated target user context; skipping OpenCode CLI install (non-blocking)'
+      return
+    }
+
+    $runtimeBinBase = if (Test-Path -LiteralPath (Join-Path $ReleaseDir 'node.exe') -PathType Leaf) { $ReleaseDir } else { $CurrentDir }
+    $nodeExe = Join-Path $runtimeBinBase 'node.exe'
+    $ocInstallerJs = Join-Path $runtimeBinBase 'package\\dist\\src\\node\\install-opencode-cli.js'
 
     $execExe = ''
     $execArgs = @()
-    $execWorkDir = $HomeDir
     $isHookRun = $false
 
     if (-not [string]::IsNullOrWhiteSpace($hookPath) -and (Test-Path -LiteralPath $hookPath -PathType Leaf)) {
@@ -1823,32 +1716,17 @@ function Install-OpenCodeCliBestEffort {
       if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
         $execArgs += @('--registry', [string]$env:IMCODES_OPENCODE_REGISTRY, '--no-fallback', '--isolated-test')
       }
-      $execWorkDir = $CurrentDir
     } else {
       return
     }
 
-    $exitCode = 0
-    $rawOut = ''
-    if ($isElevated) {
-      if ($isHookRun -and $hookPath.ToLowerInvariant().EndsWith('.ps1')) {
-        $psExe = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'
-        $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $hookPath, '-HomeDir', $HomeDir)
-        $res = Invoke-NonElevatedInteractiveCommand $psExe $psArgs $HomeDir
-      } else {
-        $res = Invoke-NonElevatedInteractiveCommand $execExe $execArgs $execWorkDir
-      }
-      $exitCode = [int]$res.exitCode
-      $rawOut = [string]$res.output
-    } else {
-      $prevEap = $ErrorActionPreference
-      $ErrorActionPreference = 'Continue'
-      try {
-        $rawOut = (& $execExe @execArgs 2>&1 | Out-String)
-        $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
-      } finally {
-        $ErrorActionPreference = $prevEap
-      }
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      $rawOut = (& $execExe @execArgs 2>&1 | Out-String)
+      $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+    } finally {
+      $ErrorActionPreference = $prevEap
     }
 
     $detail = Format-OpenCodeLogDetail $rawOut
@@ -1865,6 +1743,7 @@ function Install-OpenCodeCliBestEffort {
         try { Add-UserPathEntry $ocBinDir } catch { Write-InstallerLog ("WARNING: Failed to add $ocBinDir to User PATH: " + $_.Exception.Message) }
       }
     }
+    Sync-OpenCodeProcessPath
   } catch {
     Write-InstallerLog ("WARNING: OpenCode CLI install failed (non-blocking): " + $_.Exception.Message)
   }
@@ -1882,35 +1761,6 @@ if ($Mode -eq 'InstallOpenCode') {
   }
 }
 
-if ($Mode -eq 'ApplyServices') {
-  try {
-    Write-InstallerLog "Starting ApplyServices version=$Version"
-    $snapManifestPath = Join-Path $SnapshotDir 'snapshot.json'
-    $restartDaemon = $false
-    if (Test-Path -LiteralPath $snapManifestPath -PathType Leaf) {
-      try {
-        $existingSnap = Get-Content -LiteralPath $snapManifestPath -Raw | ConvertFrom-Json
-        if ($existingSnap.services) {
-          $existingSnap.services.applyRecorded = $true
-          if ($existingSnap.services.PSObject.Properties['stoppedDaemon']) {
-            $restartDaemon = [bool]$existingSnap.services.stoppedDaemon
-          }
-          Write-TextAtomic $snapManifestPath ($existingSnap | ConvertTo-Json -Depth 6) ([System.Text.Encoding]::UTF8)
-        }
-      } catch {}
-    }
-    if ($ApplyServices) {
-      Register-WindowsServices $plan $restartDaemon
-    }
-    Write-InstallerLog 'Completed ApplyServices'
-    exit 0
-  } catch {
-    Write-InstallerLog ("FATAL: " + $_.Exception.Message)
-    if ($_.ScriptStackTrace) { Write-InstallerLog ([string]$_.ScriptStackTrace) }
-    throw
-  }
-}
-
 try {
 Write-InstallerLog "Starting PostInstall version=$Version scenario=$($plan.scenario) nodeRoot=$NodeRoot runtimeRoot=$RuntimeRoot"
 # PostInstall mode: capture pre-stop service state & verify lock BEFORE snapshot or payload writes
@@ -1918,15 +1768,12 @@ $preServiceSnap = Get-WindowsServicesSnapshot
 $stoppedDaemon = Assert-SingleInstanceLockAndStop $plan
 $snapManifestPath = Join-Path $SnapshotDir 'snapshot.json'
 if (-not (Test-Path -LiteralPath $snapManifestPath -PathType Leaf)) {
-  Save-RollbackSnapshot $plan $preServiceSnap $stoppedDaemon
-} elseif ($ApplyServices -or $stoppedDaemon) {
+  Save-RollbackSnapshot $plan $preServiceSnap
+} elseif ($ApplyServices) {
   try {
     $existingSnap = Get-Content -LiteralPath $snapManifestPath -Raw | ConvertFrom-Json
     if ($existingSnap.services) {
-      if ($ApplyServices) { $existingSnap.services.applyRecorded = $true }
-      if ($stoppedDaemon) {
-        $existingSnap.services | Add-Member -NotePropertyName stoppedDaemon -NotePropertyValue $true -Force
-      }
+      $existingSnap.services.applyRecorded = $true
       Write-TextAtomic $snapManifestPath ($existingSnap | ConvertTo-Json -Depth 6) ([System.Text.Encoding]::UTF8)
     }
   } catch {}
@@ -2218,9 +2065,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ${filesEntries.join('\n')}
 
 [Run]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode PostInstall -AllowSystemRoot -SkipOpenCode -Version ""${version}"" -RuntimeRoot ""{commonpf}\\IM.codes\\daemon-runtime"" -NodeRoot ""{commonappdata}\\imcodes-node"" -CliWrapperPath ""{localappdata}\\imcodes\\bin\\imcodes.cmd"" -StagedCliWrapper ""{app}\\imcodes.cmd.staged"" -LogPath ""{commonappdata}\\imcodes-node\\installer-postinstall.log"""; Flags: runhidden waituntilterminated
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode InstallOpenCode -AllowSystemRoot -Version ""${version}"" -RuntimeRoot ""{commonpf}\\IM.codes\\daemon-runtime"" -HomeDir ""{userprofile}"" -LogPath ""{localappdata}\\imcodes\\installer-opencode.log"""; Flags: runhidden waituntilterminated runasoriginaluser
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode ApplyServices -AllowSystemRoot -ApplyServices -Version ""${version}"" -RuntimeRoot ""{commonpf}\\IM.codes\\daemon-runtime"" -NodeRoot ""{commonappdata}\\imcodes-node"" -CliWrapperPath ""{localappdata}\\imcodes\\bin\\imcodes.cmd"" -LogPath ""{commonappdata}\\imcodes-node\\installer-postinstall.log"""; Flags: runhidden waituntilterminated
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode InstallOpenCode -AllowSystemRoot -Version ""${version}"" -RuntimeRoot ""{commonpf}\\IM.codes\\daemon-runtime"""; Flags: runhidden waituntilterminated runasoriginaluser
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode PostInstall -AllowSystemRoot -SkipOpenCode -ApplyServices -Version ""${version}"" -RuntimeRoot ""{commonpf}\\IM.codes\\daemon-runtime"" -NodeRoot ""{commonappdata}\\imcodes-node"" -CliWrapperPath ""{localappdata}\\imcodes\\bin\\imcodes.cmd"" -StagedCliWrapper ""{app}\\imcodes.cmd.staged"" -LogPath ""{commonappdata}\\imcodes-node\\installer-postinstall.log"""; Flags: runhidden waituntilterminated
 
 [UninstallRun]
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode Rollback -AllowSystemRoot -ApplyServices -SnapshotDir ""{commonappdata}\\imcodes-node\\installer-rollback-${version}"" -LogPath ""{commonappdata}\\imcodes-node\\installer-rollback.log"""; Flags: runhidden waituntilterminated; RunOnceId: "IMCodesDesktopRollback"

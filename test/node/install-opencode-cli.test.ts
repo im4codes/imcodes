@@ -441,6 +441,26 @@ describe('install-opencode-cli', () => {
       expect(raceRes).toMatchObject({ status: 'existing', path: destB });
       expect(readFileSync(destB, 'utf8')).toBe('existing-v1');
       expect(readdirSync(binDirB)).toEqual(['opencode']);
+
+      // Counterexample C: link failure (ENOTSUP) never falls back to partial direct write; temp and dest both stay absent
+      const homeC = makeTempDir();
+      const destC = join(homeC, '.opencode', 'bin', 'opencode');
+      const binDirC = join(homeC, '.opencode', 'bin');
+      const linkFailRes = await installOpenCodeCli({
+        homeDir: homeC,
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: false,
+        env: { PATH: '' },
+        registries: [srv.url],
+        verifyVersion: () => 'opencode 2.4.2',
+        linkFile: () => {
+          throw Object.assign(new Error('hardlinks not supported'), { code: 'ENOTSUP' });
+        },
+      });
+      expect(linkFailRes.status).toBe('failed');
+      expect(existsSync(destC)).toBe(false);
+      expect(readdirSync(binDirC)).toEqual([]);
     } finally {
       await srv.close();
     }

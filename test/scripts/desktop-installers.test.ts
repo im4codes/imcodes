@@ -827,7 +827,7 @@ ${programArgs.map((arg) => `    <string>${arg}</string>`).join('\n')}
 
     const ps1Text = readFileSync(res.ps1Path, 'utf8');
     expect(ps1Text).toContain(
-      "ValidateSet('Probe', 'Plan', 'PreInstall', 'PostInstall', 'InstallOpenCode', 'ApplyServices', 'CleanupTmp', 'Rollback')",
+      "ValidateSet('Probe', 'Plan', 'PreInstall', 'PostInstall', 'InstallOpenCode', 'CleanupTmp', 'Rollback')",
     );
     expect(ps1Text).toContain('imcodes-node-watchdog');
     expect(ps1Text).toContain('Resolve-CanonicalWindowsPath');
@@ -2921,10 +2921,33 @@ exec "${realStatBin}" "$@"
       );
       expect(resSym.status).toBe(0);
       expect(resSym.stdout).toContain('INSTALL_OK');
-      expect(resSym.stderr).toContain('unsafe OpenCode target path');
+      expect(resSym.stderr).toContain('refusing symlinked OpenCode target path');
       expect(readdirSync(outsideSymDir)).toEqual([]);
 
-      // Case 8: generated LaunchAgent plist / systemd unit sparse PATH discovers newly installed ~/.opencode/bin/opencode
+      // Leaf binary symlink escaping home into sentinel file is rejected BEFORE hook runs
+      const isoLeaf = join(root, 'iso-leaf');
+      const homeLeaf = join(root, 'home-leaf');
+      const sentinelDir = makeTempDir(`imcodes-oc-sentinel-${os}-`);
+      const sentinelFile = join(sentinelDir, 'sentinel.txt');
+      writeFileSync(sentinelFile, 'SENTINEL_UNTOUCHED', 'utf8');
+      mkdirSync(join(isoLeaf, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+      mkdirSync(join(homeLeaf, '.opencode', 'bin'), { recursive: true });
+      symlinkSync(sentinelFile, join(homeLeaf, '.opencode', 'bin', 'opencode'));
+      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoLeaf, 'daemon-runtime', 'releases', '0.9.5')]);
+      const resLeaf = spawnSync(
+        runnerPath,
+        ['--isolated-root', isoLeaf, '--home', homeLeaf, '--confirm-fda-switch', '--no-service-control'],
+        {
+          env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: fakeHook },
+          encoding: 'utf8',
+        },
+      );
+      expect(resLeaf.status).toBe(0);
+      expect(resLeaf.stdout).toContain('INSTALL_OK');
+      expect(resLeaf.stderr).toContain('refusing symlinked OpenCode target path');
+      expect(readFileSync(sentinelFile, 'utf8')).toBe('SENTINEL_UNTOUCHED');
+
+      // Case 8: LaunchAgent plist / Linux systemd inherited PATH extension keeps pre-existing agents AND discovers opencode
       if (os === 'darwin') {
         const plistPath = join(homeHook, 'Library', 'LaunchAgents', 'imcodes.daemon.plist');
         const plistXml = readFileSync(plistPath, 'utf8');
@@ -2942,29 +2965,70 @@ exec "${realStatBin}" "$@"
         });
         expect(macProbe.agents.opencode).toEqual({ installed: true });
       } else {
-        const svcPath = join(homeHook, '.config', 'systemd', 'user', 'imcodes.service');
+        const isoSys = join(root, 'iso-sys');
+        const homeSys = join(root, 'home-sys');
+        const nixAgentDir = join(root, 'nix-agents-bin');
+        mkdirSync(nixAgentDir, { recursive: true });
+        writeFileSync(join(nixAgentDir, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+        const mgrPathFile = join(root, 'systemd-mgr-path.txt');
+        writeFileSync(mgrPathFile, `${nixAgentDir}:/usr/bin`, 'utf8');
+        const envSystemctl = join(root, 'fake-env-systemctl.sh');
+        writeFileSync(
+          envSystemctl,
+          `#!/bin/sh
+if [ "$1" = "--user" ] && [ "$2" = "show-environment" ]; then
+  echo "PATH=$(cat "${mgrPathFile}")"
+  exit 0
+fi
+if [ "$1" = "--user" ] && [ "$2" = "set-environment" ]; then
+  case "$3" in
+    PATH=*) printf '%s' "\${3#PATH=}" > "${mgrPathFile}" ;;
+  esac
+  exit 0
+fi
+echo "SVC args=$*" >> "${traceFile}"
+exit 0
+`,
+          { mode: 0o755 },
+        );
+        mkdirSync(join(isoSys, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+        execFileSync('cp', ['-R', `${rtDir}/.`, join(isoSys, 'daemon-runtime', 'releases', '0.9.5')]);
+        execFileSync(
+          runnerPath,
+          ['--isolated-root', isoSys, '--home', homeSys, '--confirm-fda-switch', '--apply-services'],
+          {
+            env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: fakeHook, IMCODES_SYSTEMCTL_BIN: envSystemctl },
+            encoding: 'utf8',
+          },
+        );
+        const svcPath = join(homeSys, '.config', 'systemd', 'user', 'imcodes.service');
         const unitText = readFileSync(svcPath, 'utf8');
-        const envMatch = unitText.match(/^Environment="PATH=([^"]+)"/m);
-        expect(envMatch).toBeTruthy();
-        const systemdSparsePath = envMatch![1];
-        expect(systemdSparsePath).toContain(join(homeHook, '.opencode', 'bin'));
+        expect(unitText).not.toContain('Environment="PATH=');
+        const envDText = readFileSync(join(homeSys, '.config', 'environment.d', '99-imcodes-opencode.conf'), 'utf8');
+        expect(envDText).toContain(join(homeSys, '.opencode', 'bin'));
+        const updatedMgrPath = readFileSync(mgrPathFile, 'utf8').trim();
+        expect(updatedMgrPath).toContain(nixAgentDir);
+        expect(updatedMgrPath).toContain(join(homeSys, '.opencode', 'bin'));
         const linuxProbe = await detectInstalledAgentsWithMetadata({
           deps: {
             platform: 'linux',
-            homeDir: homeHook,
-            env: { PATH: systemdSparsePath },
+            homeDir: homeSys,
+            env: { PATH: updatedMgrPath },
           },
         });
+        expect(linuxProbe.agents.codex).toEqual({ installed: true });
         expect(linuxProbe.agents.opencode).toEqual({ installed: true });
       }
     }
   });
 
-  it('wires OpenCode CLI auto-install cleanly into Windows installer ps1 and Inno Setup runasoriginaluser split', () => {
+  it('wires OpenCode CLI auto-install cleanly into Windows installer ps1 and single-transaction PostInstall Inno Setup', () => {
     const ps1 = renderWindowsPhaseAInstallerPs1({ version: '2026.11.7132-dev.7022', cliWrapperContent: '@echo off\r\n' });
     expect(ps1).toContain('function Install-OpenCodeCliBestEffort');
     expect(ps1).toContain('function Test-IsElevatedOrSystemProcess');
-    expect(ps1).toContain('function Invoke-NonElevatedInteractiveCommand');
+    expect(ps1).toContain('function Test-PathHasReparsePoint');
+    expect(ps1).toContain('function Sync-OpenCodeProcessPath');
+    expect(ps1).not.toContain('IMCodesUnElevRunner');
     expect(ps1).toContain('Assert-SafeTargetPath $ocBinDir $RealProfile -EntryMode');
     expect(ps1).toContain('install-opencode-cli.js');
     expect(ps1).toContain('--isolated-test');
@@ -2978,13 +3042,13 @@ exec "${realStatBin}" "$@"
 
     const iss = renderWindowsInnoSetupIss({ version: '2026.11.7132-dev.7022' });
     const runSection = iss.slice(iss.indexOf('[Run]'), iss.indexOf('[UninstallRun]'));
-    const postIdx = runSection.indexOf('-Mode PostInstall');
     const ocIdx = runSection.indexOf('-Mode InstallOpenCode');
-    const svcIdx = runSection.indexOf('-Mode ApplyServices');
-    expect(postIdx).toBeGreaterThan(-1);
-    expect(ocIdx).toBeGreaterThan(postIdx);
-    expect(svcIdx).toBeGreaterThan(ocIdx);
+    const postIdx = runSection.indexOf('-Mode PostInstall');
+    expect(ocIdx).toBeGreaterThan(-1);
+    expect(postIdx).toBeGreaterThan(ocIdx);
+    expect(runSection).not.toContain('-Mode ApplyServices');
     expect(runSection).toContain('-SkipOpenCode');
+    expect(runSection).toContain('-ApplyServices');
     expect(runSection).toContain('runasoriginaluser');
   });
 
@@ -3068,6 +3132,58 @@ exec "${realStatBin}" "$@"
       );
       const offlineLog = readFileSync(logOfflinePath, 'utf8');
       expect(offlineLog).toContain('WARNING: OpenCode CLI install failed exit=1');
+
+      // Clean install 2-step sequence: InstallOpenCode -> PostInstall -SkipOpenCode -ApplyServices invokes ActivateUserDaemon once and sees opencode in PATH
+      const cleanIso = join(root, 'iso-clean-seq');
+      const cleanNode = join(cleanIso, 'ProgramData', 'imcodes-node');
+      const cleanRt = join(cleanIso, 'ProgramFiles', 'IM.codes', 'daemon-runtime');
+      const cleanRel = join(cleanRt, 'releases', '2026.11.7132-dev.7022');
+      mkdirSync(cleanNode, { recursive: true });
+      mkdirSync(join(cleanRel, 'package', 'dist', 'src'), { recursive: true });
+      writeFileSync(join(cleanRel, 'node.exe'), readFileSync(process.execPath));
+      writeFileSync(join(cleanRel, 'package', 'dist', 'src', 'index.js'), 'console.log("daemon");\n');
+      const svcTracePath = join(root, 'win-clean-svc-trace.txt');
+      const svcHookPath = join(root, 'win-svc-hook.ps1');
+      writeFileSync(
+        svcHookPath,
+        `param([string]$Action, [string]$PayloadJson)
+$found = $null -ne (Get-Command opencode -ErrorAction SilentlyContinue)
+Add-Content -LiteralPath '${svcTracePath.replace(/'/g, "''")}' -Value "$Action|opencode=$found|path=$env:PATH"
+`,
+        'utf8',
+      );
+      const ocPopulateHook = join(root, 'win-oc-populate.ps1');
+      writeFileSync(
+        ocPopulateHook,
+        `param([string]$HomeDir)
+$b = Join-Path (Join-Path $HomeDir '.opencode') 'bin'
+New-Item -ItemType Directory -Force -Path $b | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $b 'opencode.exe'), 'MZ-fake-opencode')
+`,
+        'utf8',
+      );
+      execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1Path,
+          '-Mode', 'InstallOpenCode', '-IsolatedRoot', cleanIso, '-Version', '2026.11.7132-dev.7022',
+          '-RuntimeRoot', cleanRt, '-NodeRoot', cleanNode, '-OpenCodeInstallHook', ocPopulateHook,
+        ],
+        { encoding: 'utf8' },
+      );
+      execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1Path,
+          '-Mode', 'PostInstall', '-SkipOpenCode', '-ApplyServices', '-IsolatedRoot', cleanIso, '-Version', '2026.11.7132-dev.7022',
+          '-RuntimeRoot', cleanRt, '-NodeRoot', cleanNode, '-ServiceHookScript', svcHookPath,
+        ],
+        { encoding: 'utf8' },
+      );
+      const svcTraceLines = readFileSync(svcTracePath, 'utf8').trim().split(/\r?\n/);
+      const activateLines = svcTraceLines.filter((l) => l.startsWith('ActivateUserDaemon|'));
+      expect(activateLines).toHaveLength(1);
+      expect(activateLines[0]).toContain('opencode=True');
     },
   );
 });
