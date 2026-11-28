@@ -973,10 +973,11 @@ describe('controlled-node lost-response recovery across ticket revocation/expiry
 
     const oldServerId = hex(8);
     const oldToken = hex(16);
+    const oldNodeId = await generateControlledNodeId();
     await createServer(db, oldServerId, userId, 'old-node', sha256(oldToken));
     await db.execute(
-      'UPDATE servers SET node_role = $2, revoked_at = $3 WHERE id = $1',
-      [oldServerId, NODE_ROLE.CONTROLLED, Date.now()],
+      'UPDATE servers SET node_role = $2, node_id = $3, revoked_at = $4 WHERE id = $1',
+      [oldServerId, NODE_ROLE.CONTROLLED, oldNodeId, Date.now()],
     );
 
     const ticket1 = `t1_${hex(8)}`;
