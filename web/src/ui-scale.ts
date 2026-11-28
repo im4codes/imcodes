@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from 'preact/hooks';
 import {
   NATIVE_HOST_EVENT,
   isDesignedForIpadMac,
+  isMobilePhone,
   readNativePlatformEnvironment,
   type NativePlatformEnvironment,
 } from './native-platform';
@@ -19,6 +20,7 @@ export const UI_SCALE_ZOOM_VAR = '--imcodes-ui-zoom';
 export const UI_SCALE_SHRINK_ZOOM_VAR = '--imcodes-ui-zoom-shrink';
 export const DEFAULT_UI_SCALE = 100;
 export const DESIGNED_FOR_IPAD_DEFAULT_UI_SCALE = 125;
+export const MOBILE_PHONE_DEFAULT_UI_SCALE = 95;
 export const MIN_UI_SCALE = 60;
 export const MAX_UI_SCALE = 150;
 export const UI_SCALE_STEP = 5;
@@ -36,12 +38,19 @@ export function formatUiScale(scale: number): string {
 
 /**
  * Default UI scale for the current environment: `125%` on Designed-for-iPad Mac native shells
- * (old OTA shells and new native shells, excluding Mac Catalyst `native-1x`), `100%` everywhere else.
+ * (old OTA shells and new native shells, excluding Mac Catalyst `native-1x`),
+ * `95%` on mobile phones when user has not saved a custom setting, and `100%` everywhere else.
  */
 export function getDefaultUiScale(
   env: NativePlatformEnvironment = readNativePlatformEnvironment(),
 ): number {
-  return isDesignedForIpadMac(env) ? DESIGNED_FOR_IPAD_DEFAULT_UI_SCALE : DEFAULT_UI_SCALE;
+  if (isDesignedForIpadMac(env)) {
+    return DESIGNED_FOR_IPAD_DEFAULT_UI_SCALE;
+  }
+  if (isMobilePhone(env)) {
+    return MOBILE_PHONE_DEFAULT_UI_SCALE;
+  }
+  return DEFAULT_UI_SCALE;
 }
 
 /**

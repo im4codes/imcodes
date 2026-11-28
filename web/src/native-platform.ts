@@ -306,6 +306,59 @@ export function isDesignedForIpadMac(env: NativePlatformEnvironment = readNative
 }
 
 /**
+ * Detects whether the current environment is a mobile phone (iPhone, iPod, Android phone),
+ * excluding desktop browsers, Electron PC App, Mac Catalyst, Designed-for-iPad Mac,
+ * iPad, and wide Android tablets.
+ */
+export function isMobilePhone(env: NativePlatformEnvironment = readNativePlatformEnvironment()): boolean {
+  if (isNativeMacDesktop(env) || isPcAppDesktop(env)) return false;
+
+  const navigatorLike = env.navigator;
+  const ua = navigatorLike?.userAgent ?? '';
+  const platform = [
+    navigatorLike?.platform,
+    navigatorLike?.userAgentData?.platform,
+  ].filter(Boolean).join(' ');
+
+  // iPads (both mobile Safari UA and desktop-mode iPadOS UA with 'iPad' platform) are tablets, not phones.
+  if (/\biPad\b/i.test(ua) || /\biPad\b/i.test(platform)) {
+    return false;
+  }
+
+  // iPhones and iPods are always mobile phones (both native Capacitor and mobile browsers).
+  if (/\b(iPhone|iPod)\b/i.test(ua) || /\b(iPhone|iPod)\b/i.test(platform)) {
+    return true;
+  }
+
+  const nativePlatform = getNativePlatform(env);
+
+  // Android phone handling (both native Capacitor and mobile browsers):
+  if (nativePlatform === 'android' || /\bAndroid\b/i.test(ua)) {
+    if (/\bMobile\b/i.test(ua)) return true;
+    if (!/\bTablet\b/i.test(ua)) {
+      if (typeof env.innerWidth === 'number' && env.innerWidth > 0) {
+        return env.innerWidth < 768;
+      }
+      if (nativePlatform === 'android') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Capacitor iOS fallback when UA lacks explicit iPhone/iPad tokens (e.g. synthetic test env):
+  if (nativePlatform === 'ios') {
+    if (typeof env.innerWidth === 'number' && env.innerWidth > 0) {
+      return env.innerWidth < 768;
+    }
+    return false;
+  }
+
+  // Other mobile phone web browsers (e.g. Windows Phone, etc.)
+  return /\bMobile\b/i.test(ua) && !/\bTablet\b/i.test(ua);
+}
+
+/**
  * Legacy chat-only text inflation (`html.native-ios-mac`) is disabled in favor of uniform
  * whole-page CSS zoom via `ui-scale.ts`.
  */

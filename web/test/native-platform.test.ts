@@ -13,6 +13,7 @@ import {
   applyNativePlatformClasses,
   getPcAppBridge,
   isDesignedForIpadMac,
+  isMobilePhone,
   isNativeMacDesktop,
   isPcAppDesktop,
   isPcAppInlineVoiceSupported,
@@ -368,6 +369,132 @@ describe('native platform detection and uniform UI scaling', () => {
         downloads: { revealFile: async () => true },
         updater: { quitAndInstall: async () => true },
       },
+    })).toBe(false);
+  });
+
+  it('accurately identifies mobile phones while strictly excluding desktop browsers, PC App, Mac Catalyst, Designed-for-iPad Mac, iPads, and tablets', () => {
+    // Mobile phones (iPhone, iPod, Android phone)
+    expect(isMobilePhone({
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'ios' },
+      navigator: { platform: 'iPhone', userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)', maxTouchPoints: 5 },
+      innerWidth: 390,
+    })).toBe(true);
+
+    expect(isMobilePhone({
+      capacitor: { isNativePlatform: () => false, getPlatform: () => 'web' },
+      navigator: { platform: 'iPhone', userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1', maxTouchPoints: 5 },
+      innerWidth: 390,
+    })).toBe(true);
+
+    expect(isMobilePhone({
+      navigator: { platform: 'iPod', userAgent: 'Mozilla/5.0 (iPod touch; CPU iPhone OS 14_0 like Mac OS X)', maxTouchPoints: 5 },
+      innerWidth: 320,
+    })).toBe(true);
+
+    expect(isMobilePhone({
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'android' },
+      navigator: { platform: 'Linux armv8l', userAgent: 'Mozilla/5.0 (Linux; Android 14)', maxTouchPoints: 5 },
+      innerWidth: 360,
+    })).toBe(true);
+
+    expect(isMobilePhone({
+      capacitor: { isNativePlatform: () => false, getPlatform: () => 'web' },
+      navigator: { platform: 'Linux armv8l', userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/130.0.0.0 Mobile Safari/537.36', maxTouchPoints: 5 },
+      innerWidth: 393,
+    })).toBe(true);
+
+    // Desktop browsers (including narrow width)
+    expect(isMobilePhone({
+      navigator: { platform: 'MacIntel', userAgent: 'Mozilla/5.0 Chrome/130.0.0.0 Safari/537.36' },
+      innerWidth: 1440,
+    })).toBe(false);
+
+    expect(isMobilePhone({
+      navigator: { platform: 'MacIntel', userAgent: 'Mozilla/5.0 Chrome/130.0.0.0 Safari/537.36' },
+      innerWidth: 360,
+    })).toBe(false);
+
+    expect(isMobilePhone({
+      navigator: { platform: 'Win32', userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0' },
+      innerWidth: 1920,
+    })).toBe(false);
+
+    expect(isMobilePhone({
+      navigator: { platform: 'Linux x86_64', userAgent: 'Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0' },
+      innerWidth: 1200,
+    })).toBe(false);
+
+    // Electron PC App (even at narrow width)
+    expect(isMobilePhone({
+      pcApp: { isElectron: true, platform: 'darwin' },
+      innerWidth: 1200,
+    })).toBe(false);
+
+    expect(isMobilePhone({
+      pcApp: { isElectron: true, platform: 'darwin' },
+      innerWidth: 360,
+    })).toBe(false);
+
+    expect(isMobilePhone({
+      pcApp: { isElectron: true, platform: 'win32' },
+      innerWidth: 360,
+    })).toBe(false);
+
+    // Designed-for-iPad Mac and Mac Catalyst
+    expect(isMobilePhone({
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'ios' },
+      navigator: { platform: 'MacIntel', userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)', maxTouchPoints: 0 },
+      nativeHost: { isMacDesktop: true, scaleMode: 'designed-for-ipad' },
+    })).toBe(false);
+
+    expect(isMobilePhone({
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'ios' },
+      navigator: { platform: 'MacIntel', userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)', maxTouchPoints: 0 },
+      nativeHost: { isMacDesktop: true, scaleMode: 'native-1x' },
+    })).toBe(false);
+
+    // iPad / iPadOS (Safari, desktop-mode, Capacitor)
+    expect(isMobilePhone({
+      navigator: { platform: 'iPad', userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)', maxTouchPoints: 5 },
+      innerWidth: 1024,
+    })).toBe(false);
+
+    expect(isMobilePhone({
+      navigator: { platform: 'MacIntel', userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/604.1', maxTouchPoints: 5 },
+      innerWidth: 1024,
+    })).toBe(false);
+
+    expect(isMobilePhone({
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'ios' },
+      navigator: { platform: 'iPad', userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)', maxTouchPoints: 5 },
+      innerWidth: 834,
+    })).toBe(false);
+
+    // Android tablet
+    expect(isMobilePhone({
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'android' },
+      navigator: { platform: 'Linux armv8l', userAgent: 'Mozilla/5.0 (Linux; Android 14)', maxTouchPoints: 5 },
+      innerWidth: 900,
+    })).toBe(false);
+
+    expect(isMobilePhone({
+      navigator: { platform: 'Linux aarch64', userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel Tablet) AppleWebKit/537.36 Chrome/130.0 Safari/537.36', maxTouchPoints: 5 },
+      innerWidth: 1200,
+    })).toBe(false);
+
+    expect(isMobilePhone({
+      navigator: { platform: 'Linux armv8l', userAgent: 'Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36', maxTouchPoints: 5 },
+    })).toBe(false);
+
+    // Synthetic Capacitor fallback without explicit UA tokens
+    expect(isMobilePhone({
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'ios' },
+      innerWidth: 375,
+    })).toBe(true);
+
+    expect(isMobilePhone({
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'ios' },
+      innerWidth: 1024,
     })).toBe(false);
   });
 });

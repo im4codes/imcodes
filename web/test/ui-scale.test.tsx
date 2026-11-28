@@ -79,10 +79,12 @@ import {
   clampUiScale,
   DEFAULT_UI_SCALE,
   DESIGNED_FOR_IPAD_DEFAULT_UI_SCALE,
+  MOBILE_PHONE_DEFAULT_UI_SCALE,
   formatUiScale,
   getActiveCssZoom,
   getDefaultUiScale,
   getDomRectToLayoutScale,
+  initUiScale,
   markUiScalePrompted,
   MAX_UI_SCALE,
   MIN_UI_SCALE,
@@ -109,11 +111,18 @@ import { SettingsPage } from '../src/pages/SettingsPage.js';
 import { TerminalView } from '../src/components/TerminalView.js';
 import { NATIVE_HOST_EVENT, type NativePlatformEnvironment } from '../src/native-platform.js';
 
+const originalNavigatorUserAgent = navigator.userAgent;
+const originalNavigatorPlatform = navigator.platform;
+const originalMaxTouchPoints = navigator.maxTouchPoints;
+const originalInnerWidth = window.innerWidth;
+
 function setGlobalRuntime(overrides: {
   isNative?: boolean;
   platform?: string;
+  navigatorPlatform?: string;
   userAgent?: string;
   maxTouchPoints?: number;
+  innerWidth?: number;
   nativeHost?: Record<string, unknown>;
 } = {}): void {
   const g = globalThis as Record<string, unknown>;
@@ -126,12 +135,22 @@ function setGlobalRuntime(overrides: {
     delete g.Capacitor;
   }
   g.__IMCODES_NATIVE_HOST__ = overrides.nativeHost;
-  if (overrides.userAgent !== undefined) {
-    Object.defineProperty(navigator, 'userAgent', { value: overrides.userAgent, configurable: true });
-  }
-  if (overrides.maxTouchPoints !== undefined) {
-    Object.defineProperty(navigator, 'maxTouchPoints', { value: overrides.maxTouchPoints, configurable: true });
-  }
+  Object.defineProperty(navigator, 'platform', {
+    value: overrides.navigatorPlatform ?? originalNavigatorPlatform,
+    configurable: true,
+  });
+  Object.defineProperty(navigator, 'userAgent', {
+    value: overrides.userAgent ?? originalNavigatorUserAgent,
+    configurable: true,
+  });
+  Object.defineProperty(navigator, 'maxTouchPoints', {
+    value: overrides.maxTouchPoints ?? originalMaxTouchPoints,
+    configurable: true,
+  });
+  Object.defineProperty(window, 'innerWidth', {
+    value: overrides.innerWidth ?? originalInnerWidth,
+    configurable: true,
+  });
 }
 
 describe('whole-page UI scale (%) setting & onboarding', () => {
@@ -199,8 +218,106 @@ describe('whole-page UI scale (%) setting & onboarding', () => {
 
     expect(getDefaultUiScale(catalystMac)).toBe(DEFAULT_UI_SCALE);
     expect(getDefaultUiScale(intermediateNativePageZoom)).toBe(100);
-    expect(getDefaultUiScale(androidPhone)).toBe(100);
+    expect(getDefaultUiScale(androidPhone)).toBe(MOBILE_PHONE_DEFAULT_UI_SCALE);
+    expect(readUiScale(androidPhone)).toBe(95);
     expect(getDefaultUiScale(desktopBrowser)).toBe(100);
+  });
+
+  it('defaults to 95% on mobile phones when unset, auto-applies on init without fake localStorage, and strictly honors manual user preferences', () => {
+    const iphoneCapacitor: NativePlatformEnvironment = {
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'ios' },
+      navigator: { platform: 'iPhone', userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)', maxTouchPoints: 5 },
+      innerWidth: 390,
+    };
+    const iphoneSafari: NativePlatformEnvironment = {
+      capacitor: { isNativePlatform: () => false, getPlatform: () => 'web' },
+      navigator: { platform: 'iPhone', userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1', maxTouchPoints: 5 },
+      innerWidth: 390,
+    };
+    const androidCapacitor: NativePlatformEnvironment = {
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'android' },
+      navigator: { platform: 'Linux armv8l', userAgent: 'Mozilla/5.0 (Linux; Android 14)', maxTouchPoints: 5 },
+      innerWidth: 360,
+    };
+    const androidChrome: NativePlatformEnvironment = {
+      capacitor: { isNativePlatform: () => false, getPlatform: () => 'web' },
+      navigator: { platform: 'Linux armv8l', userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/130.0.0.0 Mobile Safari/537.36', maxTouchPoints: 5 },
+      innerWidth: 393,
+    };
+
+    // 1. Defaults to 95% on all phones when imcodes_uiScale is unset
+    expect(getDefaultUiScale(iphoneCapacitor)).toBe(95);
+    expect(readUiScale(iphoneCapacitor)).toBe(95);
+    expect(getDefaultUiScale(iphoneSafari)).toBe(95);
+    expect(readUiScale(iphoneSafari)).toBe(95);
+    expect(getDefaultUiScale(androidCapacitor)).toBe(95);
+    expect(readUiScale(androidCapacitor)).toBe(95);
+    expect(getDefaultUiScale(androidChrome)).toBe(95);
+    expect(readUiScale(androidChrome)).toBe(95);
+
+    // 2. initUiScale on fresh phone install auto-applies 95% without setting localStorage
+    setGlobalRuntime({
+      isNative: true,
+      platform: 'ios',
+      navigatorPlatform: 'iPhone',
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+      maxTouchPoints: 5,
+      innerWidth: 390,
+    });
+    localStorage.clear();
+    const appliedScale = initUiScale();
+    expect(appliedScale).toBe(95);
+    expect(getActiveCssZoom()).toBe(0.95);
+    expect(document.documentElement.style.getPropertyValue(UI_SCALE_ZOOM_VAR)).toBe('0.95');
+    expect(document.documentElement.style.getPropertyValue(UI_SCALE_SHRINK_ZOOM_VAR)).toBe('0.95');
+    // Does NOT write fake localStorage preference, preserving onboarding prompt detection
+    expect(localStorage.getItem(UI_SCALE_STORAGE_KEY)).toBeNull();
+    expect(shouldShowUiScaleOnboardingPrompt()).toBe(true);
+
+    // 3. User manual settings (e.g. 100, 85, 110) on phone are strictly honored
+    localStorage.setItem(UI_SCALE_STORAGE_KEY, '100');
+    expect(readUiScale(iphoneCapacitor)).toBe(100);
+    expect(initUiScale()).toBe(100);
+    expect(getActiveCssZoom()).toBe(1);
+
+    localStorage.setItem(UI_SCALE_STORAGE_KEY, '85');
+    expect(readUiScale(iphoneCapacitor)).toBe(85);
+    expect(initUiScale()).toBe(85);
+    expect(getActiveCssZoom()).toBe(0.85);
+
+    localStorage.setItem(UI_SCALE_STORAGE_KEY, '110');
+    expect(readUiScale(androidCapacitor)).toBe(110);
+    expect(initUiScale()).toBe(110);
+    expect(getActiveCssZoom()).toBe(1.1);
+
+    // 4. Reset on phone restores default 95%
+    localStorage.removeItem(UI_SCALE_STORAGE_KEY);
+    expect(readUiScale(iphoneCapacitor)).toBe(95);
+
+    // 5. Non-phones remain strictly unchanged
+    const desktopBrowserNarrow: NativePlatformEnvironment = {
+      capacitor: { isNativePlatform: () => false, getPlatform: () => 'web' },
+      navigator: { platform: 'MacIntel', userAgent: 'Mozilla/5.0 Chrome/130.0', maxTouchPoints: 0 },
+      innerWidth: 360,
+    };
+    const pcAppNarrow: NativePlatformEnvironment = {
+      pcApp: { isElectron: true, platform: 'darwin' },
+      navigator: { platform: 'MacIntel', userAgent: 'Mozilla/5.0 Electron/30.0', maxTouchPoints: 0 },
+      innerWidth: 360,
+    };
+    const ipad: NativePlatformEnvironment = {
+      navigator: { platform: 'iPad', userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)', maxTouchPoints: 5 },
+      innerWidth: 1024,
+    };
+    const androidTablet: NativePlatformEnvironment = {
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'android' },
+      navigator: { platform: 'Linux armv8l', userAgent: 'Mozilla/5.0 (Linux; Android 14)', maxTouchPoints: 5 },
+      innerWidth: 900,
+    };
+    expect(getDefaultUiScale(desktopBrowserNarrow)).toBe(100);
+    expect(getDefaultUiScale(pcAppNarrow)).toBe(100);
+    expect(getDefaultUiScale(ipad)).toBe(100);
+    expect(getDefaultUiScale(androidTablet)).toBe(100);
   });
 
   it('strictly falls back to platform default on corrupt, out-of-range, or blocked localStorage', () => {
@@ -374,6 +491,29 @@ describe('whole-page UI scale (%) setting & onboarding', () => {
     expect(screen.getByTestId('ui-scale-readout').textContent).toBe('100%');
     expect(screen.getByTestId('settings-ui-scale-readout').textContent).toBe('100%');
     expect(document.documentElement.style.getPropertyValue(UI_SCALE_ZOOM_VAR)).toBe('');
+
+    // On a mobile phone, Reset restores 95%
+    cleanup();
+    localStorage.clear();
+    setGlobalRuntime({
+      isNative: true,
+      platform: 'ios',
+      navigatorPlatform: 'iPhone',
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+      maxTouchPoints: 5,
+      innerWidth: 390,
+    });
+    render(<Harness />);
+    expect(screen.getByTestId('settings-ui-scale-readout').textContent).toBe('95%');
+    fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
+    expect(screen.getByTestId('ui-scale-readout').textContent).toBe('95%');
+    const phoneIncButtons = screen.getAllByRole('button', { name: 'Increase UI scale' });
+    fireEvent.click(phoneIncButtons[0]);
+    expect(screen.getByTestId('ui-scale-readout').textContent).toBe('100%');
+    fireEvent.click(screen.getByTestId('ui-scale-reset'));
+    expect(screen.getByTestId('ui-scale-readout').textContent).toBe('95%');
+    expect(screen.getByTestId('settings-ui-scale-readout').textContent).toBe('95%');
+    expect(document.documentElement.style.getPropertyValue(UI_SCALE_SHRINK_ZOOM_VAR)).toBe('0.95');
   });
 
   it('shows first-install floating UI scale card only on native apps and persists imcodes_uiScalePrompted on Done/Close/Aa change', () => {
@@ -428,6 +568,22 @@ describe('whole-page UI scale (%) setting & onboarding', () => {
     fireEvent.click(screen.getAllByRole('button', { name: 'Decrease UI scale' })[0]);
     expect(localStorage.getItem(UI_SCALE_PROMPTED_STORAGE_KEY)).toBe('1');
     expect(screen.queryByTestId('ui-scale-onboarding-card')).toBeNull();
+
+    // Native iPhone first install -> shows card defaulting to 95%
+    cleanup();
+    localStorage.clear();
+    setGlobalRuntime({
+      isNative: true,
+      platform: 'ios',
+      navigatorPlatform: 'iPhone',
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+      maxTouchPoints: 5,
+      innerWidth: 390,
+    });
+    expect(shouldShowUiScaleOnboardingPrompt()).toBe(true);
+    render(<NativeHarness />);
+    expect(screen.getByTestId('ui-scale-onboarding-card')).toBeTruthy();
+    expect(screen.getByTestId('ui-scale-onboarding-readout').textContent).toBe('95%');
   });
 
   it('re-fits TerminalView when UI scale changes without Mac-only font inflation', () => {
