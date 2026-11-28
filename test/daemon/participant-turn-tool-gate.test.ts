@@ -14,12 +14,28 @@ const caller: McpRuntimeCaller = {
   projectName: 'project', serverId: 'server-1', providerId: 'codex-sdk', transport: 'in_process',
 };
 
-it('participant turns retain the original machine admission checks, including exec_remote', () => {
+const DENIED_PARTICIPANT_TOOLS = [
+  'capability_install',
+  'capability_manage',
+] as const;
+
+it('participant turns deny capability persistence tools while leaving cross-device, alias, and other tools governed by their own server/actor checks', () => {
   const server = createMemoryMcpServer(caller, { capabilityService: {} as CapabilityService });
   const registered = Object.keys((server as unknown as { _registeredTools: Record<string, unknown> })._registeredTools);
   expect(registered.length).toBeGreaterThan(60);
-  expect(Object.keys(PARTICIPANT_TURN_TOOL_POLICY)).toEqual([]);
-  for (const name of [...registered, ...Object.values(N), 'future_registered_tool', 'EXEC_REMOTE', 'shell_session1', 'constructor', 'toString', '__proto__']) {
+  expect(Object.keys(PARTICIPANT_TURN_TOOL_POLICY).sort()).toEqual([...DENIED_PARTICIPANT_TOOLS].sort());
+  for (const name of DENIED_PARTICIPANT_TOOLS) {
+    expect(isToolAllowedInParticipantTurn(name), name).toBe(false);
+  }
+  for (const name of [
+    ...registered.filter((n) => !(DENIED_PARTICIPANT_TOOLS as readonly string[]).includes(n)),
+    'capability_list',
+    'capability_status',
+    'future_registered_tool',
+    'constructor',
+    'toString',
+    '__proto__',
+  ]) {
     expect(isToolAllowedInParticipantTurn(name), name).toBe(true);
   }
 });
@@ -31,16 +47,41 @@ const origins = [
   ['missing turn hook', undefined, false],
 ] as const;
 
-describe.each(origins)('%s origin', (_label, participantTurnRequired, _denied) => {
-  it.each([false, true])('exec_remote reaches machine admission (fallback=%s); original schemas and unknown-name rejection remain', async (fallback) => {
+describe.each(origins)('%s origin', (_label, participantTurnRequired, denied) => {
+  it.each([false, true])('blocks capability_install/manage while allowing cross-device & alias tools to reach server admission (fallback=%s)', async (fallback) => {
     const resolveAlias = vi.fn(async () => ({ status: 'ok', found: false }));
     const capabilityList = vi.fn(async () => ({ status: 'ok', items: [] }));
+    const runAgentMcp = vi.fn(async () => ({ ok: true as const, results: [{ agent: 'codex', ok: true }] }));
+    const manageCap = vi.fn(async () => ({ status: 'ok' as const }));
     const execRemote = vi.fn(async () => ({ outcome: 'completed', ok: true, exitCode: 0, stdout: '', stderr: '', timedOut: false, truncated: false, durationMs: 1 }));
     const computerUseCall = vi.fn(async ({ tool }: { tool: string }) => ({ outcome: 'completed', result: { correlationId: 'cu-12345678', ok: true, tool, content: [], durationMs: 1 } }));
+    const openPortForward = vi.fn(async () => ({
+      ok: true as const,
+      tunnel: {
+        tunnelId: 't1',
+        listenNode: 'node-0',
+        listenHost: '127.0.0.1',
+        listenPort: 1234,
+        localEndpoint: '127.0.0.1:1234',
+        targetNode: '1234567890',
+        targetHost: '127.0.0.1',
+        targetPort: 8080,
+        expiresAt: Date.now() + 60_000,
+        transportMode: 'relay' as const,
+      },
+    }));
     const turn = participantTurnRequired ? vi.fn(participantTurnRequired) : undefined;
-    const server = createMemoryMcpServer(caller, { participantTurnRequired: turn, capabilityService: { list: capabilityList } as never, machineDeps: {
-      listMachines: async () => [], execRemote, computerUseCall,
-    } as never }, { resolveAlias: resolveAlias as never });
+    const server = createMemoryMcpServer(caller, {
+      participantTurnRequired: turn,
+      capabilityService: { list: capabilityList, install: vi.fn(), manage: manageCap, status: vi.fn() } as never,
+      runAgentMcp,
+      machineDeps: {
+        listMachines: async () => [],
+        execRemote,
+        computerUseCall,
+        portForwardOpen: openPortForward,
+      } as never,
+    }, { resolveAlias: resolveAlias as never });
     const client = new Client({ name: 'participant-turn-gate-test', version: '1' });
     const [a, b] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(b), client.connect(a)]);
@@ -53,48 +94,90 @@ describe.each(origins)('%s origin', (_label, participantTurnRequired, _denied) =
       const alias = await invoke('resolve_alias', { name: 'test-alias' });
       expect(alias.isError).not.toBe(true);
       expect(resolveAlias).toHaveBeenCalledTimes(1);
+
+      const capInstall = await invoke('capability_install', {
+        kind: 'mcp',
+        source: { kind: 'url', value: 'https://mcp.example.com' },
+      });
+      expect(Boolean(capInstall.isError)).toBe(denied);
+      if (denied) {
+        expect(mcpToolPayload(capInstall).reason).toBe(PARTICIPANT_TURN_TOOL_REFUSAL);
+        expect(runAgentMcp).not.toHaveBeenCalled();
+      } else {
+        expect(runAgentMcp).toHaveBeenCalledTimes(1);
+      }
+
+      const capManage = await invoke('capability_manage', {
+        action: 'enable',
+        capabilityId: 'cap-1',
+        bindingId: 'bind-1',
+      });
+      expect(Boolean(capManage.isError)).toBe(denied);
+      if (denied) {
+        expect(mcpToolPayload(capManage).reason).toBe(PARTICIPANT_TURN_TOOL_REFUSAL);
+        expect(manageCap).not.toHaveBeenCalled();
+      } else {
+        expect(manageCap).toHaveBeenCalledTimes(1);
+      }
+
+      const pf = await invoke(N.PORT_FORWARD_OPEN, { targetNode: '1234567890', targetPort: 8080 });
+      expect(pf.isError).not.toBe(true);
+      expect(openPortForward).toHaveBeenCalledTimes(1);
+
       for (const name of [N.CRON_LIST, N.SESSION_IDENTITY_GET, N.VERIFICATION_MACHINE_LIST, 'execution_pool_get', 'capability_list']) {
         const result = await invoke(name, {});
         expect(mcpToolPayload(result).reason, name).not.toBe(PARTICIPANT_TURN_TOOL_REFUSAL);
         expect(JSON.stringify(result), name).not.toContain('-32602');
       }
       expect(capabilityList).toHaveBeenCalledTimes(1);
+
       for (const tool of ['list_apps', 'shell_session1', 'click']) {
-        const cu = await invoke(N.COMPUTER_USE_CALL, { machine: 'node-1', tool, arguments: {} });
+        const cu = await invoke(N.COMPUTER_USE_CALL, { machine: '1234567890', tool, arguments: {} });
         expect(cu.isError, tool).not.toBe(true);
       }
       expect(computerUseCall).toHaveBeenCalledTimes(3);
-      expect(turn?.mock.calls.length ?? 0).toBe(0);
-      const exec = await invoke(N.EXEC_REMOTE, { machine: 'node-1', command: 'id' });
+
+      const exec = await invoke(N.EXEC_REMOTE, { machine: '1234567890', command: 'id' });
       expect(exec.isError).not.toBe(true);
       expect(execRemote).toHaveBeenCalledTimes(1);
-      expect(turn?.mock.calls.length ?? 0).toBe(0);
+
       // No policy allow decision may mint a tool, accept a caller schema, or weaken its original schema.
       const unknown = await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: 'not_registered', fallbackCall: { name: 'not_registered', arguments: {} } } });
       expect(unknown.isError).toBe(true);
       expect(mcpToolPayload(unknown).reason).not.toBe(PARTICIPANT_TURN_TOOL_REFUSAL);
       expect((await client.callTool({ name: 'not_registered', arguments: {} })).isError).toBe(true);
       expect((await client.callTool({ name: 'resolve_alias', arguments: {} })).isError).toBe(true);
-      expect(resolveAlias).toHaveBeenCalledTimes(1);
     } finally { await client.close(); await server.close(); }
   });
 });
 
-it('exec_remote rechecks every call as owner and participant turns alternate', async () => {
+it('capability_install rechecks every call as owner and participant turns alternate', async () => {
   let participant = true;
-  const execRemote = vi.fn(async () => ({ outcome: 'not_dispatched', reason: 'exec_disabled', error: 'disabled' }));
-  const server = createMemoryMcpServer(caller, { participantTurnRequired: async () => participant, machineDeps: { listMachines: async () => [], execRemote } as never });
+  const runAgentMcp = vi.fn(async () => ({ ok: true as const, results: [] }));
+  const server = createMemoryMcpServer(caller, {
+    participantTurnRequired: async () => participant,
+    capabilityService: { list: vi.fn(), install: vi.fn(), manage: vi.fn(), status: vi.fn() } as never,
+    runAgentMcp,
+  });
   const client = new Client({ name: 'alternating-turn-test', version: '1' });
   const [a, b] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(b), client.connect(a)]);
   try {
-    await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: N.EXEC_REMOTE } });
+    await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: 'capability_install' } });
     for (const origin of [true, false, true, false]) {
       participant = origin;
-      const result = await client.callTool({ name: N.EXEC_REMOTE, arguments: { machine: 'node-1', command: 'id' } });
-      expect(mcpToolPayload(result).reason).toBe('exec_disabled');
+      const result = await client.callTool({
+        name: 'capability_install',
+        arguments: { kind: 'mcp', source: { kind: 'url', value: 'https://mcp.example.com' } },
+      });
+      if (origin) {
+        expect(result.isError).toBe(true);
+        expect(mcpToolPayload(result).reason).toBe(PARTICIPANT_TURN_TOOL_REFUSAL);
+      } else {
+        expect(result.isError).not.toBe(true);
+      }
     }
-    expect(execRemote).toHaveBeenCalledTimes(4);
+    expect(runAgentMcp).toHaveBeenCalledTimes(2);
   } finally { await client.close(); await server.close(); }
 });
 

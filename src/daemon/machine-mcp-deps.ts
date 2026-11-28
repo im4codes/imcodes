@@ -13,6 +13,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
+import { OWNER_MACHINE_AUTHORITY_TYPE } from '../../shared/shared-machine-authority.js';
 import { machineActionForComputerUseTool, machineActionRequiresExecute } from '../../shared/machine-access-policy.js';
 import { NODE_ROLE, type MachineExecHttpReason } from '../../shared/remote-exec.js';
 import type { ComputerUseHttpReason } from '../../shared/computer-use.js';
@@ -64,6 +65,19 @@ export interface DaemonMachineToolDepsOverrides {
   localComputerUseCall?: (input: { tool: Parameters<NonNullable<MachineToolDeps['computerUseCall']>>[0]['tool']; arguments?: Record<string, unknown>; timeoutMs?: number; signal?: AbortSignal }) => Promise<ComputerUseToolResult> | ComputerUseToolResult;
   resourceOwner?: SessionResourceOwnerIdentity | null;
   loadSharedMachineAuthority?: () => Promise<string | null>;
+  participantTurnRequired?: () => Promise<boolean>;
+}
+
+function isOwnerMachineAuthorityToken(token: string | null): boolean {
+  if (!token) return false;
+  const parts = token.split('.');
+  if (parts.length !== 3 || !parts[1]) return false;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as { type?: unknown };
+    return payload?.type === OWNER_MACHINE_AUTHORITY_TYPE;
+  } catch {
+    return false;
+  }
 }
 
 function isLocalComputerUseTarget(machine: string, creds: DaemonCredential | null): boolean {
@@ -348,9 +362,18 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
       // expiry and revocation state. A required context that cannot be loaded
       // throws here and MUST NOT degrade into an owner-authored local call.
       const sharedMachineAuthority = await loadSharedMachineAuthority();
-      // Owner local tools remain local. A participant alias names a resource, not the owner's local backend.
-      // Resolve it against the live authorized controlled fleet and dispatch through the server's target/action recheck.
-      if (isLocalComputerUseTarget(machine, creds) && !sharedMachineAuthority) {
+      const participantTurn = await (async () => {
+        if (!overrides.participantTurnRequired) return false;
+        try {
+          return (await overrides.participantTurnRequired()) === true;
+        } catch {
+          return true;
+        }
+      })();
+      // Owner local tools remain local (even when an owner-turn JWT is active).
+      // A participant turn or non-owner authority NEVER falls back to the owner's local backend.
+      const allowLocalByAuthority = !sharedMachineAuthority || isOwnerMachineAuthorityToken(sharedMachineAuthority);
+      if (isLocalComputerUseTarget(machine, creds) && allowLocalByAuthority && !participantTurn) {
         return localComputerUse({
           tool,
           ...(args ? { arguments: args } : {}),

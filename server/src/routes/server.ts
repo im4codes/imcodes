@@ -16,7 +16,7 @@ import {
   getUserPref,
   setUserPref,
 } from '../db/queries.js';
-import { resolveServerRole } from '../security/authorization.js';
+import { resolveServerMembershipRole, resolveServerRole } from '../security/authorization.js';
 import { resolveControlledMachineManagementAccess } from '../share/machine-access.js';
 import { isSharedOrContributedServer } from '../security/daemon-scope.js';
 import { resolveSharedMachineAuthority } from '../share/shared-machine-authority.js';
@@ -534,10 +534,9 @@ serverRoutes.get('/:id/upgrade', requireAuth(), async (c) => {
 serverRoutes.post('/:id/upgrade', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id') ?? '';
-  // Preserve the existing machine-member upgrade surface while also admitting
-  // whole-server participants. Concrete-session shares still resolve to null.
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (!role || role === 'none') {
+  // Strict real ownership only: whole-server share participants and group members cannot trigger upgrades.
+  const role = await resolveServerMembershipRole(c.env.DB, serverId, userId);
+  if (role !== 'owner') {
     return c.json({ error: 'not_found' }, 404);
   }
   const srv = await getServerById(c.env.DB, serverId) as (Awaited<ReturnType<typeof getServerById>> & {

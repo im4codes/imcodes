@@ -914,6 +914,8 @@ export function mergeDefaultToolDeps(
             return sharedMachineAuthorityFromHookResponse(await postSharedMachineAuthorityHook!());
           }
         : async () => null,
+      participantTurnRequired: toolDeps.participantTurnRequired
+        ?? (postSharedMachineAuthorityHook ? participantTurnFromAuthorityHook(postSharedMachineAuthorityHook) : undefined),
     }),
     cloudDocsDeps: toolDeps.cloudDocsDeps ?? createDaemonCloudDocsToolDeps({
       ...(bridgeDeps.env || bridgeDeps.hookCredential ? { env: initialBridgeEnv } : {}),

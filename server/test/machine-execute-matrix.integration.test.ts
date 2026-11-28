@@ -139,10 +139,10 @@ async function admits(name: string, action: MachineAction, token?: string): Prom
   return admission.ok;
 }
 
-/** Who may EXECUTE (exec, shell, GUI input, file send / fetch): the owner, direct grantee, and valid group participants. */
-const MAY_EXECUTE = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'];
+/** Who may EXECUTE (exec, shell, GUI input, file send / fetch): the owner and participants with an explicit exec_granted=true share grant. */
+const MAY_EXECUTE = ['owner', 'pYes', 'groupAndGrant'];
 /** Directory listing is a bounded shared-picker capability for group participants, not file read/fetch authority. */
-const MAY_LIST = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'];
+const MAY_LIST = ['owner', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'];
 /** Who may merely operate (view-class): every access that is not a viewer / nothing. */
 const MAY_VIEW = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'];
 
@@ -150,8 +150,8 @@ describe('role x action matrix (real resolvers, real routes)', () => {
   it('resolves canonical node_id aliases before admitting both relay routes', async () => {
     const row = await db.queryOne<{ node_id: string }>('SELECT node_id FROM servers WHERE id = $1', [nodeId]);
     const canonicalNodeId = row!.node_id;
-    const allowed = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'] as const;
-    const denied = ['viewer', 'revoked', 'other'] as const;
+    const allowed = ['owner', 'pYes', 'groupAndGrant'] as const;
+    const denied = ['pNo', 'gMember', 'viewer', 'revoked', 'other'] as const;
 
     for (const name of allowed) {
       const actor = actors[name]!;
@@ -207,7 +207,7 @@ describe('role x action matrix (real resolvers, real routes)', () => {
 
   it('the listing tells an actor whether THEY can execute, and a daemon-facing flag follows it', async () => {
     const forMember = (await listControlledMachines(db, actors.gMember!.userId, Date.now())).machines.find((m) => m.serverId === nodeId)!;
-    expect(forMember).toMatchObject({ execEnabled: true, canExecute: true, execGranted: false, accessSource: 'group' });
+    expect(forMember).toMatchObject({ execEnabled: false, canExecute: false, execGranted: false, accessSource: 'group' });
     const forGrantee = (await listControlledMachines(db, actors.pYes!.userId, Date.now())).machines.find((m) => m.serverId === nodeId)!;
     expect(forGrantee).toMatchObject({ canExecute: true, execGranted: true, accessSource: 'share' });
     const forOwner = (await listControlledMachines(db, actors.owner!.userId, Date.now())).machines.find((m) => m.serverId === nodeId)!;
@@ -215,8 +215,8 @@ describe('role x action matrix (real resolvers, real routes)', () => {
   });
 
   it('keeps machine listing and execute admission on the same effective role', async () => {
-    // Every valid participant source is executable; viewers remain visible but
-    // denied. The list projection and relay gate must agree for every actor.
+    // Only owners and participants with exec_granted=true are executable; group members without grant,
+    // participant shares without grant, and viewers remain denied for execute actions.
     for (const name of ['owner', 'pNo', 'pYes', 'gMember', 'groupAndGrant'] as const) {
       const listed = (await listControlledMachines(db, actors[name]!.userId, Date.now())).machines
         .find((machine) => machine.serverId === nodeId);
@@ -230,7 +230,7 @@ describe('role x action matrix (real resolvers, real routes)', () => {
   });
 
   it('the highest effective role wins when a viewer row coexists with a group participant', async () => {
-    expect(await admits('viewerAndGroup', MACHINE_ACTION.EXEC)).toBe(true);
+    expect(await admits('viewerAndGroup', MACHINE_ACTION.EXEC)).toBe(false);
     expect(await admits('viewerAndGroup', MACHINE_ACTION.VIEW)).toBe(true);
     expect(await admits('groupAndGrant', MACHINE_ACTION.EXEC)).toBe(true);
   });
@@ -285,7 +285,7 @@ describe('exec_remote uses the participant grant on participant-origin turns', (
   it.each(NAMES)('%s: participant-origin exec_remote follows the effective participant role', async (name) => {
     const headers = await delegatedHeader(name);
     const owner = actors.owner!;
-    const mayExecute = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'].includes(name);
+    const mayExecute = MAY_EXECUTE.includes(name);
     const before = execCalls;
     expect((await EXEC(owner, headers)).status).toBe(mayExecute ? 200 : 403);
     expect(execCalls).toBe(before + (mayExecute ? 1 : 0));
@@ -305,22 +305,22 @@ describe('exec_remote uses the participant grant on participant-origin turns', (
       token: headers[SHARED_MACHINE_AUTHORITY_HEADER], signingKey: KEY, authenticatedSourceServerId: owner.serverId,
       sourceOwnerUserId: owner.userId, targetServerId: nodeId, action: MACHINE_ACTION.FILE_LIST, now: Date.now(),
     });
-    expect(listAdmission.ok, MACHINE_ACTION.FILE_LIST).toBe(['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'].includes(name));
+    expect(listAdmission.ok, MACHINE_ACTION.FILE_LIST).toBe(MAY_LIST.includes(name));
   });
 
   it.each(['pNo', 'pYes', 'gMember'])('%s: daemon list keeps the raw switch for non-EXEC consumers without owner-grant substitution', async (name) => {
     const delegated = await delegatedHeader(name);
     const owner = actors.owner!;
     const projected = (await listControlledMachines(db, owner.userId, Date.now(), actors[name]!.userId)).machines.find((m) => m.serverId === nodeId)!;
-    if (name === 'gMember' || name === 'viewerAndGroup') expect(projected).toMatchObject({ execEnabled: true, canExecute: true, accessSource: name === 'gMember' ? 'group' : 'group' });
-    else expect(projected).toMatchObject({ execEnabled: name !== 'viewer', canExecute: name !== 'viewer', accessSource: 'share' });
+    if (name === 'gMember') expect(projected).toMatchObject({ execEnabled: false, canExecute: false, accessSource: 'group' });
+    else expect(projected).toMatchObject({ execEnabled: name === 'pYes', canExecute: name === 'pYes', accessSource: 'share' });
     const response = await execApp().request('/api/machines', {
       headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}`, ...delegated },
     });
     expect(response.status).toBe(200);
     const listed = await response.json();
     const item = listed.machines.find((m: { serverId: string }) => m.serverId === nodeId);
-    { expect(item).toMatchObject({ execEnabled: name !== 'viewer' }); expect(item).not.toHaveProperty('canExecute'); }
+    { expect(item).toMatchObject({ execEnabled: name === 'pYes' }); expect(item).not.toHaveProperty('canExecute'); }
   });
 
   it('a read-only view still follows the participant\'s OWN access (a direct share or own group may look, a stranger may not)', async () => {
@@ -429,16 +429,19 @@ describe('audit and rate limit', () => {
   it('records refused AND allowed attempts durably: actor, delegated actor, reason, hash and length, never the command', async () => {
     const secretCommand = `echo ${hex(8)}-SECRET`;
     await call('/api/machine/exec', actors.gMember!, { command: secretCommand });
+    await call('/api/machine/exec', actors.pYes!, { command: secretCommand });
     await call('/api/machine/exec', actors.owner!, { command: secretCommand });
     const rows = await db.query<Record<string, unknown>>(
       `SELECT * FROM machine_exec_audit WHERE target_server_id = $1 AND command_sha256 = $2 ORDER BY created_at`, [nodeId, sha(secretCommand)]);
     expect(rows.map((r) => [r.user_id, r.decision, r.reason ?? null, r.action])).toEqual([
-      [actors.gMember!.userId, 'allowed', null, 'exec'],
+      [actors.gMember!.userId, 'denied', 'execute_not_granted', 'exec'],
+      [actors.pYes!.userId, 'allowed', null, 'exec'],
       [actors.owner!.userId, 'allowed', null, 'exec'],
     ]);
     expect(JSON.stringify(rows)).not.toContain('SECRET');
     expect(Number(rows[0]!.command_length)).toBe(Buffer.byteLength(secretCommand));
-    expect(rows[1]!.access_source).toBe('owner');
+    expect(rows[2]!.access_source).toBe('owner');
+    expect(rows[1]!.access_source).toBe('share');
     expect(rows[0]!.access_source).toBe('group');
   });
 

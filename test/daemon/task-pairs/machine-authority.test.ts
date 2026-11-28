@@ -193,7 +193,7 @@ describe('task-pairs machine authority capture, private persistence, and deliver
     for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   });
 
-  it('captures ownerMachineAuthority on pair_create, delivers it to executor/auditor/Brain across store reload, and never leaks JWT', async () => {
+  it('captures ownerMachineAuthority in RAM without persisting owner JWTs to SQLite disk, scrubs legacy owner rows, and never leaks JWT', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tp-auth-'));
     tempDirs.push(dir);
     const dbPath = join(dir, 'pairs.sqlite');
@@ -228,13 +228,9 @@ describe('task-pairs machine authority capture, private persistence, and deliver
     expect(audBrief?.metadata.ownerMachineAuthority).toBe(ownerJwt);
     expect(audBrief?.metadata.sharedActor).toBeUndefined();
 
-    // Simulate daemon restart: reopen TaskPairStore from disk.
-    setTaskPairStoreForTests(new TaskPairStore(dbPath));
+    // Same daemon lifetime in RAM: all Brain notices carry ownerMachineAuthority.
     capturedSends.length = 0;
-
-    // NEEDS_INPUT notice to Brain carries ownerMachineAuthority.
     await sendTaskPairMessage(BRAIN, 'tsk_owner_1', 'brain-needs_input', 'Needs Brain ruling');
-    // Non-Brain DECISION recorded by human notifies Brain with ownerMachineAuthority.
     taskPairService.recordDecision({
       project: PROJECT,
       taskId: 'tsk_owner_1',
@@ -246,9 +242,7 @@ describe('task-pairs machine authority capture, private persistence, and deliver
       idempotencyKey: 'dec-1',
     });
     await taskPairService.waitForIdle();
-    // PASS completion notice to Brain carries ownerMachineAuthority.
     await sendTaskPairMessage(BRAIN, 'tsk_owner_1', 'brain-line-pass-done', 'PASS ready');
-    // Aggregate Brain heartbeat carries freshest ownerMachineAuthority.
     await sendTaskPairMessage(
       BRAIN,
       '__aggregate__',
@@ -264,6 +258,25 @@ describe('task-pairs machine authority capture, private persistence, and deliver
       expect(msg.metadata.ownerMachineAuthority).toBe(ownerJwt);
       expect(msg.metadata.sharedActor).toBeUndefined();
     }
+
+    // Verify SQLite on disk stores ZERO owner authority rows or JWT strings.
+    const inspectDb = new DatabaseSync(dbPath);
+    const ownerRowsBeforeRestart = inspectDb.prepare('SELECT kind, authority FROM task_pair_private_authority').all() as Array<{ kind: string; authority: string | null }>;
+    expect(ownerRowsBeforeRestart.filter((r) => r.kind === 'owner')).toEqual([]);
+    expect(JSON.stringify(ownerRowsBeforeRestart)).not.toContain(ownerJwt);
+    // Simulate legacy plaintext owner row on disk and verify reopening scrubs it.
+    inspectDb.prepare('INSERT OR REPLACE INTO task_pair_private_authority (project, task_id, kind, actor_user_id, authority, updated_at) VALUES (?, ?, ?, NULL, ?, ?)')
+      .run(PROJECT, 'tsk_legacy_owner', 'owner', 'legacy-disk-owner-jwt', 1);
+    inspectDb.close();
+
+    // Simulate daemon restart: reopen TaskPairStore from disk.
+    const reloaded = new TaskPairStore(dbPath);
+    setTaskPairStoreForTests(reloaded);
+    expect(reloaded.getPrivateAuthority(PROJECT, 'tsk_owner_1')).toBeUndefined();
+    const checkScrubbed = new DatabaseSync(dbPath);
+    const remainingOwnerRows = checkScrubbed.prepare("SELECT * FROM task_pair_private_authority WHERE kind != 'participant'").all();
+    checkScrubbed.close();
+    expect(remainingOwnerRows).toEqual([]);
 
     // Zero JWT leakage across store state, events, MCP projections, and timeline payloads.
     const pairGet = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_GET]!({ taskId: 'tsk_owner_1' });

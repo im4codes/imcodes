@@ -23,6 +23,7 @@ import {
 } from '../../shared/transport-queue-types.js';
 import { transportQueueStaleThresholdMs } from '../../shared/transport-queue-types.js';
 import { buildQueueProjectionEntry } from '../../shared/transport-queue-privacy.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD } from '../../shared/shared-machine-authority.js';
 import { resolveTransportConversationKey } from '../agent/transport-resume-opts.js';
 import { getSession } from '../store/session-store.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
@@ -289,6 +290,11 @@ export class TransportQueueStore {
   private readonly ownsDb: boolean;
   private closed = false;
   private lastSessionCommandPruneAt = 0;
+  /**
+   * Owner machine authority JWTs stay strictly in daemon RAM (never persisted to SQLite).
+   * Keyed by session + message id + normalized recipient identity.
+   */
+  private readonly ownerMachineAuthorities = new Map<string, string>();
 
   constructor(options: TransportQueueStoreOptions = {}) {
     if (options.database) {
@@ -307,6 +313,7 @@ export class TransportQueueStore {
   }
 
   close(): void {
+    this.ownerMachineAuthorities.clear();
     if (this.ownsDb && !this.closed) this.db.close();
     this.closed = true;
   }
@@ -425,6 +432,56 @@ export class TransportQueueStore {
     this.migrateRecipientIdentityColumns();
     this.migrateSupervisionReferenceColumn();
     this.migrateDeliveryConversationColumn();
+    this.scrubPersistedOwnerAuthorities();
+  }
+
+  private ownerAuthorityKey(
+    sessionName: string,
+    clientMessageId: string,
+    recipient: QueueRecipientIdentity | null | undefined,
+  ): string {
+    return `${sessionName}\u0000${clientMessageId}\u0000${recipient?.sessionInstanceId ?? ''}\u0000${recipient?.runtimeEpoch ?? ''}`;
+  }
+
+  private clearOwnerAuthorityEntries(sessionName: string, clientMessageId?: string): void {
+    const prefix = clientMessageId
+      ? `${sessionName}\u0000${clientMessageId}\u0000`
+      : `${sessionName}\u0000`;
+    for (const key of this.ownerMachineAuthorities.keys()) {
+      if (key.startsWith(prefix)) this.ownerMachineAuthorities.delete(key);
+    }
+  }
+
+  private extractOwnerAuthorityForRam(materialJson: string): { sanitizedJson: string; ownerAuthority?: string } {
+    try {
+      const parsed = JSON.parse(materialJson) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && OWNER_MACHINE_AUTHORITY_FIELD in parsed) {
+        const raw = parsed[OWNER_MACHINE_AUTHORITY_FIELD];
+        const ownerAuthority = typeof raw === 'string' && raw.trim() ? raw.trim() : undefined;
+        delete parsed[OWNER_MACHINE_AUTHORITY_FIELD];
+        return { sanitizedJson: JSON.stringify(parsed), ...(ownerAuthority ? { ownerAuthority } : {}) };
+      }
+    } catch {
+      // Leave unparseable payloads untouched.
+    }
+    return { sanitizedJson: materialJson };
+  }
+
+  private scrubPersistedOwnerAuthorities(): void {
+    const rows = this.db.prepare(`
+      SELECT session_name AS sessionName, client_message_id AS clientMessageId, material_json AS materialJson
+      FROM queue_private_material
+      WHERE material_json LIKE ?
+    `).all(`%${OWNER_MACHINE_AUTHORITY_FIELD}%`) as Array<{ sessionName: string; clientMessageId: string; materialJson: string }>;
+    for (const row of rows) {
+      const extracted = this.extractOwnerAuthorityForRam(row.materialJson);
+      if (extracted.sanitizedJson !== row.materialJson) {
+        this.db.prepare(`
+          UPDATE queue_private_material SET material_json = ?
+          WHERE session_name = ? AND client_message_id = ?
+        `).run(extracted.sanitizedJson, row.sessionName, row.clientMessageId);
+      }
+    }
   }
 
   /** Atomically accept one server cron occurrence; retries are no-ops. */
@@ -569,6 +626,7 @@ export class TransportQueueStore {
   }
 
   private deleteSessionQueueStateRows(sessionName: string): Omit<DiscardTransportQueueStateResult, 'rebound'> {
+    this.clearOwnerAuthorityEntries(sessionName);
     return {
       queueEntries: Number(this.db.prepare('DELETE FROM queue_entries WHERE session_name = ?').run(sessionName).changes ?? 0),
       privateMaterials: Number(this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ?').run(sessionName).changes ?? 0),
@@ -744,6 +802,7 @@ export class TransportQueueStore {
         `).run(now, sessionName, `cron:${cronSchedule}:%`);
       }
       if (evictClientMessageId) {
+        this.clearOwnerAuthorityEntries(sessionName, evictClientMessageId);
         this.db.prepare('DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ?').run(sessionName, evictClientMessageId);
         this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ?').run(sessionName, evictClientMessageId);
       }
@@ -772,13 +831,17 @@ export class TransportQueueStore {
         recipient?.runtimeEpoch ?? null,
       );
       if (input.privateMaterialJson !== undefined) {
+        const extracted = this.extractOwnerAuthorityForRam(input.privateMaterialJson);
+        const ramKey = this.ownerAuthorityKey(sessionName, clientMessageId, recipient);
+        if (extracted.ownerAuthority) this.ownerMachineAuthorities.set(ramKey, extracted.ownerAuthority);
+        else this.ownerMachineAuthorities.delete(ramKey);
         this.db.prepare(`
           INSERT OR REPLACE INTO queue_private_material (
             session_name, client_message_id, material_json, updated_at,
             recipient_session_instance_id, recipient_runtime_epoch
           ) VALUES (?, ?, ?, ?, ?, ?)
         `).run(
-          sessionName, clientMessageId, input.privateMaterialJson, now,
+          sessionName, clientMessageId, extracted.sanitizedJson, now,
           recipient?.sessionInstanceId ?? null, recipient?.runtimeEpoch ?? null,
         );
       }
@@ -1002,6 +1065,7 @@ export class TransportQueueStore {
     delete parsed.providerText;
     delete parsed.messagePreamble;
     delete parsed.aliasAudit;
+    delete parsed[OWNER_MACHINE_AUTHORITY_FIELD];
     parsed.text = text;
     if (replacement?.providerText != null) parsed.providerText = replacement.providerText;
     if (replacement?.aliasAudit) parsed.aliasAudit = replacement.aliasAudit;
@@ -1120,13 +1184,27 @@ export class TransportQueueStore {
   ): string | undefined {
     const sessionName = normalizeSessionName(sessionNameInput);
     const clientMessageId = requireNonEmpty(clientMessageIdInput.trim(), 'clientMessageId');
-    const gate = this.recipientPredicate(normalizeQueueRecipient(recipient));
+    const normalizedRecipient = normalizeQueueRecipient(recipient);
+    const gate = this.recipientPredicate(normalizedRecipient);
     const row = this.db.prepare(`
       SELECT material_json AS materialJson
       FROM queue_private_material
       WHERE session_name = ? AND client_message_id = ? AND ${gate.sql}
     `).get(sessionName, clientMessageId, ...gate.params) as { materialJson?: string } | undefined;
-    return readString(row?.materialJson);
+    const raw = readString(row?.materialJson);
+    if (!raw) return undefined;
+    const ramAuthority = this.ownerMachineAuthorities.get(this.ownerAuthorityKey(sessionName, clientMessageId, normalizedRecipient));
+    if (!ramAuthority) return raw;
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        parsed[OWNER_MACHINE_AUTHORITY_FIELD] = ramAuthority;
+        return JSON.stringify(parsed);
+      }
+    } catch {
+      // Ignore corrupt material JSON.
+    }
+    return raw;
   }
 
   /** Projection-only policy change after a definitive native refusal. */
@@ -1141,6 +1219,7 @@ export class TransportQueueStore {
       const parsed = material ? JSON.parse(material) as Record<string, unknown> : undefined;
       if (parsed && parsed.appendFallbackReason !== reason) {
         parsed.appendFallbackReason = reason;
+        delete parsed[OWNER_MACHINE_AUTHORITY_FIELD];
         this.db.prepare(`UPDATE queue_private_material SET material_json = ? WHERE session_name = ? AND client_message_id = ? AND ${gate.sql}`)
           .run(JSON.stringify(parsed), sessionName, clientMessageId, ...gate.params);
         this.bumpVersion(sessionName);

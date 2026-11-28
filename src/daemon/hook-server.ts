@@ -112,7 +112,10 @@ import {
 } from '../../shared/shared-machine-authority.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { readSenderParticipantTurn } from './sender-participant-turn.js';
-import { readProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
+import {
+  readProcessSharedMachineAuthority,
+  readProcessSharedMachineParticipants,
+} from './shared-machine-authority-context.js';
 
 export { DEFAULT_HOOK_PORT, getActiveHookServerPort };
 
@@ -2091,6 +2094,15 @@ export async function startHookServer(
             logger.debug({ session, event, agentType: record?.agentType }, 'Hook: ignored — not a managed claude-code session');
             res.writeHead(200);
             res.end('ignored');
+            return;
+          }
+
+          const participantTurnActive = readProcessSharedMachineParticipants(session).length > 0
+            || readSenderParticipantTurn(session) !== null;
+          if (participantTurnActive && !hookCredentialMatches(session, req.headers)) {
+            logger.warn({ session, event }, 'Hook: rejected /notify during active participant turn — missing or mismatched hook session credential');
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: HOOK_SESSION_CREDENTIAL_ERROR }));
             return;
           }
 

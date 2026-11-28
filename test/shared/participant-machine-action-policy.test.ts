@@ -4,8 +4,8 @@ import { MACHINE_ACTION, MACHINE_ACCESS_SOURCE as S, MACHINE_DENIAL_REASON as D,
 const subjects: Array<[string, MachineAccessSubject, boolean, boolean]> = [
   ['owner', { accessRole: 'owner', accessSource: S.OWNER, execGranted: false, execEnabled: true, participantTurn: true }, true, true],
   ['granted', { accessRole: 'participant', accessSource: S.SHARE, execGranted: true, execEnabled: true, participantTurn: true }, true, true],
-  ['participant without extra grant', { accessRole: 'participant', accessSource: S.SHARE, execGranted: false, execEnabled: true, participantTurn: true }, true, true],
-  ['group without grant', { accessRole: 'participant', accessSource: S.GROUP, execGranted: false, execEnabled: true, participantTurn: true }, true, true],
+  ['participant without extra grant', { accessRole: 'participant', accessSource: S.SHARE, execGranted: false, execEnabled: true, participantTurn: true }, true, false],
+  ['group without grant', { accessRole: 'participant', accessSource: S.GROUP, execGranted: false, execEnabled: true, participantTurn: true }, true, false],
   ['group with execute grant', { accessRole: 'participant', accessSource: S.GROUP, execGranted: true, execEnabled: true, participantTurn: true }, true, true],
   ['viewer', { accessRole: 'viewer', accessSource: S.SHARE, execGranted: false, execEnabled: true, participantTurn: true }, false, false],
   ['revoked', { accessRole: null, accessSource: null, execGranted: true, execEnabled: true, participantTurn: true }, false, false],
@@ -13,12 +13,15 @@ const subjects: Array<[string, MachineAccessSubject, boolean, boolean]> = [
 describe.each(subjects)('%s real access', (_name, subject, mayView, mayExecute) => {
   it.each(Object.values(MACHINE_ACTION))('participant vs owner turn for %s', (action) => {
     const expected = action === MACHINE_ACTION.LIST || action === MACHINE_ACTION.VIEW
-        ? mayView
-        : action === MACHINE_ACTION.FILE_LIST && subject.accessSource === S.GROUP && subject.accessRole === 'participant'
-          ? true
-          : mayExecute;
-    expect(evaluateMachineAction(subject, action).allowed).toBe(expected);
-    // With provenance absent, grant rules are identical except the exact exec_remote action.
+      ? mayView
+      : action === MACHINE_ACTION.FILE_LIST && subject.accessSource === S.GROUP && subject.accessRole === 'participant'
+        ? true
+        : mayExecute;
+    const participantTurnDecision = evaluateMachineAction(subject, action);
+    expect(participantTurnDecision.allowed).toBe(expected);
+    if (!expected && (subject.accessRole === 'owner' || subject.accessRole === 'participant')) {
+      expect(participantTurnDecision).toEqual({ allowed: false, reason: D.EXECUTE_NOT_GRANTED });
+    }
     const ownerTurn = evaluateMachineAction({ ...subject, participantTurn: false }, action);
     expect(ownerTurn.allowed).toBe(expected);
     const switchedOff = evaluateMachineAction({ ...subject, execEnabled: false }, action);

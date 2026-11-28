@@ -285,7 +285,6 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: REPO_MSG.PR_DETAIL, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: REPO_MSG.ISSUE_DETAIL, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: 'memory.skill.query', sharedCommand: SHARE_BROWSER_COMMANDS.MEMORY_QUERY, policy: { kind: 'participant-covered-action' } },
-  { bridgeCommand: 'cron.create', sharedCommand: SHARE_BROWSER_COMMANDS.CRON_MUTATE, policy: { kind: 'participant-covered-action' } },
 ];
 
 function assertShareCommandInventoryEntry(entry: ShareBridgeCommandInventoryEntry): void {

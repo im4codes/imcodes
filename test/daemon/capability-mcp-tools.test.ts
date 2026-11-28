@@ -663,4 +663,58 @@ describe('capability MCP tools', () => {
     expect(unitDeps.listAgentMcp).toBeUndefined();
     expect(unitDeps.searchAgentMcpRegistry).toBeUndefined();
   });
+
+  it('fails closed inside capability_install and capability_manage during a participant turn or failing turn check', async () => {
+    const runAgentMcp = vi.fn(async () => ({ ok: true as const, results: [] }));
+    const runAgentSkills = vi.fn(async () => ({ ok: true as const, output: 'ok', skills: [] }));
+    const manage = vi.fn(async () => ({ status: 'ok' as const, item: {} as never }));
+    const install = vi.fn(async () => ({ status: 'ok' as const, operationId: 'op-1' }));
+
+    for (const check of [
+      async () => true,
+      async () => { throw new Error('authority_hook_unreachable'); },
+    ]) {
+      const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+      const { registerCapabilityMcpTools } = await import('../../src/daemon/capability-mcp-tools.js');
+      const server = new McpServer({ name: 'cap-direct-gate-test', version: '1' });
+      registerCapabilityMcpTools(server, caller(), {
+        capabilityService: { ...service(), install, manage } as unknown as CapabilityService,
+        participantTurnRequired: check,
+        runAgentMcp: runAgentMcp as never,
+        runAgentSkills: runAgentSkills as never,
+      });
+      const client = new Client({ name: 'cap-direct-gate-client', version: '1' });
+      const [a, b] = InMemoryTransport.createLinkedPair();
+      await Promise.all([server.connect(b), client.connect(a)]);
+      try {
+        const resMcp = await client.callTool({
+          name: 'capability_install',
+          arguments: { kind: 'mcp', source: { kind: 'url', value: 'https://mcp.example.com' } },
+        });
+        expect(resMcp.isError).toBe(true);
+        expect(resMcp.structuredContent).toMatchObject({ status: 'error', reason: 'forbidden' });
+
+        const resSkill = await client.callTool({
+          name: 'capability_install',
+          arguments: { kind: 'skill', source: { kind: 'url', value: 'https://skills.sh/acme/skill' } },
+        });
+        expect(resSkill.isError).toBe(true);
+        expect(resSkill.structuredContent).toMatchObject({ status: 'error', reason: 'forbidden' });
+
+        const resManage = await client.callTool({
+          name: 'capability_manage',
+          arguments: { action: 'uninstall', kind: 'mcp', name: 'github', userIntent: 'remove github' },
+        });
+        expect(resManage.isError).toBe(true);
+        expect(resManage.structuredContent).toMatchObject({ status: 'error', reason: 'forbidden' });
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    }
+    expect(runAgentMcp).not.toHaveBeenCalled();
+    expect(runAgentSkills).not.toHaveBeenCalled();
+    expect(install).not.toHaveBeenCalled();
+    expect(manage).not.toHaveBeenCalled();
+  });
 });

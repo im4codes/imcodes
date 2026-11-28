@@ -96,7 +96,7 @@ describe('participant owner-parity vs share-invite denial', () => {
     mockSendOutbound.mockResolvedValue(undefined);
   });
 
-  it('ownedDaemonServerId grants whole-server participants owner parity for machine agent config routes', async () => {
+  it('ownedDaemonServerId strictly denies whole-server participants and allows real owners only', async () => {
     const { ownedDaemonServerId } = await import('../src/routes/owned-daemon-request.js');
     const app = new Hono();
     app.get('/test', async (c) => {
@@ -111,9 +111,16 @@ describe('participant owner-parity vs share-invite denial', () => {
       return c.json(resolved);
     });
 
-    const res = await app.request('/test?serverId=srv-shared');
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ serverId: 'srv-shared' });
+    // Whole-server participant: resolveServerRole === 'owner' but resolveServerMembershipRole === 'none' -> 403
+    const denied = await app.request('/test?serverId=srv-shared');
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toEqual({ error: 'forbidden' });
+
+    // Real owner: resolveServerMembershipRole === 'owner' -> 200
+    mockResolveServerMembershipRole.mockResolvedValueOnce('owner');
+    const allowed = await app.request('/test?serverId=srv-shared');
+    expect(allowed.status).toBe(200);
+    expect(await allowed.json()).toEqual({ serverId: 'srv-shared' });
   });
 
   it('serverRoutes blocks whole-server participant rename/delete and blocks participant_daemon on daemon config/binding routes while keeping runtime-config read', async () => {

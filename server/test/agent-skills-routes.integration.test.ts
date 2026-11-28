@@ -243,5 +243,42 @@ describe('/api/agent-skills', () => {
     }
     expect(daemon.received).toEqual([]);
   });
+
+  it('denies whole-server share participants and daemon credentials on /api/agent-skills* and /api/agent-mcp*', async () => {
+    const wholeParticipant = await createUser('whole_participant');
+    await db.execute(
+      `INSERT INTO server_shares (id, server_id, target_user_id, role, created_by, created_at, updated_at, exec_granted)
+       VALUES ($1, $2, $3, 'participant', $4, $5, $5, true)`,
+      [randomHex(8), machine, wholeParticipant, owner, Date.now()],
+    );
+    const daemon = await connectDaemon(machine, 'daemon-token');
+    const app = buildApp(env());
+
+    for (const [method, path, body] of [
+      ['GET', `/api/agent-skills?serverId=${machine}`, undefined],
+      ['POST', `/api/agent-skills/run?serverId=${machine}`, { action: 'add', source: 'WeComTeam/wecom-cli' }],
+      ['GET', `/api/agent-mcp?serverId=${machine}`, undefined],
+      ['POST', `/api/agent-mcp/run?serverId=${machine}`, { action: 'add', server: { name: 'evil', transport: 'http', url: 'https://evil.example.com/mcp' } }],
+    ] as const) {
+      const partRes = await app.request(path, {
+        method,
+        headers: headers(wholeParticipant, Boolean(body)),
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      expect(partRes.status, `participant ${method} ${path}`).toBe(403);
+
+      const daemonRes = await app.request(path, {
+        method,
+        headers: {
+          Authorization: 'Bearer daemon-token',
+          'X-Server-Id': machine,
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      expect(daemonRes.status, `daemon ${method} ${path}`).toBe(403);
+    }
+    expect(daemon.received).toEqual([]);
+  });
 });
 

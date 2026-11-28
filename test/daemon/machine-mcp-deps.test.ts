@@ -431,4 +431,41 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     });
     expect(sendFile).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'srv-stale' }));
   });
+
+  it('allows Owner local computer_use_call even when an ownerMachineAuthority JWT is active, while refusing participant turns', async () => {
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+    const ownerPayload = Buffer.from(JSON.stringify({ type: 'owner-session-machine-authority', sub: 'owner-1' })).toString('base64url');
+    const ownerJwt = `${header}.${ownerPayload}.sig`;
+
+    const localComputerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const listMachines = vi.fn(async () => []);
+    const ownerDeps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => ownerJwt,
+      participantTurnRequired: async () => false,
+      listMachines,
+      localComputerUseCall: localComputerUse as never,
+    });
+
+    await expect(ownerDeps.computerUseCall?.({ machine: 'local', tool: 'list_apps' })).resolves.toMatchObject({ outcome: 'completed' });
+    expect(localComputerUse).toHaveBeenCalledTimes(1);
+    expect(listMachines).not.toHaveBeenCalled();
+
+    const partPayload = Buffer.from(JSON.stringify({ type: 'shared-session-machine-authority', sub: 'part-1' })).toString('base64url');
+    const partJwt = `${header}.${partPayload}.sig`;
+    const partDeps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => partJwt,
+      participantTurnRequired: async () => true,
+      listMachines,
+      localComputerUseCall: localComputerUse as never,
+    });
+
+    await expect(partDeps.computerUseCall?.({ machine: 'local', tool: 'list_apps' })).resolves.toMatchObject({
+      outcome: 'not_dispatched',
+      reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND,
+    });
+    expect(localComputerUse).toHaveBeenCalledTimes(1);
+    expect(listMachines).toHaveBeenCalledTimes(1);
+  });
 });

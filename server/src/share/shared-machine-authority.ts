@@ -23,7 +23,7 @@ import {
   type ControlledMachineOperatorAccessRow,
 } from './machine-access.js';
 
-const AUTHORITY_TTL_SECONDS = 24 * 60 * 60;
+const AUTHORITY_TTL_SECONDS = 300;
 
 function parseTarget(value: unknown): ShareTarget | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;

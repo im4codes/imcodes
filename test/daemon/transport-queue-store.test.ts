@@ -1851,4 +1851,54 @@ describe('dropTaskPairEntries', () => {
       syncStore.close();
     }
   });
+
+  it('keeps ownerMachineAuthority strictly in RAM, never persists it to SQLite, and scrubs legacy rows on open', () => {
+    const dbPath = join(dir, 'owner-authority-ram-only.sqlite');
+    const recipient = { sessionInstanceId: 'inst-1', runtimeEpoch: 'epoch-1' };
+    const ownerJwt = 'eyJ.owner.machine.authority.never.on.disk';
+    const ramStore = new TransportQueueStore({ dbPath });
+    ramStore.enqueue({
+      sessionName: 'ram-target',
+      clientMessageId: 'msg-owner-1',
+      text: 'owner task',
+      recipient,
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: 'msg-owner-1',
+        text: 'owner task',
+        ownerMachineAuthority: ownerJwt,
+        deliveryMode: 'append',
+      }),
+    });
+
+    // Available in RAM during the same daemon lifetime:
+    const inRam = ramStore.readPrivateDispatchMaterial('ram-target', 'msg-owner-1', recipient);
+    expect(JSON.parse(inRam!).ownerMachineAuthority).toBe(ownerJwt);
+
+    // Trigger markAppendFallback and verify SQLite still stores zero ownerMachineAuthority:
+    ramStore.markAppendFallback('ram-target', 'msg-owner-1', 'unsupported', recipient);
+    const rawDb = (ramStore as unknown as { db: InstanceType<typeof DatabaseSync> }).db;
+    const rawRows = rawDb.prepare('SELECT material_json FROM queue_private_material WHERE session_name = ?').all('ram-target') as Array<{ material_json: string }>;
+    expect(rawRows).toHaveLength(1);
+    expect(rawRows[0]!.material_json).not.toContain(ownerJwt);
+    expect(rawRows[0]!.material_json).not.toContain('ownerMachineAuthority');
+    ramStore.close();
+
+    // Seed a legacy SQLite row containing ownerMachineAuthority and verify reopening scrubs it:
+    const legacyWriter = new DatabaseSync(dbPath);
+    legacyWriter.prepare(
+      'INSERT OR REPLACE INTO queue_private_material (session_name, client_message_id, material_json, updated_at, recipient_session_instance_id, recipient_runtime_epoch) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run('ram-target', 'msg-legacy', JSON.stringify({ text: 'old', ownerMachineAuthority: 'legacy-disk-jwt' }), 1, 'inst-1', 'epoch-1');
+    legacyWriter.close();
+
+    const reopened = new TransportQueueStore({ dbPath });
+    try {
+      expect(reopened.readPrivateDispatchMaterial('ram-target', 'msg-owner-1', recipient)).not.toContain('ownerMachineAuthority');
+      const scrubbed = reopened.readPrivateDispatchMaterial('ram-target', 'msg-legacy', recipient);
+      expect(scrubbed).toBeDefined();
+      expect(scrubbed).not.toContain('legacy-disk-jwt');
+      expect(scrubbed).not.toContain('ownerMachineAuthority');
+    } finally {
+      reopened.close();
+    }
+  });
 });

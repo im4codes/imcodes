@@ -283,7 +283,7 @@ describe('controlled-node sharing reuses grants without becoming a shared Tab', 
     expect(promote.status).toBe(200);
     const participantList = await app.request('/api/machines', { headers: webAuth(recipientId) });
     expect(await participantList.json()).toEqual({
-      machines: [expect.objectContaining({ serverId, accessRole: 'participant', execEnabled: true })],
+      machines: [expect.objectContaining({ serverId, accessRole: 'participant', execEnabled: false, execGranted: false })],
     });
 
     const nonOwnerManage = await app.request(`/api/server/${serverId}/shares`, {
@@ -1060,10 +1060,11 @@ describe('a shared-session participant reaches only the machines shared with the
     expect(await listed(t.app, t.delegated)).toContain(node);
     expect((await computerUse(t.app, t.ownerTurn, node)).status).toBe(403);
     expect((await computerUse(t.app, t.delegated, node)).status).toBe(200);
-    expect((await exec(t.app, t.delegated, node)).status).toBe(200);
-    expect((await fileHandle(t.app, t.delegated, node)).status).toBe(503);
+    // Group membership alone grants operate/view + FILE_LIST, not execute without an explicit exec_granted share.
+    expect((await exec(t.app, t.delegated, node)).status).toBe(403);
+    expect((await fileHandle(t.app, t.delegated, node)).status).toBe(403);
     const browser = await (await t.app.request('/api/machines', { headers: webAuth(t.participantId) })).json();
-    expect(browser.machines.find((m: {serverId: string}) => m.serverId === node)).toMatchObject({ accessRole: 'participant', canExecute: true, execEnabled: true, execGranted: false, accessSource: 'group' });
+    expect(browser.machines.find((m: {serverId: string}) => m.serverId === node)).toMatchObject({ accessRole: 'participant', canExecute: false, execEnabled: false, execGranted: false, accessSource: 'group' });
     expect(browser.machines.find((m: {serverId: string}) => m.serverId === node).canRename === true).toBe(role !== 'member');
     expect((await t.app.request(`/api/machines/${node}/display-name`, { method:'POST',headers:webAuth(t.participantId),body:JSON.stringify({displayName:'Group label'}) })).status).toBe(role === 'member' ? 404 : 200);
     for (const action of ['exec-enabled', 'upgrade', 'remote-desktop-worker', 'revoke']) {
@@ -1093,7 +1094,7 @@ describe('a shared-session participant reaches only the machines shared with the
       const view = await client.callTool({name:MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,arguments:{machine:nodeId,tool:'list_apps'}});
       expect(view.isError,JSON.stringify(view)).not.toBe(true);
       const execute = await client.callTool({name:MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,arguments:{machine:nodeId,command:'echo no-dispatch'}});
-      expect(execute.isError,JSON.stringify(execute)).not.toBe(true); // group participants execute without an extra grant
+      expect(execute.isError).toBe(true); // group participants without exec_granted are refused execute actions
       const viewer = await createMachineGrant({ownerId:peer,recipientId:t.participantId,serverId:node,role:'viewer'});
       expect((await computerUse(t.app,t.delegated,node)).status).toBe(200);
       expect(await listed(t.app,t.delegated)).toContain(node); // participant group grant outranks direct viewer
@@ -1149,16 +1150,16 @@ describe('a shared-session participant reaches only the machines shared with the
     }
   });
 
-  it('participant-origin exec_remote follows group membership without an extra grant', async () => {
+  it('participant-origin exec_remote requires explicit exec_granted while view keeps group access', async () => {
     const t = await scene();
     for (const target of [t.participantShared, t.grouped]) {
       // Read-only computer use follows the participant's own access (a machine share, or the group)...
       expect((await computerUse(t.app, t.delegated, target)).status, `computer-use ${target}`).toBe(200);
-      // Both direct participant grant and group membership reach the offline
-      // node (503), not a policy refusal.
+      const expectedExecStatus = target === t.participantShared ? 200 : 403;
+      const expectedFileStatus = target === t.participantShared ? 503 : 403;
       const execResult = await exec(t.app, t.delegated, target);
-      expect(execResult.status, `exec ${target}`).toBe(200);
-      expect((await fileHandle(t.app, t.delegated, target)).status, `file ${target}`).toBe(503);
+      expect(execResult.status, `exec ${target}`).toBe(expectedExecStatus);
+      expect((await fileHandle(t.app, t.delegated, target)).status, `file ${target}`).toBe(expectedFileStatus);
     }
   });
 
@@ -1193,15 +1194,16 @@ describe('a shared-session participant reaches only the machines shared with the
     expect((await exec(t.app, t.ownerTurn, t.participantShared)).status).toBe(200);
   });
 
-  it('expiry or revocation of a direct share preserves independent live group execute coverage', async () => {
+  it('expiry or revocation of a direct share preserves independent live group view coverage while dropping execute grant', async () => {
     const t = await scene();
     const share = await createMachineGrant({ ownerId: t.ownerId, recipientId: t.participantId, serverId: t.grouped, role: 'participant' });
     expect((await computerUse(t.app, t.delegated, t.grouped)).status).toBe(200);
+    expect((await fileHandle(t.app, t.delegated, t.grouped)).status).toBe(503);
     expect(await listed(t.app, t.delegated)).toContain(t.grouped);
     for (const field of ['expires_at', 'revoked_at'] as const) {
       await db.execute(`UPDATE server_shares SET expires_at = $2, revoked_at = $3 WHERE id = $1`, [share.id, field === 'expires_at' ? Date.now() - 1 : null, field === 'revoked_at' ? Date.now() : null]);
       expect((await computerUse(t.app, t.delegated, t.grouped)).status).toBe(200);
-      expect((await fileHandle(t.app, t.delegated, t.grouped)).status).toBe(503);
+      expect((await fileHandle(t.app, t.delegated, t.grouped)).status).toBe(403);
       expect(await listed(t.app, t.delegated)).toContain(t.grouped);
     }
     expect((await computerUse(t.app, t.ownerTurn, t.grouped)).status).toBe(200);

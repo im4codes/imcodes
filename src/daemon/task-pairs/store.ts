@@ -279,6 +279,11 @@ export class TaskPairStore {
   #activeIndex: ActivePairIndex | undefined;
   readonly #livenessDbWriteAt = new Map<string, number>();
   /**
+   * Owner machine authority JWTs stay strictly in daemon RAM (never persisted to SQLite).
+   * After daemon restart they are absent and fail closed on shared hosts.
+   */
+  readonly #ownerPrivateAuthorities = new Map<string, { authority: string; updatedAt: number }>();
+  /**
    * Activity stamps not yet written: the newest liveness of each pair whose
    * last stamp was deferred. Every read overlays it, so a reader (or a state
    * change that re-reads the pair) never sees an older stamp than memory has;
@@ -401,6 +406,8 @@ export class TaskPairStore {
         if (!columns.some((column) => column.name === 'details_json')) throw error;
       }
     }
+    // Scrub any legacy plaintext owner machine authority JWT rows persisted by older daemons.
+    this.#db.exec("DELETE FROM task_pair_private_authority WHERE kind != 'participant'");
   }
 
   close(): void {
@@ -410,6 +417,7 @@ export class TaskPairStore {
     this.#activeIndex = undefined;
     this.#livenessDbWriteAt.clear();
     this.#pendingLiveness.clear();
+    this.#ownerPrivateAuthorities.clear();
     this.#db.close();
   }
 
@@ -1069,6 +1077,13 @@ export class TaskPairStore {
     this.#db.prepare(
       'DELETE FROM task_pair_private_authority WHERE NOT EXISTS (SELECT 1 FROM task_pairs WHERE task_pairs.project = task_pair_private_authority.project AND task_pairs.task_id = task_pair_private_authority.task_id)',
     ).run();
+    for (const key of this.#ownerPrivateAuthorities.keys()) {
+      const sep = key.indexOf('\u0000');
+      const project = sep >= 0 ? key.slice(0, sep) : '';
+      const taskId = sep >= 0 ? key.slice(sep + 1) : '';
+      const exists = this.#db.prepare('SELECT 1 FROM task_pairs WHERE project = ? AND task_id = ?').get(project, taskId);
+      if (!exists) this.#ownerPrivateAuthorities.delete(key);
+    }
     this.#activeIndex = undefined;
   }
 
@@ -1086,6 +1101,7 @@ export class TaskPairStore {
   ): void {
     const now = entry.updatedAt ?? Date.now();
     if (entry.kind === 'participant') {
+      this.#ownerPrivateAuthorities.delete(pairKey(project, taskId));
       const actorUserId = entry.actorUserId.trim() || 'participant';
       const authority = typeof entry.authority === 'string' && entry.authority.trim() ? entry.authority.trim() : null;
       this.#db.prepare(`
@@ -1101,24 +1117,17 @@ export class TaskPairStore {
     }
     const authority = entry.authority.trim();
     if (!authority) return;
-    this.#db.prepare(`
-      INSERT INTO task_pair_private_authority (project, task_id, kind, actor_user_id, authority, updated_at)
-      VALUES (?, ?, 'owner', NULL, ?, ?)
-      ON CONFLICT (project, task_id) DO UPDATE SET
-        kind = 'owner',
-        actor_user_id = NULL,
-        authority = excluded.authority,
-        updated_at = excluded.updated_at
-      WHERE task_pair_private_authority.kind != 'participant'
-    `).run(project, taskId, authority, now);
+    const existing = this.#db.prepare('SELECT kind FROM task_pair_private_authority WHERE project = ? AND task_id = ?')
+      .get(project, taskId) as { kind?: string } | undefined;
+    if (existing?.kind === 'participant') return;
+    this.#ownerPrivateAuthorities.set(pairKey(project, taskId), { authority, updatedAt: now });
   }
 
   getPrivateAuthority(project: string, taskId: string): TaskPairPrivateAuthority | undefined {
     const row = this.#db.prepare('SELECT kind, actor_user_id, authority, updated_at FROM task_pair_private_authority WHERE project = ? AND task_id = ?')
       .get(project, taskId) as { kind: string; actor_user_id: string | null; authority: string | null; updated_at: number } | undefined;
-    if (!row) return undefined;
-    const updatedAt = Number(row.updated_at ?? 0);
-    if (row.kind === 'participant') {
+    if (row?.kind === 'participant') {
+      const updatedAt = Number(row.updated_at ?? 0);
       return {
         kind: 'participant',
         actorUserId: typeof row.actor_user_id === 'string' && row.actor_user_id.trim() ? row.actor_user_id.trim() : 'participant',
@@ -1126,11 +1135,12 @@ export class TaskPairStore {
         updatedAt,
       };
     }
-    if (row.kind === 'owner' && typeof row.authority === 'string' && row.authority.trim()) {
+    const inMemoryOwner = this.#ownerPrivateAuthorities.get(pairKey(project, taskId));
+    if (inMemoryOwner) {
       return {
         kind: 'owner',
-        authority: row.authority.trim(),
-        updatedAt,
+        authority: inMemoryOwner.authority,
+        updatedAt: inMemoryOwner.updatedAt,
       };
     }
     return undefined;

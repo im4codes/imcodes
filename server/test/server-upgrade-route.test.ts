@@ -9,6 +9,7 @@ const mockRequestDaemonUpgrade = vi.fn();
 const mockDaemonUpgradeStatus = vi.fn();
 const mockDeleteServer = vi.fn();
 const mockResolveServerRole = vi.fn();
+const mockResolveServerMembershipRole = vi.fn();
 const mockGetServerById = vi.fn();
 const mockResolveControlledMachineManagementAccess = vi.fn();
 const mockWsBridgeFind = vi.fn();
@@ -20,6 +21,7 @@ vi.mock('../src/security/authorization.js', () => ({
     await next();
   },
   resolveServerRole: (...args: unknown[]) => mockResolveServerRole(...args),
+  resolveServerMembershipRole: (...args: unknown[]) => mockResolveServerMembershipRole(...args),
 }));
 
 vi.mock('../src/share/machine-access.js', () => ({
@@ -96,6 +98,7 @@ describe('server routes', () => {
     });
     mockDeleteServer.mockResolvedValue(true);
     mockResolveServerRole.mockResolvedValue('owner');
+    mockResolveServerMembershipRole.mockResolvedValue('owner');
     mockGetServerById.mockResolvedValue({ id: 'srv-1', user_id: 'user-1', name: 'Alpha' });
     mockResolveControlledMachineManagementAccess.mockResolvedValue(null);
     mockWsBridgeFind.mockReturnValue(undefined);
@@ -282,13 +285,22 @@ describe('server routes', () => {
   });
 
   it('does not let a user without a server role force an upgrade', async () => {
-    mockResolveServerRole.mockResolvedValueOnce('none');
+    mockResolveServerMembershipRole.mockResolvedValueOnce('none');
     const app = await buildTestApp();
     const res = await app.request('/api/server/srv-1/upgrade', {
       method: 'POST',
       body: JSON.stringify({ force: true }),
       headers: { 'content-type': 'application/json' },
     });
+    expect(res.status).toBe(404);
+    expect(mockRequestDaemonUpgrade).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whole-server share participant on POST /:id/upgrade even when resolveServerRole returns owner', async () => {
+    mockResolveServerRole.mockResolvedValueOnce('owner');
+    mockResolveServerMembershipRole.mockResolvedValueOnce('none');
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/upgrade', { method: 'POST' });
     expect(res.status).toBe(404);
     expect(mockRequestDaemonUpgrade).not.toHaveBeenCalled();
   });
@@ -307,7 +319,7 @@ describe('server routes', () => {
   });
 
   it('rejects a user with neither membership nor a shared-server operator grant', async () => {
-    mockResolveServerRole.mockResolvedValueOnce('none');
+    mockResolveServerMembershipRole.mockResolvedValueOnce('none');
     const app = await buildTestApp();
 
     const res = await app.request('/api/server/srv-1/upgrade', { method: 'POST' });

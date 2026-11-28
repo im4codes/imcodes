@@ -23,6 +23,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
 import { activeHookPort } from '../daemon/hook-server.js';
+import { HOOK_SESSION_CREDENTIAL_ENV, HOOK_SESSION_CREDENTIAL_HEADER } from '../../shared/hook-session-credential.js';
 
 function imcodesDir(): string { return resolveImcodesHome(); }
 function ccSettingsPath(): string { return path.join(os.homedir(), '.claude', 'settings.json'); }
@@ -84,7 +85,7 @@ case "$SESSION_NAME" in
 esac`;
 
 const CURL_BASE = (port: number) =>
-  `curl -s -X POST "http://127.0.0.1:${port}/notify" \\\n  -H "Content-Type: application/json"`;
+  `curl -s -X POST "http://127.0.0.1:${port}/notify" \\\n  -H "Content-Type: application/json" \\\n  -H "${HOOK_SESSION_CREDENTIAL_HEADER}: \${${HOOK_SESSION_CREDENTIAL_ENV}:-}"`;
 
 function buildStopScript(port: number): string {
   return `#!/bin/bash
@@ -179,8 +180,9 @@ const WIN_POST = (port: number) =>
   `async function post(body) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), 2000);
+  const cred = process.env[${JSON.stringify(HOOK_SESSION_CREDENTIAL_ENV)}] || '';
   try { await fetch('http://127.0.0.1:${port}/notify', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...(cred ? { ${JSON.stringify(HOOK_SESSION_CREDENTIAL_HEADER)}: cred } : {}) },
     body: JSON.stringify(body), signal: ac.signal,
   }); } catch {} finally { clearTimeout(t); }
 }`;

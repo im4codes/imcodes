@@ -25,7 +25,7 @@ const REQUEST_TIMEOUT_MS = 30_000;
 
 export const agentMcpRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
-agentMcpRoutes.get('/agent-mcp', requireAuth(), async (c) => {
+agentMcpRoutes.get('/agent-mcp', requireAuth({ refuseDaemonCredential: true }), async (c) => {
   const target = await ownedDaemonServerId(c);
   if ('response' in target) return target.response;
   const answer = await askOwnedDaemon(
@@ -40,7 +40,7 @@ agentMcpRoutes.get('/agent-mcp', requireAuth(), async (c) => {
   });
 });
 
-agentMcpRoutes.post('/agent-mcp/run', requireAuth(), async (c) => {
+agentMcpRoutes.post('/agent-mcp/run', requireAuth({ refuseDaemonCredential: true }), async (c) => {
   const request = readAgentMcpRunRequest(await c.req.json().catch(() => null));
   if (!request) return c.json({ error: AGENT_MCP_ERROR.INVALID_REQUEST }, 400);
   const target = await ownedDaemonServerId(c);

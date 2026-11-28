@@ -31,7 +31,7 @@ const RUN_TIMEOUT_MS = AGENT_SKILLS_LIMITS.RUN_TIMEOUT_MS + 30_000;
 
 export const agentSkillsRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
-agentSkillsRoutes.get('/agent-skills', requireAuth(), async (c) => {
+agentSkillsRoutes.get('/agent-skills', requireAuth({ refuseDaemonCredential: true }), async (c) => {
   const target = await ownedDaemonServerId(c);
   if ('response' in target) return target.response;
   const answer = await askOwnedDaemon(
@@ -43,7 +43,7 @@ agentSkillsRoutes.get('/agent-skills', requireAuth(), async (c) => {
   return c.json({ skills: Array.isArray(answer.reply.skills) ? answer.reply.skills : [] });
 });
 
-agentSkillsRoutes.post('/agent-skills/run', requireAuth(), async (c) => {
+agentSkillsRoutes.post('/agent-skills/run', requireAuth({ refuseDaemonCredential: true }), async (c) => {
   const request = readAgentSkillsRunRequest(await c.req.json().catch(() => null));
   if (!request) return c.json({ error: AGENT_SKILLS_ERROR.INVALID_REQUEST }, 400);
   const target = await ownedDaemonServerId(c);

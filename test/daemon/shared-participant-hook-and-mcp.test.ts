@@ -682,6 +682,69 @@ describe('hook-server shared participant isolation', () => {
       clearProcessSharedMachineAuthoritiesForTests();
     }
   });
+
+  it('prevents unauthenticated local POST /notify idle from clearing an active participant authority window', async () => {
+    const {
+      bindProcessSharedMachineActivity,
+      clearProcessSharedMachineAuthoritiesForTests,
+      readProcessSharedMachineAuthority,
+    } = await import('../../src/daemon/shared-machine-authority-context.js');
+    clearProcessSharedMachineAuthoritiesForTests();
+    const sessionName = 'deck_shared_cc';
+    sessionsMap.set(sessionName, {
+      name: sessionName,
+      projectName: 'proj-shared',
+      agentType: 'claude-code',
+      state: 'running',
+      sessionInstanceId: 'inst-cc',
+      runtimeEpoch: 'epoch-cc',
+      hookCredential: 'secret-hook-cred-cc',
+    } as never);
+    bindProcessSharedMachineActivity(
+      sessionName,
+      { sessionInstanceId: 'inst-cc', runtimeEpoch: 'epoch-cc' },
+      {
+        kind: 'participant',
+        actorUserId: 'participant_user_1',
+        authority: 'sma.jwt.part.cc',
+      },
+    );
+
+    const postNotify = (extraHeaders: Record<string, string> = {}) =>
+      new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const payload = JSON.stringify({ event: 'idle', session: sessionName });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port,
+          path: '/notify',
+          method: 'POST',
+          agent: false,
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), ...extraHeaders },
+        }, (res) => {
+          let raw = '';
+          res.on('data', (c) => { raw += c; });
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, body: raw }));
+        });
+        req.on('error', reject);
+        req.end(payload);
+      });
+
+    // Unauthenticated POST /notify (no x-imcodes-hook-credential) is rejected with 403 and leaves participant window intact.
+    const spoofRes = await postNotify();
+    expect(spoofRes.status).toBe(403);
+    expect(onHook).not.toHaveBeenCalled();
+    expect(readProcessSharedMachineAuthority(sessionName, { sessionInstanceId: 'inst-cc', runtimeEpoch: 'epoch-cc' })).toEqual({
+      required: true,
+      authority: 'sma.jwt.part.cc',
+    });
+
+    // Authenticated POST /notify with matching x-imcodes-hook-credential succeeds cleanly.
+    const validRes = await postNotify({ [HOOK_SESSION_CREDENTIAL_HEADER]: 'secret-hook-cred-cc' });
+    expect(validRes.status).toBe(200);
+    expect(validRes.body).toBe('ok');
+    expect(onHook).toHaveBeenCalledWith(expect.objectContaining({ event: 'idle', session: sessionName }));
+    clearProcessSharedMachineAuthoritiesForTests();
+  });
 });
 
 describe('daemon MCP HTTP clients propagate shared-machine authority and fail closed on loader failure', () => {
