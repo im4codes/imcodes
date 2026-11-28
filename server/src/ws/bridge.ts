@@ -49,8 +49,19 @@ import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { SHARE_MESSAGE_LANE, SHARE_MESSAGE_LANE_MAX_PENDING, shareBrowserMessageLane, type ShareMessageLane } from './share-lanes.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
-import { issueOwnerMachineAuthorityForSession, issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
-import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD, SHARE_PROCESS_INPUT_COMMANDS } from '../../../shared/shared-machine-authority.js';
+import {
+  isTurnAuthorityGrantActive,
+  issueOwnerMachineAuthorityForSession,
+  issueSharedMachineAuthorityForSession,
+  revokeAllTurnAuthorityGrantsForServer,
+  revokeTurnAuthorityGrantByHash,
+} from '../share/shared-machine-authority.js';
+import {
+  OWNER_MACHINE_AUTHORITY_FIELD,
+  SHARED_MACHINE_AUTHORITY_FIELD,
+  SHARE_PROCESS_INPUT_COMMANDS,
+  isTurnAuthorityRevokeMessage,
+} from '../../../shared/shared-machine-authority.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { TERMINAL_CONTROL, TERMINAL_STREAM_RESET_REASON } from '../../../shared/terminal-protocol.js';
@@ -6240,6 +6251,7 @@ export class WsBridge {
       // old socket's identity-guarded close handler cannot see or drain them.
       this.rejectAllPendingFileTransfers('daemon_disconnected');
       defaultPortForwardRouter.onDaemonDisconnected(this.serverId, replacedGeneration);
+      revokeAllTurnAuthorityGrantsForServer(this.serverId);
       try { this.daemonWs.close(1001, 'replaced'); } catch { /* ignore */ }
     }
     this.daemonWs = ws;
@@ -7144,6 +7156,13 @@ export class WsBridge {
         return;
       }
 
+      if (msg.type === DAEMON_MSG.TURN_AUTHORITY_REVOKE) {
+        if (isTurnAuthorityRevokeMessage(msg)) {
+          revokeTurnAuthorityGrantByHash(this.serverId, msg.rootSessionName, msg.tokenHash);
+        }
+        return;
+      }
+
       if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
         if (!this.handleDaemonUpgradeBlocked(msg, ws)) return;
       }
@@ -7293,6 +7312,7 @@ export class WsBridge {
         this.rejectAllPendingPreviewRequests('daemon_disconnected');
         this.rejectAllPendingOpenSpecAutoDeliverRequests('daemon_offline');
         defaultPortForwardRouter.onDaemonDisconnected(this.serverId, connectionGeneration);
+        revokeAllTurnAuthorityGrantsForServer(this.serverId);
         // Close all preview WS tunnels — daemon is gone
         this.closeAllPreviewWsTunnels(1001, 'daemon disconnected');
         // Clear provider statuses — daemon is gone, providers are unreachable
@@ -8572,10 +8592,16 @@ export class WsBridge {
     }
     const cached = perSession.get(sessionName);
     const now = shareClockNow();
-    // A clock that went backwards never extends the window. A failed mint is
-    // remembered for the window too (token null): a session the server cannot
-    // bind must not turn every keystroke into a DB read.
-    if (cached && now >= cached.at && now - cached.at < SHARE_INPUT_AUTHORITY_REUSE_MS) return cached.token;
+    // A clock that went backwards never extends the window, and a grant that was
+    // revoked or replaced on the server is never re-issued from cache. A failed
+    // mint is remembered for the window (token null): a session the server
+    // cannot bind must not turn every keystroke into a DB read.
+    if (
+      cached
+      && now >= cached.at
+      && now - cached.at < SHARE_INPUT_AUTHORITY_REUSE_MS
+      && (cached.token === null || isTurnAuthorityGrantActive(cached.token, now))
+    ) return cached.token;
     const inFlight = this.shareInputAuthorityMints.get(ws)?.get(sessionName);
     if (inFlight) return inFlight;
     const run = this.issueShareMachineAuthority(actor, sessionName)
@@ -8617,7 +8643,12 @@ export class WsBridge {
     }
     const cached = perSession.get(sessionName);
     const now = shareClockNow();
-    if (cached && now >= cached.at && now - cached.at < SHARE_INPUT_AUTHORITY_REUSE_MS) return cached.token;
+    if (
+      cached
+      && now >= cached.at
+      && now - cached.at < SHARE_INPUT_AUTHORITY_REUSE_MS
+      && (cached.token === null || isTurnAuthorityGrantActive(cached.token, now))
+    ) return cached.token;
     const inFlight = this.ownerInputAuthorityMints.get(ws)?.get(sessionName);
     if (inFlight) return inFlight;
     const db = this.db;

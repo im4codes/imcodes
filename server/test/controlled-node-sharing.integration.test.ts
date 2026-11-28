@@ -1405,10 +1405,16 @@ describe('a shared-session participant reaches only the machines shared with the
     const otherId = `resume-${hex(4)}`;
     await createUser(db, otherId);
     await createMachineGrant({ ownerId: t.ownerId, recipientId: otherId, serverId: t.participantShared, role: 'participant' });
-    const shareTarget = { kind: 'main' as const, serverId: t.source.serverId, sessionName: t.sessionName };
+    const otherSessionName = `deck_actor2_${hex(4)}_brain`;
+    await db.execute(
+      `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, project_dir, state, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,'executor','codex-sdk','/tmp/shared2','idle',$5,$5)`,
+      [hex(16), t.source.serverId, otherSessionName, `actor2-proj-${hex(4)}`, Date.now()],
+    );
+    const shareTarget = { kind: 'main' as const, serverId: t.source.serverId, sessionName: otherSessionName };
     await createOrUpdateShare(db, { id: `share_${hex(8)}`, target: shareTarget, targetUserId: otherId, role: 'participant', createdBy: t.ownerId, expiresAt: null, now: Date.now() });
     const otherAuthority = await issueSharedMachineAuthorityForSession(db, { actorUserId: otherId, sourceServerId: t.source.serverId,
-      sessionName: t.sessionName, shareTarget, actionId: `action-${hex(4)}`, signingKey: JWT_KEY });
+      sessionName: otherSessionName, shareTarget, actionId: `action-${hex(4)}`, signingKey: JWT_KEY });
     const second = { ...t.delegated, [SHARED_MACHINE_AUTHORITY_HEADER]: otherAuthority! };
     const clientUploadId = hex(32);
     const chunk = async (headers: Record<string, string>, offset: number) => {

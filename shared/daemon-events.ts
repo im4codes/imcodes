@@ -30,6 +30,8 @@ export const DAEMON_MSG = {
    * shared/controlled-node-host-link.ts.
    */
   CONTROLLED_NODE_LOCAL_DAEMONS: 'controlled_node.local_daemons',
+  /** FULL daemon → server: immediately delete this tree's active in-memory turn grant when the tree goes idle. */
+  TURN_AUTHORITY_REVOKE: 'turn_authority.revoke',
 } as const;
 
 export type DaemonMessageType = (typeof DAEMON_MSG)[keyof typeof DAEMON_MSG];

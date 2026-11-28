@@ -37,6 +37,7 @@ export const BASE_REDACTION_PATTERNS: RedactionPattern[] = [
   { type: 'slack', re: /\bxox[abps]-[0-9A-Za-z-]{10,}\b/g },
   { type: 'stripe', re: /\b(?:sk|rk)_live_[0-9A-Za-z]{24,}\b/g },
   { type: 'openai_session', re: /\bsess-[0-9A-Za-z]{20,}\b/g },
+  { type: 'turn_grant', re: /\btrg_[A-Za-z0-9_-]{16,}\b/g },
   { type: 'hex40', re: /\b[0-9a-f]{40}\b/g },
   { type: 'base64', re: /(?<![A-Za-z0-9+/])(?:[A-Za-z0-9+/]{64,}={0,2})(?![A-Za-z0-9+/])/g },
 ];

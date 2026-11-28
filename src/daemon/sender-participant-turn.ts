@@ -8,7 +8,11 @@
  */
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
-import { readProcessSharedMachineAuthority, readProcessSharedMachineParticipants } from './shared-machine-authority-context.js';
+import {
+  readActiveTreeAuthorityForSession,
+  readProcessSharedMachineAuthority,
+  readProcessSharedMachineParticipants,
+} from './shared-machine-authority-context.js';
 
 export interface SenderParticipantTurn {
   /** The participant that started the turn; a placeholder when several users fed it. */
@@ -24,33 +28,74 @@ export function readSenderParticipantTurn(senderSessionName: string | null | und
   if (!senderSessionName) return null;
   const record = getSession(senderSessionName);
   if (!record) return null;
+  const tree = readActiveTreeAuthorityForSession(senderSessionName);
   const runtime = getTransportRuntime(senderSessionName);
   if (runtime) {
     // Every real runtime has these; a runtime-shaped stand-in that lacks them reads as an owner turn instead of failing the send.
-    if (!runtime.requiresSharedMachineAuthority?.()) return null;
-    // Everything that fed the current turn counts, including a participant's message appended into a running owner turn.
-    const actors = new Set(runtime.activeTurnParticipantUserIds?.()
-      ?? (runtime.activeDispatchEntries ?? [])
-        .filter((entry) => entry.sharedActor?.effectiveActorRole === 'participant')
-        .map((entry) => entry.sharedActor!.actorUserId)
-        .filter((id) => typeof id === 'string' && id));
-    return {
-      actorUserId: actors.size === 1 ? [...actors][0]! : AMBIGUOUS_PARTICIPANT_ACTOR,
-      authority: runtime.getActiveSharedMachineAuthority?.() ?? null,
-    };
+    if (runtime.requiresSharedMachineAuthority?.()) {
+      const actors = new Set(runtime.activeTurnParticipantUserIds?.()
+        ?? (runtime.activeDispatchEntries ?? [])
+          .filter((entry) => entry.sharedActor?.effectiveActorRole === 'participant')
+          .map((entry) => entry.sharedActor!.actorUserId)
+          .filter((id) => typeof id === 'string' && id));
+      const localAuthority = runtime.getActiveSharedMachineAuthority?.() ?? null;
+      if (tree?.kind === 'mixed') {
+        return { actorUserId: AMBIGUOUS_PARTICIPANT_ACTOR, authority: null };
+      }
+      if (!localAuthority) {
+        return {
+          actorUserId: actors.size === 1 ? [...actors][0]! : AMBIGUOUS_PARTICIPANT_ACTOR,
+          authority: null,
+        };
+      }
+      return {
+        actorUserId: actors.size === 1 ? [...actors][0]! : (tree?.actorUserId ?? AMBIGUOUS_PARTICIPANT_ACTOR),
+        authority: tree?.kind === 'participant' ? tree.authority : localAuthority,
+      };
+    }
+    if (tree?.kind === 'participant' || tree?.kind === 'mixed') {
+      return {
+        actorUserId: tree.actorUserId ?? AMBIGUOUS_PARTICIPANT_ACTOR,
+        authority: tree.kind === 'participant' ? tree.authority : null,
+      };
+    }
+    return null;
   }
-  if (!record.sessionInstanceId || !record.runtimeEpoch) return null;
+  if (!record.sessionInstanceId || !record.runtimeEpoch) {
+    if (tree?.kind === 'participant' || tree?.kind === 'mixed') {
+      return {
+        actorUserId: tree.actorUserId ?? AMBIGUOUS_PARTICIPANT_ACTOR,
+        authority: tree.kind === 'participant' ? tree.authority : null,
+      };
+    }
+    return null;
+  }
   const process = readProcessSharedMachineAuthority(
     senderSessionName,
     { sessionInstanceId: record.sessionInstanceId, runtimeEpoch: record.runtimeEpoch },
     Date.now(),
     record.state === 'running',
   );
-  if (!process.required) return null;
+  if (!process.required) {
+    if (tree?.kind === 'participant' || tree?.kind === 'mixed') {
+      return {
+        actorUserId: tree.actorUserId ?? AMBIGUOUS_PARTICIPANT_ACTOR,
+        authority: tree.kind === 'participant' ? tree.authority : null,
+      };
+    }
+    return null;
+  }
+  if (!process.authority || tree?.kind === 'mixed') {
+    const actors = readProcessSharedMachineParticipants(senderSessionName);
+    return {
+      actorUserId: actors.length === 1 ? actors[0]! : AMBIGUOUS_PARTICIPANT_ACTOR,
+      authority: null,
+    };
+  }
   const actors = readProcessSharedMachineParticipants(senderSessionName);
   return {
-    actorUserId: actors.length === 1 ? actors[0]! : AMBIGUOUS_PARTICIPANT_ACTOR,
-    authority: process.authority,
+    actorUserId: actors.length === 1 ? actors[0]! : (tree?.actorUserId ?? AMBIGUOUS_PARTICIPANT_ACTOR),
+    authority: tree?.kind === 'participant' ? tree.authority : process.authority,
   };
 }
 
@@ -63,6 +108,8 @@ export function readSenderOwnerMachineAuthority(senderSessionName: string | null
   if (readSenderParticipantTurn(senderSessionName)) return null;
   const record = getSession(senderSessionName);
   if (!record) return null;
+  const tree = readActiveTreeAuthorityForSession(senderSessionName);
+  if (tree?.kind === 'owner' && tree.authority) return tree.authority;
   const runtime = getTransportRuntime(senderSessionName);
   if (runtime) {
     return runtime.getActiveOwnerMachineAuthority?.() ?? null;

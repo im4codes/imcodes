@@ -66,6 +66,7 @@ export interface DaemonMachineToolDepsOverrides {
   resourceOwner?: SessionResourceOwnerIdentity | null;
   loadSharedMachineAuthority?: () => Promise<string | null>;
   participantTurnRequired?: () => Promise<boolean>;
+  isOwnerTurnAuthority?: () => Promise<boolean>;
 }
 
 function isOwnerMachineAuthorityToken(token: string | null): boolean {
@@ -370,9 +371,18 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
           return true;
         }
       })();
-      // Owner local tools remain local (even when an owner-turn JWT is active).
+      // Owner local tools remain local (even when an owner-turn tree grant is active).
       // A participant turn or non-owner authority NEVER falls back to the owner's local backend.
-      const allowLocalByAuthority = !sharedMachineAuthority || isOwnerMachineAuthorityToken(sharedMachineAuthority);
+      const isOwnerTurn = overrides.isOwnerTurnAuthority
+        ? await (async () => {
+            try {
+              return (await overrides.isOwnerTurnAuthority!()) === true;
+            } catch {
+              return false;
+            }
+          })()
+        : isOwnerMachineAuthorityToken(sharedMachineAuthority);
+      const allowLocalByAuthority = !sharedMachineAuthority || isOwnerTurn;
       if (isLocalComputerUseTarget(machine, creds) && allowLocalByAuthority && !participantTurn) {
         return localComputerUse({
           tool,

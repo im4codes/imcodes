@@ -1,11 +1,10 @@
+import { createHash, randomBytes } from 'node:crypto';
 import type { Database } from '../db/client.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
 import { isSharedOrContributedServer, isWholeServerShareUser } from '../security/server-share-boundary.js';
-import { signJwt, verifyJwt } from '../security/crypto.js';
 import { isUserStatusActive } from '../../../shared/user-status.js';
 import {
-  OWNER_MACHINE_AUTHORITY_TYPE,
-  SHARED_MACHINE_AUTHORITY_TYPE,
+  TURN_AUTHORITY_TOKEN_PREFIX,
   type OwnerMachineAuthorityClaims,
   type SharedMachineAuthorityClaims,
 } from '../../../shared/shared-machine-authority.js';
@@ -23,37 +22,212 @@ import {
   type ControlledMachineOperatorAccessRow,
 } from './machine-access.js';
 
-const AUTHORITY_TTL_SECONDS = 300;
+/** Active turn-grant idle ceiling; verified use slides the expiry forward while full-tree idle or sender switch deletes it immediately. */
+export const TURN_AUTHORITY_TTL_MS = 30 * 60 * 1000;
+const MAX_SUB_SESSION_TREE_DEPTH = 16;
 
-function parseTarget(value: unknown): ShareTarget | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const target = value as Record<string, unknown>;
-  if (target.kind === 'server' && typeof target.serverId === 'string' && target.serverId) {
-    return { kind: 'server', serverId: target.serverId };
+export interface TurnAuthorityGrantRecord {
+  tokenHash: string;
+  serverId: string;
+  rootSessionName: string;
+  sessionName: string;
+  projectName: string;
+  actorUserId: string;
+  ownerUserId: string;
+  kind: 'owner' | 'participant';
+  shareTarget?: ShareTarget;
+  actionId: string;
+  createdAt: number;
+  lastUsedAt: number;
+  expiresAt: number;
+}
+
+const STORE_SYMBOL = Symbol.for('imcodes.server.turnAuthorityGrantStore.v1');
+interface TurnAuthorityGrantStore {
+  grantsByHash: Map<string, TurnAuthorityGrantRecord>;
+  hashesByTree: Map<string, Set<string>>;
+  hashesByServer: Map<string, Set<string>>;
+}
+function getGrantStore(): TurnAuthorityGrantStore {
+  const g = globalThis as Record<symbol, TurnAuthorityGrantStore | undefined>;
+  if (!g[STORE_SYMBOL]) {
+    g[STORE_SYMBOL] = {
+      grantsByHash: new Map(),
+      hashesByTree: new Map(),
+      hashesByServer: new Map(),
+    };
   }
-  if (target.kind === 'main' && typeof target.serverId === 'string' && target.serverId
-    && typeof target.sessionName === 'string' && target.sessionName) {
-    return { kind: 'main', serverId: target.serverId, sessionName: target.sessionName };
+  return g[STORE_SYMBOL]!;
+}
+const { grantsByHash, hashesByTree, hashesByServer } = getGrantStore();
+
+function sha256Hex(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function treeKey(serverId: string, rootSessionName: string): string {
+  return `${serverId}\u0000${rootSessionName}`;
+}
+
+function deleteGrantByHash(tokenHash: string): boolean {
+  const existing = grantsByHash.get(tokenHash);
+  if (!existing) return false;
+  grantsByHash.delete(tokenHash);
+  const tKey = treeKey(existing.serverId, existing.rootSessionName);
+  const treeSet = hashesByTree.get(tKey);
+  if (treeSet) {
+    treeSet.delete(tokenHash);
+    if (treeSet.size === 0) hashesByTree.delete(tKey);
   }
-  if (target.kind === 'subsession' && typeof target.serverId === 'string' && target.serverId
-    && typeof target.subSessionId === 'string' && target.subSessionId) {
-    return { kind: 'subsession', serverId: target.serverId, subSessionId: target.subSessionId };
+  const serverSet = hashesByServer.get(existing.serverId);
+  if (serverSet) {
+    serverSet.delete(tokenHash);
+    if (serverSet.size === 0) hashesByServer.delete(existing.serverId);
   }
-  return null;
+  return true;
+}
+
+/** Delete every active turn grant for a single `(serverId, rootSessionName)` main-session tree. */
+export function revokeTurnAuthorityGrantsForTree(serverId: string, rootSessionName: string): number {
+  const treeSet = hashesByTree.get(treeKey(serverId, rootSessionName));
+  if (!treeSet || treeSet.size === 0) return 0;
+  let removed = 0;
+  for (const tokenHash of [...treeSet]) {
+    if (deleteGrantByHash(tokenHash)) removed += 1;
+  }
+  return removed;
+}
+
+/**
+ * Revoke a tree's active grant only when its stored `tokenHash` matches the daemon's
+ * idle notification, preventing a late revoke from deleting a freshly minted replacement turn.
+ */
+export function revokeTurnAuthorityGrantByHash(
+  serverId: string,
+  rootSessionName: string,
+  tokenHash: string,
+): boolean {
+  const normalized = tokenHash.trim().toLowerCase();
+  const grant = grantsByHash.get(normalized);
+  if (!grant || grant.serverId !== serverId || grant.rootSessionName !== rootSessionName) return false;
+  return deleteGrantByHash(normalized);
+}
+
+/** Delete every active turn grant associated with a disconnected/replaced daemon server WS. */
+export function revokeAllTurnAuthorityGrantsForServer(serverId: string): number {
+  const serverSet = hashesByServer.get(serverId);
+  if (!serverSet || serverSet.size === 0) return 0;
+  let removed = 0;
+  for (const tokenHash of [...serverSet]) {
+    if (deleteGrantByHash(tokenHash)) removed += 1;
+  }
+  return removed;
+}
+
+/** Synchronous in-memory liveness check for server input caching. Never logs or leaks the token. */
+export function isTurnAuthorityGrantActive(token: string | undefined | null, now = Date.now()): boolean {
+  if (!token) return false;
+  const grant = grantsByHash.get(sha256Hex(token));
+  return Boolean(grant && grant.expiresAt > now);
+}
+
+export function clearTurnAuthorityGrantsForTests(): void {
+  grantsByHash.clear();
+  hashesByTree.clear();
+  hashesByServer.clear();
+}
+
+export function getTurnAuthorityGrantCountForTests(): number {
+  return grantsByHash.size;
+}
+
+function mintTreeAuthorityGrant(input: {
+  serverId: string;
+  rootSessionName: string;
+  sessionName: string;
+  projectName: string;
+  actorUserId: string;
+  ownerUserId: string;
+  kind: 'owner' | 'participant';
+  shareTarget?: ShareTarget;
+  actionId: string;
+  now?: number;
+}): string {
+  const now = input.now ?? Date.now();
+  // Every new turn or sender switch on the tree immediately invalidates all prior grants on that tree.
+  revokeTurnAuthorityGrantsForTree(input.serverId, input.rootSessionName);
+
+  const token = `${TURN_AUTHORITY_TOKEN_PREFIX}${randomBytes(32).toString('base64url')}`;
+  const tokenHash = sha256Hex(token);
+  const record: TurnAuthorityGrantRecord = {
+    tokenHash,
+    serverId: input.serverId,
+    rootSessionName: input.rootSessionName,
+    sessionName: input.sessionName,
+    projectName: input.projectName,
+    actorUserId: input.actorUserId,
+    ownerUserId: input.ownerUserId,
+    kind: input.kind,
+    ...(input.shareTarget ? { shareTarget: input.shareTarget } : {}),
+    actionId: input.actionId,
+    createdAt: now,
+    lastUsedAt: now,
+    expiresAt: now + TURN_AUTHORITY_TTL_MS,
+  };
+  grantsByHash.set(tokenHash, record);
+  const tKey = treeKey(input.serverId, input.rootSessionName);
+  let treeSet = hashesByTree.get(tKey);
+  if (!treeSet) {
+    treeSet = new Set();
+    hashesByTree.set(tKey, treeSet);
+  }
+  treeSet.add(tokenHash);
+  let serverSet = hashesByServer.get(input.serverId);
+  if (!serverSet) {
+    serverSet = new Set();
+    hashesByServer.set(input.serverId, serverSet);
+  }
+  serverSet.add(tokenHash);
+  return token;
 }
 
 export function issueSharedMachineAuthority(
   claims: SharedMachineAuthorityClaims,
-  signingKey: string,
+  _signingKey?: string,
+  options?: { now?: number },
 ): string {
-  return signJwt(claims as unknown as Record<string, unknown>, signingKey, AUTHORITY_TTL_SECONDS);
+  const rootSessionName = claims.rootSessionName?.trim() || claims.sessionName;
+  return mintTreeAuthorityGrant({
+    serverId: claims.sourceServerId,
+    rootSessionName,
+    sessionName: claims.sessionName,
+    projectName: claims.projectName,
+    actorUserId: claims.sub,
+    ownerUserId: claims.ownerUserId ?? claims.sub,
+    kind: 'participant',
+    shareTarget: claims.shareTarget,
+    actionId: claims.actionId,
+    now: options?.now,
+  });
 }
 
 export function issueOwnerMachineAuthority(
   claims: OwnerMachineAuthorityClaims,
-  signingKey: string,
+  _signingKey?: string,
+  options?: { now?: number },
 ): string {
-  return signJwt(claims as unknown as Record<string, unknown>, signingKey, AUTHORITY_TTL_SECONDS);
+  const rootSessionName = claims.rootSessionName?.trim() || claims.sessionName;
+  return mintTreeAuthorityGrant({
+    serverId: claims.sourceServerId,
+    rootSessionName,
+    sessionName: claims.sessionName,
+    projectName: claims.projectName,
+    actorUserId: claims.sub,
+    ownerUserId: claims.sub,
+    kind: 'owner',
+    actionId: claims.actionId,
+    now: options?.now,
+  });
 }
 
 async function isVerifiedRealServerOwner(
@@ -76,38 +250,113 @@ async function isVerifiedRealServerOwner(
   return isUserStatusActive(row.user_status);
 }
 
-type SessionBinding = { projectName: string; parentSessionName: string | null; subSessionId: string | null };
+type SessionBinding = {
+  rootSessionName: string;
+  projectName: string;
+  parentSessionName: string | null;
+  subSessionId: string | null;
+  ancestorSubSessionIds: Set<string>;
+};
 
 async function readSessionBinding(
   db: Database,
   sourceServerId: string,
   sessionName: string,
 ): Promise<SessionBinding | null> {
-  const subSessionId = sessionName.match(/^deck_sub_([A-Za-z0-9_-]+)$/)?.[1];
-  if (subSessionId) {
-    const row = await db.queryOne<{ project_name: string; parent_session: string | null }>(
-      `SELECT s.project_name, ss.parent_session
-         FROM sub_sessions ss
-         JOIN sessions s ON s.server_id = ss.server_id AND s.name = ss.parent_session
-        WHERE ss.server_id = $1 AND ss.id = $2 AND ss.closed_at IS NULL
-        LIMIT 1`,
-      [sourceServerId, subSessionId],
-    );
-    return row ? { projectName: row.project_name, parentSessionName: row.parent_session, subSessionId } : null;
+  const initialSubSessionId = sessionName.match(/^deck_sub_([A-Za-z0-9_-]+)$/)?.[1] ?? null;
+  if (initialSubSessionId) {
+    let currentSessionName = sessionName;
+    let immediateParent: string | null = null;
+    let resolvedProjectName = '';
+    const ancestorSubSessionIds = new Set<string>();
+    const visitedSessions = new Set<string>();
+
+    for (let depth = 0; depth < MAX_SUB_SESSION_TREE_DEPTH; depth += 1) {
+      if (visitedSessions.has(currentSessionName)) break;
+      visitedSessions.add(currentSessionName);
+      const subId = currentSessionName.match(/^deck_sub_([A-Za-z0-9_-]+)$/)?.[1];
+      if (!subId) break;
+      const row = await db.queryOne<{ project_name: string | null; parent_session: string | null }>(
+        `SELECT s.project_name, ss.parent_session
+           FROM sub_sessions ss
+           LEFT JOIN sessions s ON s.server_id = ss.server_id AND s.name = ss.parent_session
+          WHERE ss.server_id = $1 AND ss.id = $2 AND ss.closed_at IS NULL
+          LIMIT 1`,
+        [sourceServerId, subId],
+      );
+      if (!row) {
+        return depth === 0 ? null : {
+          rootSessionName: currentSessionName,
+          projectName: resolvedProjectName,
+          parentSessionName: immediateParent,
+          subSessionId: initialSubSessionId,
+          ancestorSubSessionIds,
+        };
+      }
+      ancestorSubSessionIds.add(subId);
+      if (depth === 0) immediateParent = row.parent_session;
+      if (typeof row.project_name === 'string' && row.project_name) {
+        resolvedProjectName = row.project_name;
+      }
+      if (!row.parent_session) {
+        return {
+          rootSessionName: currentSessionName,
+          projectName: resolvedProjectName,
+          parentSessionName: immediateParent,
+          subSessionId: initialSubSessionId,
+          ancestorSubSessionIds,
+        };
+      }
+      if (!/^deck_sub_[A-Za-z0-9_-]+$/.test(row.parent_session)) {
+        if (!resolvedProjectName) {
+          const mainRow = await db.queryOne<{ project_name: string }>(
+            'SELECT project_name FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+            [sourceServerId, row.parent_session],
+          );
+          if (mainRow?.project_name) resolvedProjectName = mainRow.project_name;
+        }
+        return {
+          rootSessionName: row.parent_session,
+          projectName: resolvedProjectName,
+          parentSessionName: immediateParent,
+          subSessionId: initialSubSessionId,
+          ancestorSubSessionIds,
+        };
+      }
+      currentSessionName = row.parent_session;
+    }
+
+    return {
+      rootSessionName: currentSessionName,
+      projectName: resolvedProjectName,
+      parentSessionName: immediateParent,
+      subSessionId: initialSubSessionId,
+      ancestorSubSessionIds,
+    };
   }
   const row = await db.queryOne<{ project_name: string }>(
     'SELECT project_name FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
     [sourceServerId, sessionName],
   );
-  return row ? { projectName: row.project_name, parentSessionName: null, subSessionId: null } : null;
+  return row
+    ? {
+        rootSessionName: sessionName,
+        projectName: row.project_name,
+        parentSessionName: null,
+        subSessionId: null,
+        ancestorSubSessionIds: new Set(),
+      }
+    : null;
 }
 
 function targetCoversBinding(target: ShareTarget, sessionName: string, binding: SessionBinding): boolean {
   if (target.kind === 'server') return true;
   if (target.kind === 'main') {
-    return target.sessionName === sessionName || target.sessionName === binding.parentSessionName;
+    return target.sessionName === sessionName
+      || target.sessionName === binding.rootSessionName
+      || target.sessionName === binding.parentSessionName;
   }
-  return target.subSessionId === binding.subSessionId;
+  return binding.ancestorSubSessionIds.has(target.subSessionId) || target.subSessionId === binding.subSessionId;
 }
 
 export async function issueSharedMachineAuthorityForSession(
@@ -118,20 +367,24 @@ export async function issueSharedMachineAuthorityForSession(
     sessionName: string;
     shareTarget: ShareTarget;
     actionId: string;
-    signingKey: string;
+    signingKey?: string;
+    now?: number;
   },
 ): Promise<string | null> {
   const binding = await readSessionBinding(db, input.sourceServerId, input.sessionName);
   if (!binding || !targetCoversBinding(input.shareTarget, input.sessionName, binding)) return null;
-  return issueSharedMachineAuthority({
-    type: SHARED_MACHINE_AUTHORITY_TYPE,
-    sub: input.actorUserId,
-    sourceServerId: input.sourceServerId,
+  return mintTreeAuthorityGrant({
+    serverId: input.sourceServerId,
+    rootSessionName: binding.rootSessionName,
     sessionName: input.sessionName,
-    projectName: binding.projectName,
+    projectName: binding.projectName ?? '',
+    actorUserId: input.actorUserId,
+    ownerUserId: '',
+    kind: 'participant',
     shareTarget: input.shareTarget,
     actionId: input.actionId,
-  }, input.signingKey);
+    now: input.now,
+  });
 }
 
 export async function issueOwnerMachineAuthorityForSession(
@@ -142,101 +395,139 @@ export async function issueOwnerMachineAuthorityForSession(
     sessionName: string;
     projectName?: string;
     actionId: string;
-    signingKey: string;
+    signingKey?: string;
     now?: number;
   },
 ): Promise<string | null> {
   const now = input.now ?? Date.now();
   if (!input.sessionName) return null;
   if (!await isVerifiedRealServerOwner(db, input.sourceServerId, input.actorUserId, now)) return null;
-  const resolvedProjectName = typeof input.projectName === 'string' && input.projectName
-    ? input.projectName
-    : (await readSessionBinding(db, input.sourceServerId, input.sessionName))?.projectName ?? '';
-  return issueOwnerMachineAuthority({
-    type: OWNER_MACHINE_AUTHORITY_TYPE,
-    sub: input.actorUserId,
-    sourceServerId: input.sourceServerId,
+  const hasExplicitProjectName = typeof input.projectName === 'string' && input.projectName.length > 0;
+  const isSubSession = /^deck_sub_[A-Za-z0-9_-]+$/.test(input.sessionName);
+  const binding = (!hasExplicitProjectName || isSubSession)
+    ? await readSessionBinding(db, input.sourceServerId, input.sessionName)
+    : null;
+  const rootSessionName = binding?.rootSessionName ?? input.sessionName;
+  const resolvedProjectName = hasExplicitProjectName
+    ? input.projectName!
+    : (binding?.projectName ?? '');
+  return mintTreeAuthorityGrant({
+    serverId: input.sourceServerId,
+    rootSessionName,
     sessionName: input.sessionName,
     projectName: resolvedProjectName,
+    actorUserId: input.actorUserId,
+    ownerUserId: input.actorUserId,
+    kind: 'owner',
     actionId: input.actionId,
-  }, input.signingKey);
+    now,
+  });
 }
 
 export type SharedMachineAuthorityDecision =
   | { kind: 'absent' }
   | { kind: 'invalid' }
-  | { kind: 'owner'; actorUserId: string; sessionName: string; projectName: string }
-  | { kind: 'participant'; actorUserId: string; sessionName: string; projectName: string };
+  | {
+      kind: 'owner';
+      actorUserId: string;
+      sessionName: string;
+      rootSessionName: string;
+      projectName: string;
+      tokenHash: string;
+    }
+  | {
+      kind: 'participant';
+      actorUserId: string;
+      sessionName: string;
+      rootSessionName: string;
+      projectName: string;
+      shareTarget?: ShareTarget;
+      actionId: string;
+      tokenHash: string;
+    };
 
 /**
- * Verify the server-minted turn authority and re-read the live share grant or owner identity.
- * Invalid presence never falls back to source-owner authority.
+ * Verify the server-stateful in-memory opaque turn grant and re-read the live share grant
+ * or owner identity from DB. Never accepts stateless tokens or falls back to source-owner authority.
  */
 export async function resolveSharedMachineAuthority(
   db: Database,
   input: {
     token: string | undefined;
-    signingKey: string;
+    signingKey?: string;
     authenticatedSourceServerId: string;
     sourceOwnerUserId?: string;
     now: number;
   },
 ): Promise<SharedMachineAuthorityDecision> {
   if (!input.token) return { kind: 'absent' };
-  const raw = verifyJwt(input.token, input.signingKey);
-  const nowSeconds = Math.floor(Math.max(Date.now(), input.now) / 1000);
-  const iat = raw && typeof raw.iat === 'number' && Number.isFinite(raw.iat) ? raw.iat : null;
-  if (!raw || iat === null || nowSeconds - iat > AUTHORITY_TTL_SECONDS
-    || typeof raw.sub !== 'string' || !raw.sub
-    || typeof raw.sourceServerId !== 'string'
-    || raw.sourceServerId !== input.authenticatedSourceServerId
-    || typeof raw.sessionName !== 'string' || !raw.sessionName
-    || typeof raw.projectName !== 'string'
-    || typeof raw.actionId !== 'string' || !raw.actionId) {
+  const tokenHash = sha256Hex(input.token);
+  const grant = grantsByHash.get(tokenHash);
+  if (!grant || grant.serverId !== input.authenticatedSourceServerId) {
     return { kind: 'invalid' };
   }
-  if (raw.type === OWNER_MACHINE_AUTHORITY_TYPE) {
-    if (input.sourceOwnerUserId && raw.sub !== input.sourceOwnerUserId) {
+  const now = input.now;
+  if (grant.expiresAt <= now) {
+    deleteGrantByHash(tokenHash);
+    return { kind: 'invalid' };
+  }
+  if (grant.kind === 'owner') {
+    if (input.sourceOwnerUserId && grant.actorUserId !== input.sourceOwnerUserId) {
       return { kind: 'invalid' };
     }
-    if (!await isVerifiedRealServerOwner(db, input.authenticatedSourceServerId, raw.sub, input.now)) {
+    if (!await isVerifiedRealServerOwner(db, input.authenticatedSourceServerId, grant.actorUserId, now)) {
       return { kind: 'invalid' };
     }
-    if (raw.projectName) {
-      const binding = await readSessionBinding(db, input.authenticatedSourceServerId, raw.sessionName);
-      if (binding && binding.projectName !== raw.projectName) {
+    if (grant.projectName) {
+      const binding = await readSessionBinding(db, input.authenticatedSourceServerId, grant.sessionName);
+      if (binding && binding.projectName && binding.projectName !== grant.projectName) {
         return { kind: 'invalid' };
       }
     }
+    grant.lastUsedAt = now;
+    grant.expiresAt = Math.max(grant.expiresAt, now + TURN_AUTHORITY_TTL_MS);
     return {
       kind: 'owner',
-      actorUserId: raw.sub,
-      sessionName: raw.sessionName,
-      projectName: raw.projectName,
+      actorUserId: grant.actorUserId,
+      sessionName: grant.sessionName,
+      rootSessionName: grant.rootSessionName,
+      projectName: grant.projectName,
+      tokenHash: grant.tokenHash,
     };
   }
-  const shareTarget = parseTarget(raw.shareTarget);
-  if (raw.type !== SHARED_MACHINE_AUTHORITY_TYPE
-    || !raw.projectName
-    || !shareTarget || shareTarget.serverId !== input.authenticatedSourceServerId) {
+  const shareTarget = grant.shareTarget;
+  if (!shareTarget || shareTarget.serverId !== input.authenticatedSourceServerId) {
     return { kind: 'invalid' };
   }
-  const binding = await readSessionBinding(db, input.authenticatedSourceServerId, raw.sessionName);
-  if (!binding || binding.projectName !== raw.projectName
-    || !targetCoversBinding(shareTarget, raw.sessionName, binding)) {
+  if (!grant.projectName && shareTarget.kind !== 'subsession') {
+    return { kind: 'invalid' };
+  }
+  const binding = await readSessionBinding(db, input.authenticatedSourceServerId, grant.sessionName);
+  if (!binding
+    || (grant.projectName && binding.projectName && binding.projectName !== grant.projectName)
+    || !targetCoversBinding(shareTarget, grant.sessionName, binding)) {
     return { kind: 'invalid' };
   }
   const coverage = await resolveEffectiveShareCoverage(db, {
-    userId: raw.sub,
+    userId: grant.actorUserId,
     target: shareTarget,
-    now: input.now,
+    now,
   });
-  if (!coverage || coverage.effectiveRole !== 'participant') return { kind: 'invalid' };
+  if (!coverage || coverage.effectiveRole !== 'participant') {
+    deleteGrantByHash(tokenHash);
+    return { kind: 'invalid' };
+  }
+  grant.lastUsedAt = now;
+  grant.expiresAt = Math.max(grant.expiresAt, now + TURN_AUTHORITY_TTL_MS);
   return {
     kind: 'participant',
-    actorUserId: raw.sub,
-    sessionName: raw.sessionName,
-    projectName: raw.projectName,
+    actorUserId: grant.actorUserId,
+    sessionName: grant.sessionName,
+    rootSessionName: grant.rootSessionName,
+    projectName: grant.projectName,
+    shareTarget,
+    actionId: grant.actionId,
+    tokenHash: grant.tokenHash,
   };
 }
 

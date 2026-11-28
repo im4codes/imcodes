@@ -40,7 +40,12 @@ import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList, resolveAuthoritativeSessionListState } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { releaseProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
+import {
+  markTreeSessionIdle,
+  registerTreeSessionActivityProbe,
+  releaseProcessSharedMachineAuthority,
+} from './shared-machine-authority-context.js';
+import { hasInFlightTaskPairMessageForSession } from './task-pairs/delivery.js';
 import { isDuplicateTimelineForward } from './timeline-forward-dedup.js';
 import type { TimelineEvent } from './timeline-event.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
@@ -1323,6 +1328,14 @@ export async function startup(): Promise<DaemonContext> {
     }
   });
 
+  registerTreeSessionActivityProbe((sessionName) => {
+    const rt = getTransportRuntime(sessionName);
+    if (rt && (rt.getStatus() !== 'idle' || rt.sending || rt.pendingCount > 0)) return true;
+    if (getResendCount(sessionName) > 0) return true;
+    if (hasInFlightTaskPairMessageForSession(sessionName)) return true;
+    return false;
+  });
+
   // Wire timeline idle events → P2P orchestrator + queued message drain (covers all agent types: CC, codex, gemini, etc.)
   timelineEmitter.on((e) => {
     // A link-restore resync re-states what the daemon already knew so the server
@@ -1333,11 +1346,16 @@ export async function startup(): Promise<DaemonContext> {
     // the event; local listeners must ignore it.
     if (e.type === 'session.state' && isServerLinkResyncStatePayload(e.payload)) return;
     liveContextIngestion.handleTimelineEvent(e);
-    if (e.type === 'session.state' && (e.payload as Record<string, unknown>).state === 'idle') {
-      notifySessionIdle(e.sessionId);
-      // The turn is over: a participant's machine-authority window on a process session ends here.
-      releaseProcessSharedMachineAuthority(e.sessionId);
-      void drainQueue(e.sessionId);
+    if (e.type === 'session.state') {
+      const state = (e.payload as Record<string, unknown>).state;
+      if (state === 'idle') {
+        notifySessionIdle(e.sessionId);
+        // The turn is over: a participant's machine-authority window on a process session ends here.
+        releaseProcessSharedMachineAuthority(e.sessionId);
+        void drainQueue(e.sessionId);
+      } else if (state === 'error' || state === 'stopped') {
+        markTreeSessionIdle(e.sessionId);
+      }
     }
   });
   peerAuditService.init();

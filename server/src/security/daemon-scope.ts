@@ -5,7 +5,6 @@ import {
   SHARED_MACHINE_AUTHORITY_TYPE,
   type SharedMachineAuthorityClaims,
 } from '../../../shared/shared-machine-authority.js';
-import { verifyJwt } from './crypto.js';
 import { resolveSharedMachineAuthority } from '../share/shared-machine-authority.js';
 import { isSharedOrContributedServer, isWholeServerShareUser } from './server-share-boundary.js';
 
@@ -118,16 +117,15 @@ export async function resolveDaemonCallerAuthority<
         reason: 'daemon_cross_server_forbidden',
       };
     }
-    const rawClaims = rawHeader ? verifyJwt(rawHeader, c.env.JWT_SIGNING_KEY) : null;
-    const rawShareTarget = rawClaims?.shareTarget as SharedMachineAuthorityClaims['shareTarget'] | undefined;
     const claims: SharedMachineAuthorityClaims = {
       type: SHARED_MACHINE_AUTHORITY_TYPE,
       sub: delegated.actorUserId,
       sourceServerId: authServerId,
       sessionName: delegated.sessionName,
       projectName: delegated.projectName,
-      shareTarget: rawShareTarget ?? { kind: 'main', serverId: authServerId, sessionName: delegated.sessionName },
-      actionId: typeof rawClaims?.actionId === 'string' ? rawClaims.actionId : '',
+      shareTarget: delegated.shareTarget ?? { kind: 'main', serverId: authServerId, sessionName: delegated.sessionName },
+      actionId: delegated.actionId ?? '',
+      rootSessionName: delegated.rootSessionName,
     };
     return {
       ok: true,

@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
   OWNER_MACHINE_AUTHORITY_FIELD,
   SHARED_MACHINE_ACTIVITY_KIND,
@@ -7,6 +9,206 @@ import {
   type SharedMachineAuthorityActorKind,
 } from '../../shared/shared-machine-authority.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
+import { getSession, listSessions } from '../store/session-store.js';
+import { getActiveServerLink } from './active-server-link.js';
+
+const MAX_ROOT_TREE_DEPTH = 16;
+
+function sha256Hex(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+/**
+ * Resolve the canonical root session name for any session in a tree (walking
+ * `parentSession` bounded against cycles; standalone sessions return themselves).
+ */
+export function resolveDaemonRootSessionName(sessionName: string): string {
+  let current = sessionName;
+  const visited = new Set<string>();
+  for (let depth = 0; depth < MAX_ROOT_TREE_DEPTH; depth += 1) {
+    if (visited.has(current)) break;
+    visited.add(current);
+    const parent = getSession(current)?.parentSession;
+    if (!parent) break;
+    current = parent;
+  }
+  return current;
+}
+
+export interface TreeAuthorityState {
+  rootSessionName: string;
+  kind: 'owner' | 'participant' | 'mixed';
+  actorUserId: string | null;
+  authority: string | null;
+  tokenHash: string | null;
+  activeSessions: Set<string>;
+  updatedAt: number;
+}
+
+const treeAuthorities = new Map<string, TreeAuthorityState>();
+export type TreeSessionActivityProbe = (sessionName: string) => boolean;
+const treeActivityProbes = new Set<TreeSessionActivityProbe>();
+
+export function registerTreeSessionActivityProbe(probe: TreeSessionActivityProbe): () => void {
+  treeActivityProbes.add(probe);
+  return () => {
+    treeActivityProbes.delete(probe);
+  };
+}
+
+function sendTurnAuthorityRevoke(rootSessionName: string, tokenHash: string): void {
+  const link = getActiveServerLink();
+  if (!link || (link.isConnected && !link.isConnected())) return;
+  try {
+    const frame = {
+      type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
+      rootSessionName,
+      tokenHash,
+    };
+    if (link.trySend) link.trySend(frame);
+    else link.send(frame);
+  } catch {
+    // Socket unavailable: server WS disconnect handler sweeps all grants for this serverId.
+  }
+}
+
+function isAnyTreeSessionStillActive(rootSessionName: string, entry: TreeAuthorityState): boolean {
+  if (entry.activeSessions.size > 0) return true;
+  const candidateSessions = new Set<string>();
+  for (const s of listSessions()) {
+    if (resolveDaemonRootSessionName(s.name) === rootSessionName) candidateSessions.add(s.name);
+  }
+  for (const sName of windows.keys()) {
+    if (resolveDaemonRootSessionName(sName) === rootSessionName) candidateSessions.add(sName);
+  }
+  for (const sessionName of candidateSessions) {
+    const win = windows.get(sessionName);
+    if (win && win.turns > 0) return true;
+    const record = getSession(sessionName);
+    if (record?.state === 'running') return true;
+    for (const probe of treeActivityProbes) {
+      try {
+        if (probe(sessionName)) return true;
+      } catch {
+        // Ignore probe errors; fall through conservatively only when positive.
+      }
+    }
+  }
+  return false;
+}
+
+function maybeRevokeIdleTreeAuthority(rootSessionName: string, expectedTokenHash: string | null): void {
+  const entry = treeAuthorities.get(rootSessionName);
+  if (!entry || entry.tokenHash !== expectedTokenHash) return;
+  if (isAnyTreeSessionStillActive(rootSessionName, entry)) return;
+  treeAuthorities.delete(rootSessionName);
+  if (expectedTokenHash) {
+    sendTurnAuthorityRevoke(rootSessionName, expectedTokenHash);
+  }
+}
+
+/** Update or establish the unified in-memory grant for a session's root tree. */
+export function bindTreeTurnAuthority(
+  sessionName: string,
+  activity: SharedMachineActivity,
+  opts: { now?: number; markActive?: boolean } = {},
+): void {
+  const now = opts.now ?? Date.now();
+  const rootSessionName = resolveDaemonRootSessionName(sessionName);
+  const existing = treeAuthorities.get(rootSessionName);
+  const markActive = opts.markActive !== false;
+
+  if (activity.kind === SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT) {
+    const authority = typeof activity.authority === 'string' && activity.authority.trim()
+      ? activity.authority.trim()
+      : null;
+    if (authority) {
+      const tokenHash = sha256Hex(authority);
+      const activeSessions = existing?.activeSessions ?? new Set<string>();
+      if (markActive) activeSessions.add(sessionName);
+      treeAuthorities.set(rootSessionName, {
+        rootSessionName,
+        kind: 'participant',
+        actorUserId: activity.actorUserId || null,
+        authority,
+        tokenHash,
+        activeSessions,
+        updatedAt: now,
+      });
+      return;
+    }
+    const activeSessions = existing?.activeSessions ?? new Set<string>();
+    if (markActive) activeSessions.add(sessionName);
+    treeAuthorities.set(rootSessionName, {
+      rootSessionName,
+      kind: 'mixed',
+      actorUserId: activity.actorUserId || null,
+      authority: null,
+      tokenHash: null,
+      activeSessions,
+      updatedAt: now,
+    });
+    return;
+  }
+
+  const ownerAuthority = typeof activity.authority === 'string' && activity.authority.trim()
+    ? activity.authority.trim()
+    : null;
+  if (ownerAuthority) {
+    const tokenHash = sha256Hex(ownerAuthority);
+    const activeSessions = existing?.activeSessions ?? new Set<string>();
+    if (markActive) activeSessions.add(sessionName);
+    treeAuthorities.set(rootSessionName, {
+      rootSessionName,
+      kind: 'owner',
+      actorUserId: null,
+      authority: ownerAuthority,
+      tokenHash,
+      activeSessions,
+      updatedAt: now,
+    });
+    return;
+  }
+
+  if (existing && markActive) {
+    existing.activeSessions.add(sessionName);
+    existing.updatedAt = now;
+  }
+}
+
+export function markTreeSessionActive(sessionName: string, now = Date.now()): void {
+  const rootSessionName = resolveDaemonRootSessionName(sessionName);
+  const entry = treeAuthorities.get(rootSessionName);
+  if (!entry) return;
+  entry.activeSessions.add(sessionName);
+  entry.updatedAt = now;
+}
+
+export function markTreeSessionIdle(sessionName: string, now = Date.now()): void {
+  const rootSessionName = resolveDaemonRootSessionName(sessionName);
+  const entry = treeAuthorities.get(rootSessionName);
+  if (!entry) return;
+  entry.activeSessions.delete(sessionName);
+  entry.updatedAt = now;
+  const expectedTokenHash = entry.tokenHash;
+  queueMicrotask(() => {
+    maybeRevokeIdleTreeAuthority(rootSessionName, expectedTokenHash);
+  });
+}
+
+export function readActiveTreeAuthorityForSession(
+  sessionName: string,
+): { kind: 'owner' | 'participant' | 'mixed'; actorUserId: string | null; authority: string | null; rootSessionName: string } | null {
+  const rootSessionName = resolveDaemonRootSessionName(sessionName);
+  const entry = treeAuthorities.get(rootSessionName);
+  if (!entry) return null;
+  return {
+    kind: entry.kind,
+    actorUserId: entry.actorUserId,
+    authority: entry.authority,
+    rootSessionName: entry.rootSessionName,
+  };
+}
 
 type RuntimeIdentity = { sessionInstanceId: string; runtimeEpoch: string };
 type Window = {
@@ -121,6 +323,9 @@ export function bindProcessSharedMachineActivity(
     // never degrade into the ordinary source-owner path because propagation failed.
     if (activity.authority) window.authority = activity.authority;
   }
+  if (startsTurn || activity.authority) {
+    bindTreeTurnAuthority(sessionName, activity, { now, markActive: startsTurn });
+  }
   if (!startsTurn) return NO_BINDING;
   const bound = window;
   let pending = true;
@@ -139,6 +344,17 @@ export function bindProcessSharedMachineActivity(
       if (windows.get(sessionName) !== bound || bound.undelivered <= 0) return;
       bound.undelivered -= 1;
       bound.turns = Math.max(0, bound.turns - 1);
+      if (bound.turns === 0) {
+        const rootSessionName = resolveDaemonRootSessionName(sessionName);
+        const entry = treeAuthorities.get(rootSessionName);
+        if (entry) {
+          queueMicrotask(() => {
+            if (!isAnyTreeSessionStillActive(rootSessionName, entry)) {
+              maybeRevokeIdleTreeAuthority(rootSessionName, entry.tokenHash);
+            }
+          });
+        }
+      }
     },
   };
 }
@@ -210,17 +426,97 @@ export const PROCESS_SHARED_MACHINE_IDLE_GUARD_MS = 1_500;
  */
 export function releaseProcessSharedMachineAuthority(sessionName: string, now = Date.now()): void {
   const window = windows.get(sessionName);
-  if (!window) return;
-  if (now - window.lastActivityAt < PROCESS_SHARED_MACHINE_IDLE_GUARD_MS) return;
-  if (window.undelivered > 0 && window.turns - window.undelivered <= 0) return;
-  if (window.turns > 1) {
-    window.turns -= 1;
-    window.owner = false;
-    if (window.participants.size > 0) window.ownerAuthority = null;
-    window.lastActivityAt = now;
-    return;
+  if (window) {
+    if (now - window.lastActivityAt < PROCESS_SHARED_MACHINE_IDLE_GUARD_MS) return;
+    if (window.undelivered > 0 && window.turns - window.undelivered <= 0) return;
+    if (window.turns > 1) {
+      window.turns -= 1;
+      window.owner = false;
+      if (window.participants.size > 0) window.ownerAuthority = null;
+      window.lastActivityAt = now;
+      return;
+    }
+    windows.delete(sessionName);
   }
-  windows.delete(sessionName);
+  markTreeSessionIdle(sessionName, now);
+}
+
+/**
+ * Resolve the effective hook authority for any session in a tree (main session or sub-session):
+ * 1. Mixed or tokenless local turn always fails closed (`required: true, authority: null`).
+ * 2. Active tree authority (`treeAuthorities` keyed by `rootSessionName`) governs the whole tree
+ *    uniformly — including child sub-sessions whose parent Brain already went idle.
+ * 3. Falls back to the session's own transport/process context when no tree grant is registered.
+ */
+export function resolveSessionEffectiveSharedMachineAuthority(input: {
+  sessionName: string;
+  identity: RuntimeIdentity;
+  sessionRunning?: boolean;
+  now?: number;
+  runtime?: {
+    requiresSharedMachineAuthority?: () => boolean;
+    getActiveSharedMachineAuthority?: () => string | null;
+    getActiveOwnerMachineAuthority?: () => string | null;
+  } | null;
+}): { required: boolean; actorKind?: SharedMachineAuthorityActorKind; authority: string | null } {
+  const now = input.now ?? Date.now();
+  const sessionRunning = input.sessionRunning ?? false;
+  if (input.runtime) {
+    const localRequired = input.runtime.requiresSharedMachineAuthority?.() === true;
+    const localSharedAuth = input.runtime.getActiveSharedMachineAuthority?.() ?? null;
+    if (localRequired && !localSharedAuth) {
+      return { required: true, authority: null };
+    }
+    const tree = readActiveTreeAuthorityForSession(input.sessionName);
+    if (tree) {
+      if (tree.kind === 'mixed' || (tree.kind === 'participant' && !tree.authority)) {
+        return { required: true, authority: null };
+      }
+      if (tree.kind === 'participant') {
+        return {
+          required: true,
+          actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.PARTICIPANT,
+          authority: tree.authority,
+        };
+      }
+      return tree.authority
+        ? { required: false, actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER, authority: tree.authority }
+        : { required: false, authority: null };
+    }
+    if (localRequired) {
+      return {
+        required: true,
+        actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.PARTICIPANT,
+        authority: localSharedAuth,
+      };
+    }
+    const localOwnerAuth = input.runtime.getActiveOwnerMachineAuthority?.() ?? null;
+    return localOwnerAuth
+      ? { required: false, actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER, authority: localOwnerAuth }
+      : { required: false, authority: null };
+  }
+
+  const processContext = readProcessSharedMachineAuthority(input.sessionName, input.identity, now, sessionRunning);
+  if (processContext.required && !processContext.authority) {
+    return { required: true, authority: null };
+  }
+  const tree = readActiveTreeAuthorityForSession(input.sessionName);
+  if (tree) {
+    if (tree.kind === 'mixed' || (tree.kind === 'participant' && !tree.authority)) {
+      return { required: true, authority: null };
+    }
+    if (tree.kind === 'participant') {
+      return {
+        required: true,
+        actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.PARTICIPANT,
+        authority: tree.authority,
+      };
+    }
+    return tree.authority
+      ? { required: false, actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER, authority: tree.authority }
+      : { required: false, authority: null };
+  }
+  return processContext;
 }
 
 export function readProcessSharedMachineAuthority(
@@ -254,4 +550,5 @@ export function readProcessSharedMachineParticipants(sessionName: string): strin
 
 export function clearProcessSharedMachineAuthoritiesForTests(): void {
   windows.clear();
+  treeAuthorities.clear();
 }

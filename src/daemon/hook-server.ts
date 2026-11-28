@@ -113,8 +113,8 @@ import {
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { readSenderParticipantTurn } from './sender-participant-turn.js';
 import {
-  readProcessSharedMachineAuthority,
   readProcessSharedMachineParticipants,
+  resolveSessionEffectiveSharedMachineAuthority,
 } from './shared-machine-authority-context.js';
 
 export { DEFAULT_HOOK_PORT, getActiveHookServerPort };
@@ -1477,15 +1477,17 @@ export async function startHookServer(
         }
         const { getTransportRuntime } = await import('../agent/session-manager.js');
         const runtime = getTransportRuntime(session.name);
-        const processContext = readProcessSharedMachineAuthority(session.name, {
-          sessionInstanceId: session.sessionInstanceId,
-          runtimeEpoch: session.runtimeEpoch,
-        }, Date.now(), session.state === 'running');
-        const required = runtime ? runtime.requiresSharedMachineAuthority() : processContext.required;
-        const authority = runtime
-          ? (required ? runtime.getActiveSharedMachineAuthority() : (runtime.getActiveOwnerMachineAuthority?.() ?? null))
-          : processContext.authority;
-        if (required && !authority) {
+        const resolved = resolveSessionEffectiveSharedMachineAuthority({
+          sessionName: session.name,
+          identity: {
+            sessionInstanceId: session.sessionInstanceId,
+            runtimeEpoch: session.runtimeEpoch,
+          },
+          sessionRunning: session.state === 'running',
+          now: Date.now(),
+          runtime,
+        });
+        if (resolved.required && !resolved.authority) {
           const participantTurn = readSenderParticipantTurn(session.name);
           if (
             body.purpose === SHARED_MACHINE_AUTHORITY_CRON_PURPOSE
@@ -1506,10 +1508,10 @@ export async function startHookServer(
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(
-          required
-            ? { ok: true, required: true, authority }
-            : authority
-              ? { ok: true, required: false, actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER, authority }
+          resolved.required
+            ? { ok: true, required: true, authority: resolved.authority }
+            : resolved.authority
+              ? { ok: true, required: false, actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER, authority: resolved.authority }
               : { ok: true, required: false, authority: null },
         ));
       } catch {

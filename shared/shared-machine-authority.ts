@@ -1,6 +1,9 @@
 import { DAEMON_COMMAND_TYPES } from './daemon-command-types.js';
+import { DAEMON_MSG } from './daemon-events.js';
 import type { ShareTarget } from './tab-sharing.js';
 
+/** Prefix for pure in-memory, server-stateful opaque turn grants (non-JWT, zero persistence). */
+export const TURN_AUTHORITY_TOKEN_PREFIX = 'trg_' as const;
 /** Server-minted delegated authority for device calls originating in a shared turn. */
 export const SHARED_MACHINE_AUTHORITY_TYPE = 'shared-session-machine-authority' as const;
 /** Server-minted authority for machine/account calls originating in a verified host owner turn. */
@@ -49,6 +52,8 @@ export interface SharedMachineAuthorityClaims {
   projectName: string;
   shareTarget: ShareTarget;
   actionId: string;
+  rootSessionName?: string;
+  ownerUserId?: string;
 }
 
 export interface OwnerMachineAuthorityClaims {
@@ -58,4 +63,19 @@ export interface OwnerMachineAuthorityClaims {
   sessionName: string;
   projectName: string;
   actionId: string;
+  rootSessionName?: string;
+}
+
+export interface TurnAuthorityRevokeMessage {
+  type: typeof DAEMON_MSG.TURN_AUTHORITY_REVOKE;
+  rootSessionName: string;
+  tokenHash: string;
+}
+
+export function isTurnAuthorityRevokeMessage(raw: unknown): raw is TurnAuthorityRevokeMessage {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const msg = raw as Record<string, unknown>;
+  return msg.type === DAEMON_MSG.TURN_AUTHORITY_REVOKE
+    && typeof msg.rootSessionName === 'string' && msg.rootSessionName.length > 0 && msg.rootSessionName.length <= 256
+    && typeof msg.tokenHash === 'string' && /^[a-f0-9]{64}$/i.test(msg.tokenHash);
 }

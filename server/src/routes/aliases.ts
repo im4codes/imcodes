@@ -35,13 +35,21 @@ import {
   listAliases,
 } from '../db/alias-queries.js';
 import { SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
+import { NODE_ROLE } from '../../../shared/remote-exec.js';
 
-export const aliasRoutes = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
+export const aliasRoutes = new Hono<{
+  Bindings: Env;
+  Variables: { userId: string; nodeRole?: string; effectiveActorUserId?: string };
+}>();
 
 aliasRoutes.use('/*', requireAuth());
 aliasRoutes.use('/*', async (c, next) => {
-  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (c.get('nodeRole') === NODE_ROLE.CONTROLLED) {
+    return c.json({ error: 'forbidden', reason: 'controlled_node_forbidden' }, 403);
+  }
+  const authority = await resolveDaemonCallerAuthority(c);
   if (!authority.ok) return daemonScopeFailure(c, authority);
+  c.set('effectiveActorUserId', authority.actorUserId);
   await next();
   return;
 });
@@ -78,7 +86,7 @@ function normalizeRequestTags(raw: unknown): string[] {
 
 /** GET /api/aliases?q= — list the caller's aliases (optional literal substring filter). */
 aliasRoutes.get('/', async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const userId = c.get('effectiveActorUserId') ?? (c.get('userId' as never) as string);
   const q = c.req.query('q');
   try {
     const entries: AliasEntry[] = await listAliases(c.env.DB, userId, { q }, c.env.BOT_ENCRYPTION_KEY ?? '');
@@ -92,7 +100,7 @@ aliasRoutes.get('/', async (c) => {
 
 /** POST /api/aliases — upsert an alias for the caller (keyed on name). */
 aliasRoutes.post('/', async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const userId = c.get('effectiveActorUserId') ?? (c.get('userId' as never) as string);
 
   let body: { id?: unknown; name?: unknown; value?: unknown; description?: unknown; tags?: unknown };
   try {
@@ -157,7 +165,7 @@ aliasRoutes.post('/', async (c) => {
 
 /** DELETE /api/aliases/:name — remove the caller's alias by name. */
 aliasRoutes.delete('/:name', async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const userId = c.get('effectiveActorUserId') ?? (c.get('userId' as never) as string);
   const rawName = c.req.param('name')!;
 
   const nameReason = validateAliasName(rawName);
@@ -171,7 +179,7 @@ aliasRoutes.delete('/:name', async (c) => {
 
 /** GET /api/aliases/:name — fetch a single alias by name (owner-scoped). */
 aliasRoutes.get('/:name', async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const userId = c.get('effectiveActorUserId') ?? (c.get('userId' as never) as string);
   const rawName = c.req.param('name')!;
 
   const nameReason = validateAliasName(rawName);

@@ -16,6 +16,7 @@ import { getSession } from '../../store/session-store.js';
 import { timelineEmitter } from '../timeline-emitter.js';
 import { getTransportRuntime } from '../../agent/session-manager.js';
 import { dispatchSessionMessage, type SessionDispatchActorOption } from '../session-dispatch.js';
+import { markTreeSessionActive, readActiveTreeAuthorityForSession } from '../shared-machine-authority-context.js';
 import { createSendDispatchId, type SendMessageId } from '../../../shared/send-message-id.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../../shared/memory-mcp-contracts.js';
 import type { SharedActorEnvelope } from '../../../shared/tab-sharing.js';
@@ -78,6 +79,14 @@ export function resetTaskPairDeliveryInFlightForTests(): void {
   inFlightTaskPairMessages.clear();
 }
 
+export function hasInFlightTaskPairMessageForSession(sessionName: string): boolean {
+  const prefix = `${sessionName}\u0000`;
+  for (const key of inFlightTaskPairMessages) {
+    if (key.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
 function buildTaskPairParticipantActor(
   target: string,
   actorUserId: string,
@@ -124,10 +133,29 @@ function resolveTaskPairDeliveryAuthority(
   actionId: string,
   now: number,
 ): SessionDispatchActorOption | undefined {
+  const liveTree = readActiveTreeAuthorityForSession(target);
+  if (liveTree?.kind === 'mixed') {
+    return {
+      sharedActor: buildTaskPairParticipantActor(target, liveTree.actorUserId || 'participant', actionId, now),
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE,
+    };
+  }
+  if (liveTree?.kind === 'participant') {
+    return {
+      sharedActor: buildTaskPairParticipantActor(target, liveTree.actorUserId || 'participant', actionId, now),
+      ...(liveTree.authority ? { sharedMachineAuthority: liveTree.authority } : {}),
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE,
+    };
+  }
   const resolved = getTaskPairStore().getPrivateAuthorityForDelivery(target, taskId, bindings, authorityBindings);
-  if (!resolved) return undefined;
+  if (!resolved) {
+    return liveTree?.kind === 'owner' && liveTree.authority
+      ? { ownerMachineAuthority: liveTree.authority }
+      : undefined;
+  }
   if (resolved.kind === 'owner') {
-    return { ownerMachineAuthority: resolved.authority };
+    const authority = liveTree?.kind === 'owner' && liveTree.authority ? liveTree.authority : resolved.authority;
+    return { ownerMachineAuthority: authority };
   }
   return {
     sharedActor: buildTaskPairParticipantActor(target, resolved.actorUserId, actionId, now),
@@ -221,6 +249,7 @@ async function deliverTaskPairMessage(
   // reconnect even though no duplicate transport send occurred.
   if (hasPendingTaskPairMessage(target, taskId, reason, dedupeScope)) return 'skipped_pending';
   inFlightTaskPairMessages.add(dedupeKey);
+  markTreeSessionActive(target);
   try {
     timelineEmitter.emit(target, 'user.message', {
       text,

@@ -1914,17 +1914,30 @@ describe('cross-share & platform hardening regressions', () => {
       const partMsg = dispatches.find((m) => m.jobId === 'cron-part-self')!;
 
       const ownerToken = String(ownerMsg[OWNER_MACHINE_AUTHORITY_FIELD] ?? '');
-      expect(ownerToken).toBeTruthy();
+      expect(ownerToken.startsWith('trg_')).toBe(true);
       expect(ownerMsg[SHARED_MACHINE_AUTHORITY_FIELD]).toBeUndefined();
-      expect(verifyJwt(ownerToken, JWT_KEY)).toMatchObject({ type: OWNER_MACHINE_AUTHORITY_TYPE, sub: 'owner-1', sessionName: 'deck_proj_brain' });
 
       const partToken = String(partMsg[SHARED_MACHINE_AUTHORITY_FIELD] ?? '');
-      expect(partToken).toBeTruthy();
+      expect(partToken.startsWith('trg_')).toBe(true);
       expect(partMsg[OWNER_MACHINE_AUTHORITY_FIELD]).toBeUndefined();
       expect(partMsg.sharedActor).toMatchObject({ actorUserId: 'part-main', effectiveActorRole: 'participant' });
-      expect(verifyJwt(partToken, JWT_KEY)).toMatchObject({ type: SHARED_MACHINE_AUTHORITY_TYPE, sub: 'part-main', sessionName: 'deck_proj_brain' });
 
       const { signJwt } = await import('../src/security/crypto.js');
+      const { resolveSharedMachineAuthority } = await import('../src/share/shared-machine-authority.js');
+      // On shared tree deck_proj_brain, dispatching cron-part-self after cron-owner-self immediately replaced ownerToken with partToken.
+      await expect(resolveSharedMachineAuthority(db, {
+        token: ownerToken,
+        authenticatedSourceServerId: 'srv-1',
+        sourceOwnerUserId: 'owner-1',
+        now: Date.now(),
+      })).resolves.toMatchObject({ kind: 'invalid' });
+      await expect(resolveSharedMachineAuthority(db, {
+        token: partToken,
+        authenticatedSourceServerId: 'srv-1',
+        sourceOwnerUserId: 'owner-1',
+        now: Date.now(),
+      })).resolves.toMatchObject({ kind: 'participant', actorUserId: 'part-main', rootSessionName: 'deck_proj_brain' });
+
       const app = new Hono<{ Bindings: Env }>();
       app.use('*', async (c, next) => {
         c.env = { DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env;
@@ -1951,12 +1964,22 @@ describe('cross-share & platform hardening regressions', () => {
       });
       expect(partTriggerOwnerRes.status).toBe(200);
       const triggeredMsg = JSON.parse(String(sendToDaemon.mock.calls[0]![0])) as Record<string, unknown>;
+      const triggeredPartToken = String(triggeredMsg[SHARED_MACHINE_AUTHORITY_FIELD] ?? '');
       expect(triggeredMsg[OWNER_MACHINE_AUTHORITY_FIELD]).toBeUndefined();
-      expect(triggeredMsg[SHARED_MACHINE_AUTHORITY_FIELD]).toBeTruthy();
-      expect(verifyJwt(String(triggeredMsg[SHARED_MACHINE_AUTHORITY_FIELD]), JWT_KEY)).toMatchObject({
-        type: SHARED_MACHINE_AUTHORITY_TYPE,
-        sub: 'part-main',
-      });
+      expect(triggeredPartToken.startsWith('trg_')).toBe(true);
+      await expect(resolveSharedMachineAuthority(db, {
+        token: triggeredPartToken,
+        authenticatedSourceServerId: 'srv-1',
+        sourceOwnerUserId: 'owner-1',
+        now: Date.now(),
+      })).resolves.toMatchObject({ kind: 'participant', actorUserId: 'part-main', rootSessionName: 'deck_proj_brain' });
+      // Prior partToken from step 1 was immediately replaced by triggeredPartToken.
+      await expect(resolveSharedMachineAuthority(db, {
+        token: partToken,
+        authenticatedSourceServerId: 'srv-1',
+        sourceOwnerUserId: 'owner-1',
+        now: Date.now(),
+      })).resolves.toMatchObject({ kind: 'invalid' });
 
       // 3) Participant turn cannot cancel out-of-scope job
       const outOfScopeDel = await app.request('/api/server/srv-1/cron/cron-other-proj', {
@@ -1964,7 +1987,7 @@ describe('cross-share & platform hardening regressions', () => {
         headers: {
           Authorization: `Bearer ${DAEMON_TOKEN}`,
           'X-Server-Id': 'srv-1',
-          [SHARED_MACHINE_AUTHORITY_HEADER]: partToken,
+          [SHARED_MACHINE_AUTHORITY_HEADER]: triggeredPartToken,
         },
       });
       expect(outOfScopeDel.status).toBe(403);
@@ -1976,7 +1999,7 @@ describe('cross-share & platform hardening regressions', () => {
         headers: {
           Authorization: `Bearer ${DAEMON_TOKEN}`,
           'X-Server-Id': 'srv-1',
-          [SHARED_MACHINE_AUTHORITY_HEADER]: partToken,
+          [SHARED_MACHINE_AUTHORITY_HEADER]: triggeredPartToken,
         },
       });
       expect(partDelShared.status).toBe(200);
@@ -1986,20 +2009,24 @@ describe('cross-share & platform hardening regressions', () => {
         headers: {
           Authorization: `Bearer ${DAEMON_TOKEN}`,
           'X-Server-Id': 'srv-1',
-          [SHARED_MACHINE_AUTHORITY_HEADER]: partToken,
+          [SHARED_MACHINE_AUTHORITY_HEADER]: triggeredPartToken,
         },
       });
       expect(partDelOwnerInScope.status).toBe(200);
 
-      // 5) Re-seed owner job and verify owner turn CAN cancel it with ownerToken on shared host
+      // 5) Re-seed owner job and verify owner turn CAN cancel it with active ownerToken on shared host
+      sendToDaemon.mockClear();
       jobsMap.set('cron-owner-self-2', { ...jobsMap.get('cron-other-proj'), id: 'cron-owner-self-2', project_name: 'proj' });
       await dispatchJobNow({ DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env, jobsMap.get('cron-owner-self-2') as never);
+      const ownerDispatch2 = JSON.parse(String(sendToDaemon.mock.calls[0]![0])) as Record<string, unknown>;
+      const freshOwnerToken = String(ownerDispatch2[OWNER_MACHINE_AUTHORITY_FIELD] ?? '');
+      expect(freshOwnerToken.startsWith('trg_')).toBe(true);
       const ownerDelRes = await app.request('/api/server/srv-1/cron/cron-owner-self-2', {
         method: 'DELETE',
         headers: {
           Authorization: `Bearer ${DAEMON_TOKEN}`,
           'X-Server-Id': 'srv-1',
-          [SHARED_MACHINE_AUTHORITY_HEADER]: ownerToken,
+          [SHARED_MACHINE_AUTHORITY_HEADER]: freshOwnerToken,
         },
       });
       expect(ownerDelRes.status).toBe(200);

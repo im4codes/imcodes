@@ -56,7 +56,7 @@ const WHOLE_SHARE_ID = `wshare-${tag}`;
 const TEAM_ID = `team-${tag}`;
 
 const OWNER_ALIAS = `owner-alias-${tag}`;
-const OWNER_VM_ID = `vm-owner-${tag}`;
+const OWNER_VM_ID = randomHex(16);
 const OWNER_PIN_SHARED = `pin-owner-shared-${tag}`;
 const OWNER_PIN_PRIV = `pin-owner-priv-${tag}`;
 const OWNER_DOC_ID = `cdoc_owner_${tag}`;
@@ -302,8 +302,17 @@ describe('Vector A: Participant authority on M_shared is strictly scoped to User
       [SHARED_MACHINE_AUTHORITY_HEADER]: partToken,
     });
 
-    expect((await app.request('/api/aliases', { headers: partHdrs })).status).toBe(403);
-    expect((await app.request('/api/verification-machines', { headers: partHdrs })).status).toBe(403);
+    // Sender-scoped aliases & verification machines allow Participant B strictly against B's own userId (Owner A's rows are never visible or mutable)
+    const partAliasList = await app.request('/api/aliases', { headers: partHdrs });
+    expect(partAliasList.status).toBe(200);
+    expect(await partAliasList.json()).toEqual({ aliases: [] });
+    expect((await app.request(`/api/aliases/${OWNER_ALIAS}`, { method: 'DELETE', headers: partHdrs })).status).toBe(404);
+    const partVmList = await app.request('/api/verification-machines', { headers: partHdrs });
+    expect(partVmList.status).toBe(200);
+    expect(await partVmList.json()).toEqual({ profiles: [] });
+    const partVmDel = await app.request(`/api/verification-machines/${OWNER_VM_ID}`, { method: 'DELETE', headers: partHdrs });
+    expect(partVmDel.status).toBe(200);
+    expect(await partVmDel.json()).toEqual({ deleted: false });
     expect((await app.request(`/api/capabilities/${CAP_ID}?serverId=${M_SHARED}`, { headers: partHdrs })).status).toBe(403);
     // Project/memory routes allow participant turns while strictly isolating rows to User B (Owner A's private records never leak)
     expect((await app.request(`/api/memory/projection-owner?projectionId=${MEM_PROJ_PRIV_ID}&projectId=${encodeURIComponent(`priv${tag}`)}`, { headers: partHdrs })).status).toBe(404);

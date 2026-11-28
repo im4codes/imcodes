@@ -41,6 +41,7 @@ import { createSupervisionMcpToolDeps } from './supervision-registry-port.js';
 import { createDaemonMachineToolDeps } from './machine-mcp-deps.js';
 import { createDaemonCloudDocsToolDeps } from './cloud-docs-mcp-deps.js';
 import {
+  SHARED_MACHINE_AUTHORITY_ACTOR_KIND,
   SHARED_MACHINE_AUTHORITY_HOOK_PATH,
   SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
 } from '../../shared/shared-machine-authority.js';
@@ -916,6 +917,14 @@ export function mergeDefaultToolDeps(
         : async () => null,
       participantTurnRequired: toolDeps.participantTurnRequired
         ?? (postSharedMachineAuthorityHook ? participantTurnFromAuthorityHook(postSharedMachineAuthorityHook) : undefined),
+      isOwnerTurnAuthority: postSharedMachineAuthorityHook
+        ? async () => {
+            const answer = await postSharedMachineAuthorityHook();
+            return answer.ok === true
+              && answer.required === false
+              && (answer.authority == null || answer.actorKind === SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER);
+          }
+        : undefined,
     }),
     cloudDocsDeps: toolDeps.cloudDocsDeps ?? createDaemonCloudDocsToolDeps({
       ...(bridgeDeps.env || bridgeDeps.hookCredential ? { env: initialBridgeEnv } : {}),

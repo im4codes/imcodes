@@ -166,6 +166,12 @@ import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreat
 import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-errors.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { resolveEffectiveIdentityPrompt } from '../daemon/session-identity-resolver.js';
+import {
+  bindTreeTurnAuthority,
+  markTreeSessionActive,
+  markTreeSessionIdle,
+} from '../daemon/shared-machine-authority-context.js';
+import { SHARED_MACHINE_ACTIVITY_KIND } from '../../shared/shared-machine-authority.js';
 import { identityPromptHash } from '../util/identity-prompt-hash.js';
 import {
   claimProcessRestartContinuationRecovery,
@@ -2600,6 +2606,29 @@ function wireTransportCallbacks(
       clearSource: 'transport-runtime',
       queueReason: 'transport_status_idle',
     });
+    if (built.effectiveState === 'running') {
+      if (runtime.requiresSharedMachineAuthority()) {
+        const actors = runtime.activeTurnParticipantUserIds();
+        const sharedAuth = runtime.getActiveSharedMachineAuthority();
+        bindTreeTurnAuthority(sessionName, {
+          kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+          actorUserId: actors.length === 1 ? actors[0]! : '',
+          ...(sharedAuth ? { authority: sharedAuth } : {}),
+        }, { markActive: true });
+      } else {
+        const ownerAuth = runtime.getActiveOwnerMachineAuthority();
+        if (ownerAuth) {
+          bindTreeTurnAuthority(sessionName, {
+            kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
+            authority: ownerAuth,
+          }, { markActive: true });
+        } else {
+          markTreeSessionActive(sessionName);
+        }
+      }
+    } else if (built.effectiveState === 'idle' || built.effectiveState === 'error') {
+      markTreeSessionIdle(sessionName);
+    }
     persistTransportState(built.effectiveState, built.mapped === 'error' ? built.providerErrorMessage : undefined);
     timelineEmitter.emit(sessionName, 'session.state', built.payload, { source: 'daemon', confidence: 'high' });
     if (status === 'error') {

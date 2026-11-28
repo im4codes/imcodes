@@ -13,8 +13,11 @@ import { SHARE_MESSAGE_LANE, shareBrowserMessageLane } from '../src/ws/share-lan
 import { resetSharedCommandRateLimitsForTests } from '../src/share/share-rate-limit.js';
 import { shareCancelDispatchDenial } from '../../shared/tab-sharing.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
-import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../shared/shared-machine-authority.js';
-import { verifyJwt } from '../src/security/crypto.js';
+import {
+  SHARED_MACHINE_AUTHORITY_FIELD,
+  TURN_AUTHORITY_TOKEN_PREFIX,
+} from '../../shared/shared-machine-authority.js';
+import { resolveSharedMachineAuthority } from '../src/share/shared-machine-authority.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -330,8 +333,24 @@ describe('participant keystrokes through the bridge', () => {
     expect(tokens.size).toBe(1);
     const token = [...tokens][0]!;
     expect(token).not.toBe('forged');
-    expect(verifyJwt(token, 'share-hot-path-key')).toMatchObject({ sub: 'u', sessionName: 'deck_proj_brain', projectName: 'proj' });
+    expect(token.startsWith(TURN_AUTHORITY_TOKEN_PREFIX)).toBe(true);
+    expect(token.includes('.')).toBe(false);
     expect(bindings.n).toBe(1);
+    const verified = await resolveSharedMachineAuthority(
+      dbWithBinding(counts, { n: 0 }),
+      {
+        token,
+        authenticatedSourceServerId: serverId,
+        sourceOwnerUserId: 'o',
+      },
+    );
+    expect(verified).toMatchObject({
+      kind: 'participant',
+      actorUserId: 'u',
+      sessionName: 'deck_proj_brain',
+      rootSessionName: 'deck_proj_brain',
+      projectName: 'proj',
+    });
   });
 
   it('refreshes the token after the reuse window, and never reads the DB per keystroke even when it cannot mint', async () => {

@@ -30,16 +30,21 @@ import {
   type VerificationMachineScope,
 } from '../../../shared/verification-machine.js';
 import { SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
+import { NODE_ROLE } from '../../../shared/remote-exec.js';
 
 export const verificationMachineRoutes = new Hono<{
   Bindings: Env;
-  Variables: { userId: string; authServerId?: string };
+  Variables: { userId: string; authServerId?: string; nodeRole?: string; effectiveActorUserId?: string };
 }>();
 
 verificationMachineRoutes.use('/*', requireAuth());
 verificationMachineRoutes.use('/*', async (c, next) => {
-  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (c.get('nodeRole') === NODE_ROLE.CONTROLLED) {
+    return c.json({ error: 'forbidden', reason: 'controlled_node_forbidden' }, 403);
+  }
+  const authority = await resolveDaemonCallerAuthority(c);
   if (!authority.ok) return daemonScopeFailure(c, authority);
+  c.set('effectiveActorUserId', authority.actorUserId);
   await next();
   return;
 });
@@ -93,7 +98,7 @@ verificationMachineRoutes.get('/', async (c) => {
   const projectKey = c.req.query('projectKey')?.trim() || undefined;
   const includeAllProjects = c.req.query('includeAllProjects') === '1'
     || c.req.query('includeAllProjects') === 'true';
-  const userId = c.get('userId' as never) as string;
+  const userId = c.get('effectiveActorUserId') ?? (c.get('userId' as never) as string);
   if (includeAllProjects) {
     const rawCursor = c.req.query('cursor');
     const cursor = rawCursor === undefined ? null : decodeCursor(rawCursor);
@@ -142,7 +147,7 @@ verificationMachineRoutes.put('/', async (c) => {
   if (aliasReason) return c.json({ error: aliasReason }, 400);
   const targetReason = verificationMachineTargetError(kind, body.target);
   if (targetReason) return c.json({ error: targetReason }, 400);
-  const userId = c.get('userId' as never) as string;
+  const userId = c.get('effectiveActorUserId') ?? (c.get('userId' as never) as string);
   const id = body.id === undefined ? randomHex(16) : body.id;
   if (!isVerificationMachineId(id)) return c.json({ error: 'verification_machine_id_invalid' }, 400);
   const existing = await getVerificationMachine(c.env.DB, userId, id);
@@ -193,7 +198,7 @@ verificationMachineRoutes.delete('/:id', async (c) => {
   const expectedRevision = revisionText && /^\d+$/u.test(revisionText) ? Number(revisionText) : undefined;
   const result = await deleteVerificationMachine(
     c.env.DB,
-    c.get('userId' as never) as string,
+    c.get('effectiveActorUserId') ?? (c.get('userId' as never) as string),
     id,
     expectedRevision,
   );
@@ -215,7 +220,7 @@ verificationMachineRoutes.post('/:id/verification', async (c) => {
   if (!status) return c.json({ error: 'verification_machine_status_invalid' }, 400);
   const profile = await recordVerificationMachineStatus(
     c.env.DB,
-    c.get('userId' as never) as string,
+    c.get('effectiveActorUserId') ?? (c.get('userId' as never) as string),
     id,
     status,
   );

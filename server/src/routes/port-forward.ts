@@ -143,26 +143,20 @@ async function resolveEndpointServer(
     };
   }
 
-  // FULL daemon endpoint: strictly owner-only; never allow a shared participant turn
-  // or a shared/contributed host without owner authority to bridge a FULL daemon.
-  if (auth.operational.authorityKind === 'participant' || auth.operational.delegatedActorUserId) {
-    return {
-      ok: false,
-      status: 403,
-      reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
-      error: 'shared session participant cannot port-forward a FULL daemon',
-    };
-  }
+  // FULL daemon endpoint: strictly authorized for the effective acting user
+  // (never allowing a shared participant to bridge the source owner's FULL daemon
+  // or any unowned FULL daemon, and never allowing absent authority on a shared host).
+  const effectiveActorUserId = auth.operational.delegatedActorUserId ?? auth.userId;
   if (auth.operational.authorityKind === 'absent'
     && await isSharedOrContributedServer(db, auth.sourceServerId, auth.now)) {
     return {
       ok: false,
       status: 403,
       reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
-      error: 'shared host requires per-turn owner authority',
+      error: 'shared host requires per-turn authority',
     };
   }
-  if (row.user_id !== auth.userId || await isWholeServerShareUser(db, row.id, auth.userId, auth.now)) {
+  if (row.user_id !== effectiveActorUserId || await isWholeServerShareUser(db, row.id, effectiveActorUserId, auth.now)) {
     return {
       ok: false,
       status: 403,
@@ -236,7 +230,7 @@ export function createPortForwardRoutes(
     };
   };
 
-  const requireOwnerSourceAuthority = async (
+  const requireSourceTurnAuthority = async (
     db: Database,
     caller: {
       sourceServerId: string;
@@ -245,21 +239,13 @@ export function createPortForwardRoutes(
     },
     actionLabel: string,
   ): Promise<{ ok: true } | { ok: false; status: 403; reason: PortForwardErrorCode; error: string }> => {
-    if (caller.operational.authorityKind === 'participant' || caller.operational.delegatedActorUserId) {
-      return {
-        ok: false,
-        status: 403,
-        reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
-        error: `shared session participant cannot ${actionLabel}`,
-      };
-    }
     if (caller.operational.authorityKind === 'absent'
       && await isSharedOrContributedServer(db, caller.sourceServerId, caller.now)) {
       return {
         ok: false,
         status: 403,
         reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
-        error: `shared host requires per-turn owner authority to ${actionLabel}`,
+        error: `shared host requires per-turn authority to ${actionLabel}`,
       };
     }
     return { ok: true };
@@ -268,10 +254,11 @@ export function createPortForwardRoutes(
   routes.post('/', async (c) => {
     const caller = await authenticateCaller(c);
     if (!caller.ok) return c.json({ ok: false, reason: caller.reason, error: caller.error }, caller.status);
-    const sourceAuth = await requireOwnerSourceAuthority(c.env.DB, caller, 'open tunnels');
+    const sourceAuth = await requireSourceTurnAuthority(c.env.DB, caller, 'open tunnels');
     if (!sourceAuth.ok) {
       return c.json({ ok: false, reason: sourceAuth.reason, error: sourceAuth.error }, sourceAuth.status);
     }
+    const effectiveActorUserId = caller.operational.delegatedActorUserId ?? caller.userId;
 
     const rawBody = await c.req.text().catch(() => '');
     if (Buffer.byteLength(rawBody, 'utf8') > PORT_FORWARD_LIMITS.MAX_CONTROL_BYTES) {
@@ -342,7 +329,7 @@ export function createPortForwardRoutes(
     }
 
     const result = await router.openTunnel({
-      userId: caller.userId,
+      userId: effectiveActorUserId,
       listenNode: listenResolved.nodeId ?? req.listenNode,
       listenServerId: listenResolved.serverId,
       ...(listenResolved.nodeId ? { listenNodeId: listenResolved.nodeId } : {}),
@@ -369,10 +356,11 @@ export function createPortForwardRoutes(
   routes.get('/', async (c) => {
     const caller = await authenticateCaller(c);
     if (!caller.ok) return c.json({ ok: false, reason: caller.reason, error: caller.error }, caller.status);
-    const sourceAuth = await requireOwnerSourceAuthority(c.env.DB, caller, 'list tunnels');
+    const sourceAuth = await requireSourceTurnAuthority(c.env.DB, caller, 'list tunnels');
     if (!sourceAuth.ok) {
       return c.json({ ok: false, reason: sourceAuth.reason, error: sourceAuth.error }, sourceAuth.status);
     }
+    const effectiveActorUserId = caller.operational.delegatedActorUserId ?? caller.userId;
     const rawNode = c.req.query('node');
     let filterServerId: string | undefined;
     if (rawNode) {
@@ -386,22 +374,23 @@ export function createPortForwardRoutes(
         filterServerId = (await resolveMachineTargetServerId(c.env.DB, ref)) ?? ref;
       }
     }
-    const tunnels = await router.listTunnels(caller.userId, filterServerId);
+    const tunnels = await router.listTunnels(effectiveActorUserId, filterServerId);
     return c.json({ ok: true, tunnels });
   });
 
   routes.delete('/:tunnelId', async (c) => {
     const caller = await authenticateCaller(c);
     if (!caller.ok) return c.json({ ok: false, reason: caller.reason, error: caller.error }, caller.status);
-    const sourceAuth = await requireOwnerSourceAuthority(c.env.DB, caller, 'close tunnels');
+    const sourceAuth = await requireSourceTurnAuthority(c.env.DB, caller, 'close tunnels');
     if (!sourceAuth.ok) {
       return c.json({ ok: false, reason: sourceAuth.reason, error: sourceAuth.error }, sourceAuth.status);
     }
+    const effectiveActorUserId = caller.operational.delegatedActorUserId ?? caller.userId;
     const tunnelId = c.req.param('tunnelId');
     if (!tunnelId) {
       return c.json({ ok: false, reason: PORT_FORWARD_ERRORS.INVALID_REQUEST, error: 'tunnelId is required' }, 400);
     }
-    const res = await router.closeTunnelForUser(caller.userId, tunnelId);
+    const res = await router.closeTunnelForUser(effectiveActorUserId, tunnelId);
     if (!res.ok) {
       return c.json({
         ok: false,
@@ -417,10 +406,11 @@ export function createPortForwardRoutes(
   routes.delete('/', async (c) => {
     const caller = await authenticateCaller(c);
     if (!caller.ok) return c.json({ ok: false, reason: caller.reason, error: caller.error }, caller.status);
-    const sourceAuth = await requireOwnerSourceAuthority(c.env.DB, caller, 'close tunnels');
+    const sourceAuth = await requireSourceTurnAuthority(c.env.DB, caller, 'close tunnels');
     if (!sourceAuth.ok) {
       return c.json({ ok: false, reason: sourceAuth.reason, error: sourceAuth.error }, sourceAuth.status);
     }
+    const effectiveActorUserId = caller.operational.delegatedActorUserId ?? caller.userId;
     const rawNode = c.req.query('node');
     let filterServerId: string | undefined;
     if (rawNode) {
@@ -432,7 +422,7 @@ export function createPortForwardRoutes(
         ? caller.sourceServerId
         : ((await resolveMachineTargetServerId(c.env.DB, ref)) ?? ref);
     }
-    const closeResult = await router.closeAllForUser(caller.userId, filterServerId);
+    const closeResult = await router.closeAllForUser(effectiveActorUserId, filterServerId);
     if (!closeResult.confirmed) {
       return c.json({
         ok: false,
