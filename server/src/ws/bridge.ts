@@ -508,6 +508,7 @@ import {
   DAEMON_CONNECTION_DUEL_WINDOW_MS,
 } from '../../../shared/daemon-auth.js';
 import {
+  SHARE_LIFECYCLE_ACTOR_COMMANDS,
   SHARE_REASONS,
   buildSharedActorEnvelope,
   commandSessionName,
@@ -520,8 +521,10 @@ import {
   type EffectiveCoverage,
   type ShareCoverageResolver,
   type ShareCommandDecision,
+  type ShareLifecycleTargetContext,
   type ShareReason,
   type ShareScopedSocketState,
+  type ShareSubSessionRecordLookup,
   type ShareTarget,
 } from './share-policy.js';
 import {
@@ -8452,18 +8455,30 @@ export class WsBridge {
         closeSocket: true,
       };
     }
+    const msgType = typeof msg.type === 'string' ? msg.type : '';
     const sessionName = commandSessionName(msg);
     // Only a cancel depends on the runtime type, so a keystroke never waits on it.
     const runtimeType = sessionName && msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL
       ? await this.resolveSessionRuntimeType(sessionName)
       : 'unknown';
+    const lifecycleContext = SHARE_LIFECYCLE_ACTOR_COMMANDS.has(msgType)
+      ? await this.resolveShareLifecycleTargetContext(msg)
+      : undefined;
     const decision = evaluateShareCommand({
       msg,
       state: current,
       now: shareClockNow(),
       runtimeType,
       activeDispatchId: sessionName ? this.activeDispatchIds.get(sessionName) ?? null : null,
+      lifecycleContext,
     });
+    const effectiveSessionName = (
+      SHARE_LIFECYCLE_ACTOR_COMMANDS.has(msgType)
+      && decision.allowed
+      && decision.stampedMessage
+        ? commandSessionName(decision.stampedMessage)
+        : null
+    ) ?? sessionName;
     if (decision.allowed && sessionName && msg.type === 'session.send' && decision.stampedMessage) {
       const actor = decision.stampedMessage.sharedActor as SharedActorEnvelope | undefined;
       const token = actor ? await this.issueShareMachineAuthority(actor, sessionName) : null;
@@ -8487,8 +8502,8 @@ export class WsBridge {
         decision.stampedMessage = { ...decision.stampedMessage, [SHARED_MACHINE_AUTHORITY_FIELD]: token };
       }
     }
-    if (decision.allowed && sessionName) {
-      const rateLimitReason = this.evaluateShareScopedRateLimit(current, msg, sessionName, shareClockNow());
+    if (decision.allowed && effectiveSessionName) {
+      const rateLimitReason = this.evaluateShareScopedRateLimit(current, msg, effectiveSessionName, shareClockNow());
       if (rateLimitReason) {
         const rateLimitedDecision: ShareCommandDecision = { allowed: false, reason: rateLimitReason };
         this.queueShareCommandAudit(current, msg, rateLimitedDecision);
@@ -9160,6 +9175,97 @@ export class WsBridge {
     const live = this.activeSubSessions.get(subSessionName);
     if (!live) return { known: false };
     return { known: true, state: live.state ?? 'unknown', agentType: live.agentType ?? null };
+  }
+
+  private async resolveShareSubSessionRecord(subSessionName: string): Promise<ShareSubSessionRecordLookup> {
+    const rawId = subSessionName.match(/^deck_sub_([A-Za-z0-9_-]+)$/)?.[1]
+      ?? (subSessionName.startsWith('deck_sub_') ? subSessionName.slice('deck_sub_'.length) : null);
+    if (!rawId) return { exists: false, parentSession: null };
+
+    const norm = (value: unknown): string | null => (
+      typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+    );
+    const liveSub = this.activeSubSessions.get(subSessionName);
+    const liveIncogMeta = this.incognitoSubSessionMetadata.get(subSessionName);
+    const pendingIncog = this.pendingIncognitoSubSessionStarts.get(subSessionName);
+    const incognito = this.incognitoSessions.has(subSessionName)
+      || Boolean(liveIncogMeta)
+      || Boolean(pendingIncog);
+    const liveParent = norm(liveSub?.parentSession) ?? norm(liveIncogMeta?.parentSession);
+
+    let dbFound = false;
+    let dbParent: string | null = null;
+    let lookupFailed = false;
+    if (this.db) {
+      try {
+        const row = await this.db.queryOne<{ id?: string | null; parent_session?: string | null }>(
+          'SELECT id, parent_session FROM sub_sessions WHERE id = $1 AND server_id = $2 LIMIT 1',
+          [rawId, this.serverId],
+        );
+        if (row) {
+          dbFound = true;
+          dbParent = norm(row.parent_session);
+        }
+      } catch {
+        lookupFailed = true;
+      }
+    }
+
+    const exists = Boolean(liveSub || liveIncogMeta || pendingIncog || incognito || dbFound);
+    const parentConflict = liveParent !== null && dbParent !== null && liveParent !== dbParent;
+    const parentSession = parentConflict ? null : (liveParent ?? dbParent);
+    return {
+      exists,
+      parentSession,
+      ...(incognito ? { incognito: true } : {}),
+      ...(lookupFailed ? { lookupFailed: true } : {}),
+    };
+  }
+
+  private async resolveShareLifecycleTargetContext(
+    msg: Record<string, unknown>,
+  ): Promise<ShareLifecycleTargetContext> {
+    const type = typeof msg.type === 'string' ? msg.type : '';
+    const norm = (value: unknown): string | null => (
+      typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+    );
+    if (type === 'subsession.start') {
+      const rawId = norm(msg.id);
+      const claimedParent = norm(msg.parentSession);
+      const parentIncognito = claimedParent ? this.incognitoSessions.has(claimedParent) : false;
+      if (!rawId || rawId.startsWith('deck_sub_')) {
+        return {
+          subSessionRecord: { exists: false, parentSession: null },
+          ...(parentIncognito ? { parentIncognito: true } : {}),
+        };
+      }
+      const subSessionRecord = await this.resolveShareSubSessionRecord(`deck_sub_${rawId}`);
+      return {
+        subSessionRecord,
+        ...(parentIncognito ? { parentIncognito: true } : {}),
+      };
+    }
+    if (type === 'session.start') {
+      const project = norm(msg.project);
+      if (project) {
+        const canonicalMain = mainSessionNameForProjectSlug(sanitizeProjectName(project));
+        if (this.incognitoSessions.has(canonicalMain)) {
+          return { targetIncognito: true };
+        }
+      }
+      return {};
+    }
+    if (type === 'subsession.restart' || type === 'session.restart') {
+      const sessionName = norm(msg.sessionName);
+      if (sessionName && sessionName.startsWith('deck_sub_')) {
+        const subSessionRecord = await this.resolveShareSubSessionRecord(sessionName);
+        return { subSessionRecord };
+      }
+      if (sessionName && this.incognitoSessions.has(sessionName)) {
+        return { targetIncognito: true };
+      }
+    }
+    return {};
   }
 
   async resolveSessionAgentType(sessionName: string): Promise<string | null> {

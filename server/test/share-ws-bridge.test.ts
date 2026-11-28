@@ -39,6 +39,7 @@ import { CC_PRESET_MSG } from '../../shared/cc-presets.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1, SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
+import { SESSION_INCOGNITO_CAPABILITY } from '../../shared/session-incognito-types.js';
 import { encodeSessionIdentityDirectHandle } from '../../shared/session-identity.js';
 import { SESSION_IDENTITY_WS } from '../../shared/session-identity-ws.js';
 
@@ -3827,6 +3828,185 @@ describe('WsBridge share-scoped sockets', () => {
     expect(daemon.sentJson).toHaveLength(0);
     expect(viewerSock.sentJson.some((m) => m.type === 'command.failed' && m.commandId === 'viewer-send-sh' && m.reason === SHARE_REASONS.ROLE_DENIED)).toBe(true);
     expect(viewerSock.sentJson.some((m) => m.type === 'error' && m.code === SHARE_REASONS.ROLE_DENIED)).toBe(true);
+  });
+
+  it('enforces canonical lifecycle target & server-known sub-session ownership for share participants without breaking authorized creates/restarts or incognito semantics', async () => {
+    const now = Date.now();
+    const daemon = new MockWs();
+    const bridge = WsBridge.get(serverId);
+    const subRows: Array<{ id: string; parent_session: string | null }> = [
+      { id: 'owned_db_sh', parent_session: 'deck_proj_alpha_brain' },
+      { id: 'other_db_sh', parent_session: 'deck_other_brain' },
+      { id: 'orphan_sub', parent_session: null },
+    ];
+    let throwSubSessionLookup = false;
+    const baseDb = makeDb(null, [], { subSessions: subRows });
+    const db = {
+      ...baseDb,
+      queryOne: async (sql: string, params: unknown[] = []) => {
+        if (sql.includes('FROM sub_sessions WHERE id = $1 AND server_id = $2')) {
+          if (throwSubSessionLookup) throw new Error('db_lookup_error');
+          const row = subRows.find((r) => r.id === params[0]);
+          return row ? { id: row.id, parent_session: row.parent_session } : null;
+        }
+        return (baseDb as { queryOne: (s: string, p?: unknown[]) => Promise<unknown> }).queryOne(sql, params);
+      },
+    } as never;
+
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-lifecycle-scope-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+      daemonId: serverId,
+      capabilities: [SESSION_INCOGNITO_CAPABILITY],
+      helloEpoch: 1,
+      sentAt: now,
+    }));
+    daemon.emit('message', JSON.stringify({
+      type: 'session_list',
+      sessions: [
+        { name: 'deck_proj_alpha_brain', project: 'Proj Alpha', role: 'brain', state: 'idle', agentType: 'shell', runtimeType: 'process' },
+        { name: 'deck_other_brain', project: 'other', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+      ],
+    }));
+    daemon.emit('message', JSON.stringify({
+      type: 'subsession.sync',
+      id: 'other_live_sh',
+      parentSession: 'deck_other_brain',
+      sessionType: 'shell',
+      runtimeType: 'process',
+      state: 'idle',
+    }));
+    await flushAsync();
+
+    // Owner creates an existing incognito sub-session; share participants must not hijack its ID.
+    const ownerWs = new MockWs();
+    bridge.handleBrowserConnection(ownerWs as never, 'owner-user', db);
+    ownerWs.emit('message', JSON.stringify({
+      type: 'subsession.start',
+      id: 'owner_incog',
+      sessionType: 'claude-code-sdk',
+      parentSession: 'deck_proj_alpha_brain',
+      incognito: true,
+    }));
+    await flushAsync();
+    expect(bridge.isIncognitoSessionName('deck_sub_owner_incog')).toBe(true);
+
+    const mainTarget: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_alpha_brain' };
+    const mainCov: EffectiveCoverage = {
+      ...coverage(mainTarget, 'participant', now),
+      coveredSessionNames: ['deck_proj_alpha_brain', 'deck_sub_owned_db_sh'],
+    };
+    bridge.setShareCoverageResolverForTests(async () => mainCov);
+    const tabSock = new MockWs();
+    bridge.handleShareBrowserConnection(tabSock as never, 'tab-participant-lifecycle', db, {
+      ticketId: 'ticket-tab-lifecycle',
+      target: mainTarget,
+      snapshot: mainCov,
+    });
+    await flushAsync();
+    daemon.sent.length = 0;
+    tabSock.sent.length = 0;
+
+    // 1) Bifurcated / out-of-scope lifecycle attempts MUST all be rejected cleanly without reaching daemon.
+    const deniedPayloads: Array<Record<string, unknown>> = [
+      // session.start spoofing covered sessionName while project resolves to uncovered deck_victim_brain
+      { type: 'session.start', sessionName: 'deck_proj_alpha_brain', project: 'victim', agentType: 'shell' },
+      // session.restart without sessionName (whole-project teardown+restart) is server-participant only
+      { type: 'session.restart', project: 'Proj Alpha' },
+      // session.restart spoofing `session` alias while restarting `project`
+      { type: 'session.restart', session: 'deck_proj_alpha_brain', project: 'other' },
+      // session.restart targeting uncovered session while smuggling covered project/parentSession
+      { type: 'session.restart', sessionName: 'deck_other_brain', project: 'Proj Alpha' },
+      // subsession.start spoofing covered sessionName while id/parentSession target uncovered session
+      { type: 'subsession.start', id: 'victim_new', sessionName: 'deck_proj_alpha_brain', parentSession: 'deck_other_brain', sessionType: 'shell' },
+      // subsession.start against DB-known existing subsession belonging to deck_other_brain with spoofed parentSession
+      { type: 'subsession.start', id: 'other_db_sh', sessionType: 'shell', parentSession: 'deck_proj_alpha_brain' },
+      // subsession.start against live-synced existing subsession belonging to deck_other_brain with spoofed parentSession
+      { type: 'subsession.start', id: 'other_live_sh', sessionType: 'shell', parentSession: 'deck_proj_alpha_brain' },
+      // subsession.start against existing subsession with null/unconfirmable parent ownership
+      { type: 'subsession.start', id: 'orphan_sub', sessionType: 'shell', parentSession: 'deck_proj_alpha_brain' },
+      // subsession.start against owner's existing incognito sub-session
+      { type: 'subsession.start', id: 'owner_incog', sessionType: 'claude-code-sdk', parentSession: 'deck_proj_alpha_brain' },
+      // subsession.start with non-canonical double-prefixed id
+      { type: 'subsession.start', id: 'deck_sub_owned_db_sh', sessionType: 'shell', parentSession: 'deck_proj_alpha_brain' },
+      // subsession.start creating a new subsession under an uncovered parent
+      { type: 'subsession.start', id: 'new_uncovered_parent', sessionType: 'shell', parentSession: 'deck_other_brain' },
+      // subsession.restart with mismatched id or spoofed session alias
+      { type: 'subsession.restart', sessionName: 'deck_sub_owned_db_sh', id: 'other_db_sh' },
+      { type: 'subsession.restart', sessionName: 'deck_sub_other_db_sh', session: 'deck_sub_owned_db_sh' },
+      { type: 'subsession.restart', sessionName: 'deck_sub_owner_incog' },
+    ];
+    for (const payload of deniedPayloads) {
+      tabSock.emit('message', JSON.stringify(payload));
+    }
+    await flushAsync();
+    expect(daemon.sentJson).toEqual([]);
+    expect(tabSock.sentJson.filter((m) => m.type === 'error' && m.code === SHARE_REASONS.DIRECT_SURFACE_DENIED)).toHaveLength(deniedPayloads.length);
+
+    // DB lookup failure while resolving existing subsession ownership must fail closed
+    throwSubSessionLookup = true;
+    tabSock.sent.length = 0;
+    tabSock.emit('message', JSON.stringify({
+      type: 'subsession.start',
+      id: 'maybe_db_sub',
+      sessionType: 'shell',
+      parentSession: 'deck_proj_alpha_brain',
+    }));
+    await flushAsync();
+    expect(daemon.sentJson).toEqual([]);
+    expect(tabSock.sentJson.some((m) => m.type === 'error' && m.code === SHARE_REASONS.DIRECT_SURFACE_DENIED)).toBe(true);
+    throwSubSessionLookup = false;
+
+    // 2) Authorized tab-share participant lifecycle operations forward exact validated canonical target
+    tabSock.sent.length = 0;
+    daemon.sent.length = 0;
+    tabSock.emit('message', JSON.stringify({ type: 'session.start', project: 'Proj Alpha', agentType: 'shell' }));
+    tabSock.emit('message', JSON.stringify({ type: 'session.restart', sessionName: 'deck_proj_alpha_brain', agentType: 'shell' }));
+    tabSock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'owned_db_sh', sessionType: 'shell', parentSession: 'deck_proj_alpha_brain' }));
+    tabSock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'new_tab_sh', sessionType: 'shell', parentSession: 'deck_proj_alpha_brain' }));
+    tabSock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'tab_incog_child', sessionType: 'claude-code-sdk', parentSession: 'deck_proj_alpha_brain', incognito: true }));
+    tabSock.emit('message', JSON.stringify({ type: 'subsession.restart', sessionName: 'deck_sub_owned_db_sh' }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'session.start', project: 'Proj Alpha', sharedActor: expect.objectContaining({ origin: 'shared-tab', effectiveActorRole: 'participant' }) }),
+      expect.objectContaining({ type: 'session.restart', sessionName: 'deck_proj_alpha_brain', sharedActor: expect.objectContaining({ origin: 'shared-tab' }) }),
+      expect.objectContaining({ type: 'subsession.start', id: 'owned_db_sh', parentSession: 'deck_proj_alpha_brain', sharedActor: expect.objectContaining({ origin: 'shared-tab' }) }),
+      expect.objectContaining({ type: 'subsession.start', id: 'new_tab_sh', parentSession: 'deck_proj_alpha_brain', sharedActor: expect.objectContaining({ origin: 'shared-tab' }) }),
+      expect.objectContaining({ type: 'subsession.start', id: 'tab_incog_child', parentSession: 'deck_proj_alpha_brain', incognito: true, sharedActor: expect.objectContaining({ origin: 'shared-tab' }) }),
+      expect.objectContaining({ type: 'subsession.restart', sessionName: 'deck_sub_owned_db_sh', sharedActor: expect.objectContaining({ origin: 'shared-tab' }) }),
+    ]));
+    expect(bridge.isIncognitoSessionName('deck_sub_tab_incog_child')).toBe(true);
+
+    // 3) Whole-server participant allows project-level session.restart, yet still rejects mismatched targets & orphan sub-session
+    const serverTarget: ShareTarget = { kind: 'server', serverId };
+    const serverCov: EffectiveCoverage = { ...coverage(serverTarget, 'participant', now), serverParticipantAuthority: true };
+    bridge.setShareCoverageResolverForTests(async () => serverCov);
+    const serverSock = new MockWs();
+    bridge.handleShareBrowserConnection(serverSock as never, 'server-participant-lifecycle', db, {
+      ticketId: 'ticket-srv-lifecycle',
+      target: serverTarget,
+      snapshot: serverCov,
+    });
+    await flushAsync();
+    daemon.sent.length = 0;
+    serverSock.sent.length = 0;
+
+    serverSock.emit('message', JSON.stringify({ type: 'session.restart', project: 'other' }));
+    serverSock.emit('message', JSON.stringify({ type: 'session.restart', project: 'other', session: 'deck_proj_alpha_brain' }));
+    serverSock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'orphan_sub', sessionType: 'shell', parentSession: 'deck_proj_alpha_brain' }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual([
+      expect.objectContaining({
+        type: 'session.restart',
+        project: 'other',
+        sharedActor: expect.objectContaining({ origin: 'shared-server', effectiveActorRole: 'participant' }),
+      }),
+    ]);
+    expect(serverSock.sentJson.filter((m) => m.type === 'error' && m.code === SHARE_REASONS.DIRECT_SURFACE_DENIED)).toHaveLength(2);
   });
 
   it('relays shell/script subsession.start, mixed-project session.restart, group-clone, P2P targets, and keeps cache invalidation fresh', async () => {

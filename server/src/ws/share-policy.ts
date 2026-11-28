@@ -41,7 +41,8 @@ import { TRANSPORT_QUEUE_COMMANDS } from '../../../shared/transport-queue-types.
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../../shared/openspec-auto-deliver-constants.js';
 import { CC_PRESET_MSG } from '../../../shared/cc-presets.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../../shared/supervision-task-console.js';
-import { SESSION_GROUP_CLONE_MSG } from '../../../shared/session-group-clone.js';
+import { SESSION_GROUP_CLONE_MSG, mainSessionNameForProjectSlug } from '../../../shared/session-group-clone.js';
+import { sanitizeProjectName } from '../../../shared/sanitize-project-name.js';
 import {
   projectSharedSessionSupervisionMode,
   SUPERVISION_MODE_PROJECTION_KEY,
@@ -144,7 +145,24 @@ export const SHARE_REASONS = {
   COMMENT_INVALID: 'share-comment-invalid',
 } as const satisfies Record<string, ShareReason>;
 
-const SHARE_LIFECYCLE_ACTOR_COMMANDS: ReadonlySet<string> = new Set([
+export type ShareSubSessionRecordLookup = {
+  /** True when live bridge state or persistent DB already knows a sub-session with this ID/name. */
+  exists: boolean;
+  /** Authoritative parentSession from live runtime state or DB (null when absent/unconfirmable). */
+  parentSession: string | null;
+  /** True when this sub-session is already tracked as incognito on the server. */
+  incognito?: boolean;
+  /** True when DB lookup failed so ownership could not be verified. */
+  lookupFailed?: boolean;
+};
+
+export type ShareLifecycleTargetContext = {
+  subSessionRecord?: ShareSubSessionRecordLookup;
+  parentIncognito?: boolean;
+  targetIncognito?: boolean;
+};
+
+export const SHARE_LIFECYCLE_ACTOR_COMMANDS: ReadonlySet<string> = new Set([
   'session.start',
   'session.restart',
   'subsession.start',
@@ -612,12 +630,207 @@ function stripClientShareAuthorityFields(msg: Record<string, unknown>): Record<s
   return rest;
 }
 
+function parseOptionalCanonicalField(
+  msg: Record<string, unknown>,
+  key: string,
+): { ok: true; value: string | null } | { ok: false } {
+  const raw = msg[key];
+  if (raw === undefined || raw === null) return { ok: true, value: null };
+  if (typeof raw !== 'string') return { ok: false };
+  const trimmed = raw.trim();
+  if (!trimmed) return { ok: raw.length === 0, value: null };
+  if (trimmed !== raw) return { ok: false };
+  return { ok: true, value: raw };
+}
+
+function lifecycleActionId(msg: Record<string, unknown>, now: number): string {
+  if (typeof msg.actionId === 'string' && msg.actionId.trim()) return msg.actionId.trim();
+  if (typeof msg.commandId === 'string' && msg.commandId.trim()) return msg.commandId.trim();
+  return `share-action-${now}`;
+}
+
+function stripLifecycleRoutingFields(msg: Record<string, unknown>): Record<string, unknown> {
+  const base = stripClientShareAuthorityFields(msg);
+  delete base.sessionName;
+  delete base.session;
+  delete base.sessionId;
+  delete base.parentSession;
+  delete base.project;
+  delete base.id;
+  return base;
+}
+
+function evaluateShareLifecycleCommand(
+  input: {
+    msg: Record<string, unknown>;
+    state: ShareScopedSocketState;
+    now: number;
+    lifecycleContext?: ShareLifecycleTargetContext;
+  },
+  serverParticipant: boolean,
+): ShareCommandDecision {
+  const type = typeof input.msg.type === 'string' ? input.msg.type : '';
+  const deny = (): ShareCommandDecision => ({ allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED });
+  const stamped = (fields: Record<string, unknown>): ShareCommandDecision => {
+    const base = stripLifecycleRoutingFields(input.msg);
+    return {
+      allowed: true,
+      stampedMessage: {
+        ...base,
+        ...fields,
+        sharedActor: buildSharedActorEnvelope(input.state, lifecycleActionId(input.msg, input.now), input.now),
+      },
+    };
+  };
+
+  if (type === 'session.start') {
+    const project = parseOptionalCanonicalField(input.msg, 'project');
+    const sessionName = parseOptionalCanonicalField(input.msg, 'sessionName');
+    const session = parseOptionalCanonicalField(input.msg, 'session');
+    const sessionId = parseOptionalCanonicalField(input.msg, 'sessionId');
+    const parentSession = parseOptionalCanonicalField(input.msg, 'parentSession');
+    if (!project.ok || !project.value || !sessionName.ok || !session.ok || !sessionId.ok || !parentSession.ok) {
+      return deny();
+    }
+    if (input.lifecycleContext?.targetIncognito) return deny();
+    const canonicalSession = mainSessionNameForProjectSlug(sanitizeProjectName(project.value));
+    for (const alias of [sessionName.value, session.value, sessionId.value, parentSession.value]) {
+      if (alias !== null && alias !== canonicalSession) return deny();
+    }
+    if (!shareStateCoversSession(input.state, canonicalSession)) return deny();
+    return stamped({ project: project.value });
+  }
+
+  if (type === 'session.restart') {
+    const sessionName = parseOptionalCanonicalField(input.msg, 'sessionName');
+    const project = parseOptionalCanonicalField(input.msg, 'project');
+    const session = parseOptionalCanonicalField(input.msg, 'session');
+    const sessionId = parseOptionalCanonicalField(input.msg, 'sessionId');
+    const parentSession = parseOptionalCanonicalField(input.msg, 'parentSession');
+    if (!sessionName.ok || !project.ok || !session.ok || !sessionId.ok || !parentSession.ok) {
+      return deny();
+    }
+    const subRecord = input.lifecycleContext?.subSessionRecord;
+    if (subRecord?.lookupFailed || subRecord?.incognito || input.lifecycleContext?.targetIncognito) return deny();
+
+    if (sessionName.value !== null) {
+      const targetSession = sessionName.value;
+      if (session.value !== null && session.value !== targetSession) return deny();
+      if (sessionId.value !== null && sessionId.value !== targetSession) return deny();
+      if (project.value !== null) {
+        const slug = sanitizeProjectName(project.value);
+        if (targetSession !== mainSessionNameForProjectSlug(slug) && !targetSession.startsWith(`deck_${slug}_`)) {
+          return deny();
+        }
+      }
+      if (parentSession.value !== null) {
+        if (parseSubSessionName(targetSession)) {
+          if (!subRecord?.exists || !subRecord.parentSession || parentSession.value !== subRecord.parentSession) {
+            return deny();
+          }
+        } else if (parentSession.value !== targetSession) {
+          return deny();
+        }
+      }
+      if (!shareStateCoversSession(input.state, targetSession)) return deny();
+      return stamped({ sessionName: targetSession });
+    }
+
+    // Whole-project restart (`cmd.project` without `cmd.sessionName`) remains whole-server-participant only.
+    if (!serverParticipant || !project.value) return deny();
+    if (session.value !== null || sessionId.value !== null || parentSession.value !== null) return deny();
+    return stamped({ project: project.value });
+  }
+
+  if (type === 'subsession.restart') {
+    const sessionName = parseOptionalCanonicalField(input.msg, 'sessionName');
+    const rawId = parseOptionalCanonicalField(input.msg, 'id');
+    const session = parseOptionalCanonicalField(input.msg, 'session');
+    const sessionId = parseOptionalCanonicalField(input.msg, 'sessionId');
+    const parentSession = parseOptionalCanonicalField(input.msg, 'parentSession');
+    if (!sessionName.ok || !sessionName.value || !rawId.ok || !session.ok || !sessionId.ok || !parentSession.ok) {
+      return deny();
+    }
+    const targetSession = sessionName.value;
+    if (rawId.value !== null && (rawId.value.startsWith('deck_sub_') || `deck_sub_${rawId.value}` !== targetSession)) {
+      return deny();
+    }
+    if (session.value !== null && session.value !== targetSession) return deny();
+    if (sessionId.value !== null && sessionId.value !== targetSession) return deny();
+
+    const subRecord = input.lifecycleContext?.subSessionRecord;
+    if (subRecord?.lookupFailed || subRecord?.incognito || input.lifecycleContext?.targetIncognito) return deny();
+
+    if (parseSubSessionName(targetSession)) {
+      if (subRecord?.exists) {
+        if (!subRecord.parentSession) {
+          if (parentSession.value !== null || (!serverParticipant && !shareTargetCoversSession(input.state.target, targetSession))) {
+            return deny();
+          }
+        } else {
+          if (parentSession.value !== null && parentSession.value !== subRecord.parentSession) return deny();
+          if (!serverParticipant && !shareTargetCoversSession(input.state.target, targetSession)
+            && !shareStateCoversSession(input.state, subRecord.parentSession)) {
+            return deny();
+          }
+        }
+      } else if (parentSession.value !== null && !shareStateCoversSession(input.state, parentSession.value)) {
+        return deny();
+      }
+    } else if (parentSession.value !== null && parentSession.value !== targetSession) {
+      return deny();
+    }
+
+    if (!shareStateCoversSession(input.state, targetSession)) return deny();
+    return stamped({ sessionName: targetSession });
+  }
+
+  if (type === 'subsession.start') {
+    const rawId = parseOptionalCanonicalField(input.msg, 'id');
+    const sessionName = parseOptionalCanonicalField(input.msg, 'sessionName');
+    const session = parseOptionalCanonicalField(input.msg, 'session');
+    const sessionId = parseOptionalCanonicalField(input.msg, 'sessionId');
+    const parentSession = parseOptionalCanonicalField(input.msg, 'parentSession');
+    if (!rawId.ok || !rawId.value || rawId.value.startsWith('deck_sub_') || !sessionName.ok || !session.ok || !sessionId.ok || !parentSession.ok) {
+      return deny();
+    }
+    const canonicalSession = `deck_sub_${rawId.value}`;
+    if (sessionName.value !== null && sessionName.value !== canonicalSession) return deny();
+    if (session.value !== null && session.value !== canonicalSession) return deny();
+    if (sessionId.value !== null && sessionId.value !== canonicalSession) return deny();
+
+    const subRecord = input.lifecycleContext?.subSessionRecord;
+    if (!subRecord || subRecord.lookupFailed || subRecord.incognito || input.lifecycleContext?.parentIncognito) {
+      return deny();
+    }
+
+    if (subRecord.exists) {
+      // Existing sub-session: require confirmed parent ownership, consistency with any supplied parentSession,
+      // and share coverage on BOTH the real sub-session target and its authoritative parent.
+      if (!subRecord.parentSession) return deny();
+      if (parentSession.value !== null && parentSession.value !== subRecord.parentSession) return deny();
+      if (!shareStateCoversSession(input.state, canonicalSession)) return deny();
+      if (!shareStateCoversSession(input.state, subRecord.parentSession)) return deny();
+      return stamped({ id: rawId.value, parentSession: subRecord.parentSession });
+    }
+
+    // New sub-session: authorize against a valid, covered parentSession (preserving incognito creation semantics).
+    if (!parentSession.value || !shareStateCoversSession(input.state, parentSession.value)) {
+      return deny();
+    }
+    return stamped({ id: rawId.value, parentSession: parentSession.value });
+  }
+
+  return deny();
+}
+
 export function evaluateShareCommand(input: {
   msg: Record<string, unknown>;
   state: ShareScopedSocketState;
   now: number;
   runtimeType: 'process' | 'transport' | 'unknown';
   activeDispatchId: string | null;
+  lifecycleContext?: ShareLifecycleTargetContext;
 }): ShareCommandDecision {
   const type = typeof input.msg.type === 'string' ? input.msg.type : '';
   const policy = SHARE_SCOPED_COMMAND_POLICY.get(type);
@@ -776,6 +989,9 @@ export function evaluateShareCommand(input: {
   }
 
   if (policy.kind === 'participant-covered-action') {
+    if (SHARE_LIFECYCLE_ACTOR_COMMANDS.has(type)) {
+      return evaluateShareLifecycleCommand(input, serverParticipant);
+    }
     if (!(targetlessCoveredForServerParticipant || (sessionName && shareStateCoversSession(input.state, sessionName)))) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
@@ -788,20 +1004,6 @@ export function evaluateShareCommand(input: {
         stampedMessage: {
           ...stripClientShareAuthorityFields(input.msg),
           sharedActor: buildSharedActorEnvelope(input.state, `share-input-${input.state.userId}`, input.now),
-        },
-      };
-    }
-    if (SHARE_LIFECYCLE_ACTOR_COMMANDS.has(type)) {
-      const actionId = typeof input.msg.actionId === 'string' && input.msg.actionId.trim()
-        ? input.msg.actionId.trim()
-        : typeof input.msg.commandId === 'string' && input.msg.commandId.trim()
-          ? input.msg.commandId.trim()
-          : `share-action-${input.now}`;
-      return {
-        allowed: true,
-        stampedMessage: {
-          ...stripClientShareAuthorityFields(input.msg),
-          sharedActor: buildSharedActorEnvelope(input.state, actionId, input.now),
         },
       };
     }
