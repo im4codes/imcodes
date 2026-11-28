@@ -966,7 +966,13 @@ describe('controlled-node lost-response recovery across ticket revocation/expiry
     return row!.id;
   }
 
-  async function runLostResponseFlow(mode: 'ticket_expired_legacy' | 'ticket_revoked' | 'ticket_never_succeeded_before_revoke') {
+  async function runLostResponseFlow(
+    mode:
+      | 'ticket_expired_legacy'
+      | 'ticket_revoked'
+      | 'ticket_never_succeeded_before_revoke'
+      | 'ticket_rebound_before_revoke',
+  ) {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
@@ -1099,11 +1105,28 @@ describe('controlled-node lost-response recovery across ticket revocation/expiry
         warn: () => {},
       });
 
-      // Attempt 1 with Ticket 1: fails on network timeout (committed for legacy/revoked modes; uncommitted for control mode).
+      // Attempt 1 with Ticket 1: fails on network timeout (committed for legacy/revoked/rebound modes; uncommitted for never-succeeded mode).
       await expect(bootstrapControlledNodeWithDisposition(makeDeps(ticket1))).rejects.toThrow(/network_timeout/);
 
-      // Expire or revoke Ticket 1 BEFORE Attempt 2 arrives with Ticket 2.
-      if (mode === 'ticket_expired_legacy') {
+      // Expire, revoke, or rebind+revoke Ticket 1 BEFORE Attempt 2 arrives with Ticket 2.
+      let rotatedServerId: string | null = null;
+      if (mode === 'ticket_rebound_before_revoke') {
+        const t1Install = await db.queryOne<{ redeemed_server_id: string }>(
+          'SELECT redeemed_server_id FROM controlled_node_enrollment_installs WHERE enrollment_id = $1',
+          [ticket1Id],
+        );
+        expect(t1Install?.redeemed_server_id).toBeTruthy();
+        rotatedServerId = t1Install!.redeemed_server_id;
+        // Simulate owner rebind rotating servers.token_hash so the pending Ticket-1 token is stale!
+        await db.execute(
+          'UPDATE servers SET token_hash = $2 WHERE id = $1',
+          [rotatedServerId, sha256(hex(16))],
+        );
+        await db.execute(
+          'UPDATE controlled_node_enrollments_v2 SET revoked_at = $2 WHERE id = $1',
+          [ticket1Id, Date.now()],
+        );
+      } else if (mode === 'ticket_expired_legacy') {
         await db.execute(
           'UPDATE controlled_node_enrollments_v2 SET expires_at = $2 WHERE id = $1',
           [ticket1Id, Date.now() - 1_000],
@@ -1122,18 +1145,27 @@ describe('controlled-node lost-response recovery across ticket revocation/expiry
         'SELECT id FROM servers WHERE user_id = $1 AND revoked_at IS NULL',
         [userId],
       );
-      expect(activeNodes).toHaveLength(1);
-      expect(res2.credential?.serverId).toBe(activeNodes[0]!.id);
 
       const t2Installs = await db.query<{ redeemed_server_id: string }>(
         'SELECT redeemed_server_id FROM controlled_node_enrollment_installs WHERE enrollment_id = $1',
         [ticket2Id],
       );
       if (mode === 'ticket_never_succeeded_before_revoke') {
+        expect(activeNodes).toHaveLength(1);
+        expect(res2.credential?.serverId).toBe(activeNodes[0]!.id);
         // Control: Ticket 1 replay got authoritative 401 -> cleared pending -> Ticket 2 created the single active node.
         expect(redeemedTickets).toEqual([ticket1, ticket1, ticket2]);
         expect(t2Installs).toHaveLength(1);
+      } else if (mode === 'ticket_rebound_before_revoke') {
+        // Rebound node A kept a different live token_hash, so Ticket 1 replay returned 401 (no stale token write-back);
+        // installer proceeded cleanly to redeem Ticket 2 creating Node B.
+        expect(redeemedTickets).toEqual([ticket1, ticket1, ticket2]);
+        expect(t2Installs).toHaveLength(1);
+        expect(res2.credential?.serverId).toBe(t2Installs[0]!.redeemed_server_id);
+        expect(res2.credential?.serverId).not.toBe(rotatedServerId);
       } else {
+        expect(activeNodes).toHaveLength(1);
+        expect(res2.credential?.serverId).toBe(activeNodes[0]!.id);
         // Regression: Ticket 1 had already committed in DB -> Ticket 1 idempotent replay recovered Node A
         // despite later revocation/expiry; Ticket 2 was NEVER redeemed.
         expect(redeemedTickets).toEqual([ticket1, ticket1]);
@@ -1155,5 +1187,9 @@ describe('controlled-node lost-response recovery across ticket revocation/expiry
 
   it('proceeds cleanly with new ticket when prior ticket replay authoritatively rejects (401) because no active node exists', async () => {
     await runLostResponseFlow('ticket_never_succeeded_before_revoke');
+  });
+
+  it('refuses stale idempotent replay after token rotation (rebind) + ticket revocation and proceeds with new ticket', async () => {
+    await runLostResponseFlow('ticket_rebound_before_revoke');
   });
 });

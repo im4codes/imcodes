@@ -2452,10 +2452,11 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         display_name: string | null;
         abi_profile?: unknown;
         server_revoked_at: number | null;
+        server_token_hash: string;
       }>(
         `SELECT install.node_token_hash, install.redeemed_server_id,
                 server.node_id, server.ref_name, server.display_name, server.abi_profile,
-                server.revoked_at AS server_revoked_at
+                server.revoked_at AS server_revoked_at, server.token_hash AS server_token_hash
            FROM controlled_node_enrollment_installs AS install
            JOIN servers AS server ON server.id = install.redeemed_server_id
           WHERE install.enrollment_id = $1 AND install.install_id = $2`,
@@ -2472,11 +2473,13 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         && existing.server_revoked_at == null
         && runtimeMatchesTicket
         && existing.node_token_hash === nodeTokenHash
+        && existing.server_token_hash === nodeTokenHash
         && normalizeControlledNodeAbiProfile(existing.abi_profile) === abiProfile
       ) {
-        // Exact idempotent replay of an active node created by this enrollment +
-        // install identity (allowed even if the ticket was later revoked or
-        // expired; owner account + node revocation status are both enforced).
+        // Exact idempotent replay of an active node whose current live credential
+        // still matches this install (allowed even if the ticket was later
+        // revoked or expired; owner, node revocation, and live token match are
+        // all enforced).
         const existingNodeId = parseControlledNodeId(existing.node_id);
         if (!existingNodeId) throw new Error('controlled_node_redeem_stored_node_id_invalid');
         const legacyTarget = existing.ref_name == null
@@ -2508,7 +2511,7 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         return { kind: 'mismatch' as const, ticketId: row.id };
       }
       if (existing) {
-        if (existing.server_revoked_at != null) {
+        if (existing.server_revoked_at != null || existing.server_token_hash !== existing.node_token_hash) {
           return { kind: 'denied' as const };
         }
         return { kind: 'mismatch' as const, ticketId: row.id };
