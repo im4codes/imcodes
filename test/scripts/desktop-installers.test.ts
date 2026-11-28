@@ -2612,430 +2612,432 @@ if (-not ($script:schtasksCalls -contains '/End /TN imcodes-node')) { throw 'mis
     },
   );
 
-  it('installs OpenCode CLI idempotently and non-blockingly in POSIX (linux + darwin) postinstall before service start', async () => {
-    for (const os of ['linux', 'darwin'] as const) {
-      const root = makeTempDir(`imcodes-oc-${os}-`);
-      const rtDir = createFakeRuntimeDir(root, os, '0.9.5');
-      mkdirSync(join(rtDir, 'package', 'dist', 'src', 'node'), { recursive: true });
-      writeFileSync(join(rtDir, 'package', 'dist', 'src', 'node', 'install-opencode-cli.js'), '// stub\n', 'utf8');
+  it.each(['linux', 'darwin'] as const)(
+    'installs OpenCode CLI idempotently and non-blockingly in POSIX (%s) postinstall before service start',
+    async (os) => {
+    const root = makeTempDir(`imcodes-oc-${os}-`);
+    const rtDir = createFakeRuntimeDir(root, os, '0.9.5');
+    mkdirSync(join(rtDir, 'package', 'dist', 'src', 'node'), { recursive: true });
+    writeFileSync(join(rtDir, 'package', 'dist', 'src', 'node', 'install-opencode-cli.js'), '// stub\n', 'utf8');
 
-      const runnerPath = join(root, `phase-a-${os}.sh`);
-      const scriptText = renderPosixPhaseARunnerScript({
-        platform: os,
-        version: '0.9.5',
-        cliWrapperContent: '#!/bin/sh\necho ok\n',
-      });
-      writeFileSync(runnerPath, scriptText, { mode: 0o755 });
+    const runnerPath = join(root, `phase-a-${os}.sh`);
+    const scriptText = renderPosixPhaseARunnerScript({
+      platform: os,
+      version: '0.9.5',
+      cliWrapperContent: '#!/bin/sh\necho ok\n',
+    });
+    writeFileSync(runnerPath, scriptText, { mode: 0o755 });
 
-      expect(scriptText).toContain('install_opencode_cli_best_effort');
-      expect(scriptText).toContain('run_as_target_unix_user');
-      expect(scriptText).toContain('install-opencode-cli.js" --home "$EFF_HOME" --strict');
-      expect(scriptText.lastIndexOf('install_opencode_cli_best_effort\n\nif [ "$CLEAN_EXPIRED_TMP"')).toBeLessThan(
-        scriptText.lastIndexOf('if [ "$PRESERVE_AUTOSTART" -eq 0 ]; then'),
-      );
-      expect(scriptText.lastIndexOf('install_opencode_cli_best_effort\n\nif [ "$CLEAN_EXPIRED_TMP"')).toBeLessThan(
-        scriptText.lastIndexOf('if [ "$APPLY_SERVICES" -eq 1 ]; then'),
-      );
+    expect(scriptText).toContain('install_opencode_cli_best_effort');
+    expect(scriptText).toContain('run_as_target_unix_user');
+    expect(scriptText).toContain('install-opencode-cli.js" --home "$EFF_HOME" --strict');
+    expect(scriptText.lastIndexOf('install_opencode_cli_best_effort\n\nif [ "$CLEAN_EXPIRED_TMP"')).toBeLessThan(
+      scriptText.lastIndexOf('if [ "$PRESERVE_AUTOSTART" -eq 0 ]; then'),
+    );
+    expect(scriptText.lastIndexOf('install_opencode_cli_best_effort\n\nif [ "$CLEAN_EXPIRED_TMP"')).toBeLessThan(
+      scriptText.lastIndexOf('if [ "$APPLY_SERVICES" -eq 1 ]; then'),
+    );
 
-      // Build fake staged release dir + hook logging invocation order
-      const traceFile = join(root, 'trace.log');
-      const fakeHook = join(root, 'oc-hook.sh');
-      writeFileSync(
-        fakeHook,
-        `#!/bin/sh
+    // Build fake staged release dir + hook logging invocation order
+    const traceFile = join(root, 'trace.log');
+    const fakeHook = join(root, 'oc-hook.sh');
+    writeFileSync(
+      fakeHook,
+      `#!/bin/sh
 echo "OC_HOOK args=$*" >> "${traceFile}"
 home_arg=""
 while [ $# -gt 0 ]; do
-  case "$1" in
-    --home) home_arg="$2"; shift 2 ;;
-    *) shift ;;
-  esac
+case "$1" in
+  --home) home_arg="$2"; shift 2 ;;
+  *) shift ;;
+esac
 done
 mkdir -p "$home_arg/.opencode/bin"
 printf '#!/bin/sh\necho 2.4.2\n' > "$home_arg/.opencode/bin/opencode"
 chmod 755 "$home_arg/.opencode/bin/opencode"
 `,
-        { mode: 0o755 },
-      );
+      { mode: 0o755 },
+    );
 
-      const failHook = join(root, 'oc-fail-hook.sh');
-      writeFileSync(
-        failHook,
-        `#!/bin/sh
+    const failHook = join(root, 'oc-fail-hook.sh');
+    writeFileSync(
+      failHook,
+      `#!/bin/sh
 echo "OC_FAIL_HOOK" >> "${traceFile}"
 exit 42
 `,
-        { mode: 0o755 },
-      );
+      { mode: 0o755 },
+    );
 
-      const fakeSvcBin = join(root, os === 'linux' ? 'fake-systemctl.sh' : 'fake-launchctl.sh');
-      writeFileSync(
-        fakeSvcBin,
-        `#!/bin/sh
+    const fakeSvcBin = join(root, os === 'linux' ? 'fake-systemctl.sh' : 'fake-launchctl.sh');
+    writeFileSync(
+      fakeSvcBin,
+      `#!/bin/sh
 echo "SVC args=$*" >> "${traceFile}"
 exit 0
 `,
-        { mode: 0o755 },
-      );
+      { mode: 0o755 },
+    );
 
-      // Case 1: isolated mode with no hook/registry does NOT invoke node installer or create .opencode
-      const isoDefault = join(root, 'iso-default');
-      const homeDefault = join(root, 'home-default');
-      mkdirSync(join(isoDefault, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
-      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoDefault, 'daemon-runtime', 'releases', '0.9.5')]);
-      const outDefault = execFileSync(
-        runnerPath,
-        ['--isolated-root', isoDefault, '--home', homeDefault, '--confirm-fda-switch', '--no-service-control'],
-        { env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: '', IMCODES_OPENCODE_REGISTRY: '' }, encoding: 'utf8' },
-      );
-      expect(outDefault).toContain('INSTALL_OK');
-      expect(existsSync(join(homeDefault, '.opencode'))).toBe(false);
+    // Case 1: isolated mode with no hook/registry does NOT invoke node installer or create .opencode
+    const isoDefault = join(root, 'iso-default');
+    const homeDefault = join(root, 'home-default');
+    mkdirSync(join(isoDefault, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+    execFileSync('cp', ['-R', `${rtDir}/.`, join(isoDefault, 'daemon-runtime', 'releases', '0.9.5')]);
+    const outDefault = execFileSync(
+      runnerPath,
+      ['--isolated-root', isoDefault, '--home', homeDefault, '--confirm-fda-switch', '--no-service-control'],
+      { env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: '', IMCODES_OPENCODE_REGISTRY: '' }, encoding: 'utf8' },
+    );
+    expect(outDefault).toContain('INSTALL_OK');
+    expect(existsSync(join(homeDefault, '.opencode'))).toBe(false);
 
-      // Case 2: hook runs BEFORE service start/restart and installs ~/.opencode/bin/opencode
-      const isoHook = join(root, 'iso-hook');
-      const homeHook = join(root, 'home-hook');
-      mkdirSync(join(isoHook, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
-      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoHook, 'daemon-runtime', 'releases', '0.9.5')]);
-      const outHook = execFileSync(
+    // Case 2: hook runs BEFORE service start/restart and installs ~/.opencode/bin/opencode
+    const isoHook = join(root, 'iso-hook');
+    const homeHook = join(root, 'home-hook');
+    mkdirSync(join(isoHook, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+    execFileSync('cp', ['-R', `${rtDir}/.`, join(isoHook, 'daemon-runtime', 'releases', '0.9.5')]);
+    const outHook = execFileSync(
+      runnerPath,
+      ['--isolated-root', isoHook, '--home', homeHook, '--confirm-fda-switch', '--apply-services'],
+      {
+        env: {
+          ...process.env,
+          IMCODES_OPENCODE_INSTALL_HOOK: fakeHook,
+          ...(os === 'linux' ? { IMCODES_SYSTEMCTL_BIN: fakeSvcBin } : { IMCODES_LAUNCHCTL_BIN: fakeSvcBin }),
+        },
+        encoding: 'utf8',
+      },
+    );
+    expect(outHook).toContain('INSTALL_OK');
+    expect(existsSync(join(homeHook, '.opencode', 'bin', 'opencode'))).toBe(true);
+    const traceLines = readFileSync(traceFile, 'utf8').trim().split('\n');
+    const ocIdx = traceLines.findIndex((l) => l.startsWith('OC_HOOK'));
+    const svcStartIdx = traceLines.findIndex(
+      (l) => l.startsWith('SVC') && (l.includes('restart') || l.includes('start') || l.includes('bootstrap') || l.includes('kickstart')),
+    );
+    expect(ocIdx).toBeGreaterThanOrEqual(0);
+    expect(svcStartIdx).toBeGreaterThan(ocIdx);
+
+    // Case 3: IMCODES_SKIP_OPENCODE=1 skips hook cleanly
+    const isoSkip = join(root, 'iso-skip');
+    const homeSkip = join(root, 'home-skip');
+    mkdirSync(join(isoSkip, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+    execFileSync('cp', ['-R', `${rtDir}/.`, join(isoSkip, 'daemon-runtime', 'releases', '0.9.5')]);
+    execFileSync(
+      runnerPath,
+      ['--isolated-root', isoSkip, '--home', homeSkip, '--confirm-fda-switch', '--no-service-control'],
+      { env: { ...process.env, IMCODES_SKIP_OPENCODE: '1', IMCODES_OPENCODE_INSTALL_HOOK: fakeHook }, encoding: 'utf8' },
+    );
+    expect(existsSync(join(homeSkip, '.opencode'))).toBe(false);
+
+    // Case 4: failing OpenCode install stays strictly non-blocking
+    const isoFail = join(root, 'iso-fail');
+    const homeFail = join(root, 'home-fail');
+    mkdirSync(join(isoFail, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+    execFileSync('cp', ['-R', `${rtDir}/.`, join(isoFail, 'daemon-runtime', 'releases', '0.9.5')]);
+    const outFail = execFileSync(
+      runnerPath,
+      ['--isolated-root', isoFail, '--home', homeFail, '--confirm-fda-switch', '--no-service-control'],
+      { env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: failHook }, encoding: 'utf8' },
+    );
+    expect(outFail).toContain('INSTALL_OK');
+
+    // Case 5: default node invocation wires --home "$EFF_HOME" --strict --no-fallback --isolated-test cleanly and stays isolated
+    let externalHits = 0;
+    const forbiddenExternalSrv = createServer((_req, res) => {
+      externalHits += 1;
+      res.statusCode = 500;
+      res.end('should-never-hit');
+    });
+    await new Promise<void>((resolve) => forbiddenExternalSrv.listen(0, '127.0.0.1', resolve));
+    const externalPort = (forbiddenExternalSrv.address() as { port: number }).port;
+    try {
+      const isoNode = join(root, 'iso-node');
+      const homeNode = join(root, 'home-node');
+      mkdirSync(join(isoNode, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+      mkdirSync(join(homeNode, '.imcodes'), { recursive: true });
+      writeFileSync(
+        join(homeNode, '.imcodes', 'install.json'),
+        JSON.stringify({ registry: `http://127.0.0.1:${externalPort}` }),
+        'utf8',
+      );
+      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoNode, 'daemon-runtime', 'releases', '0.9.5')]);
+      const nodeExecTrace = join(root, `node-exec-${os}.log`);
+      const isoNodeBin = join(isoNode, 'daemon-runtime', 'releases', '0.9.5', 'bin', 'node');
+      const compiledOcJs = join(process.cwd(), 'dist', 'src', 'node', 'install-opencode-cli.js');
+      if (existsSync(compiledOcJs)) {
+        writeFileSync(
+          join(isoNode, 'daemon-runtime', 'releases', '0.9.5', 'package', 'dist', 'src', 'node', 'install-opencode-cli.js'),
+          readFileSync(compiledOcJs),
+        );
+        writeFileSync(
+          isoNodeBin,
+          `#!/bin/sh\necho "NODE_EXEC args=$*" >> "${nodeExecTrace}"\nPATH="" exec "${process.execPath}" "$@"\n`,
+          { mode: 0o755 },
+        );
+      } else {
+        writeFileSync(
+          isoNodeBin,
+          `#!/bin/sh\necho "NODE_EXEC args=$*" >> "${nodeExecTrace}"\nexit 1\n`,
+          { mode: 0o755 },
+        );
+      }
+      const resNode = spawnSync(
         runnerPath,
-        ['--isolated-root', isoHook, '--home', homeHook, '--confirm-fda-switch', '--apply-services'],
+        ['--isolated-root', isoNode, '--home', homeNode, '--confirm-fda-switch', '--no-service-control'],
         {
           env: {
             ...process.env,
-            IMCODES_OPENCODE_INSTALL_HOOK: fakeHook,
-            ...(os === 'linux' ? { IMCODES_SYSTEMCTL_BIN: fakeSvcBin } : { IMCODES_LAUNCHCTL_BIN: fakeSvcBin }),
+            IMCODES_OPENCODE_INSTALL_HOOK: '',
+            IMCODES_OPENCODE_REGISTRY: 'http://127.0.0.1:9',
           },
           encoding: 'utf8',
         },
       );
-      expect(outHook).toContain('INSTALL_OK');
-      expect(existsSync(join(homeHook, '.opencode', 'bin', 'opencode'))).toBe(true);
-      const traceLines = readFileSync(traceFile, 'utf8').trim().split('\n');
-      const ocIdx = traceLines.findIndex((l) => l.startsWith('OC_HOOK'));
-      const svcStartIdx = traceLines.findIndex(
-        (l) => l.startsWith('SVC') && (l.includes('restart') || l.includes('start') || l.includes('bootstrap') || l.includes('kickstart')),
-      );
-      expect(ocIdx).toBeGreaterThanOrEqual(0);
-      expect(svcStartIdx).toBeGreaterThan(ocIdx);
+      expect(resNode.status).toBe(0);
+      expect(resNode.stdout).toContain('INSTALL_OK');
+      expect(resNode.stderr).toContain('WARNING: OpenCode CLI install failed (non-blocking)');
+      const nodeTraceText = readFileSync(nodeExecTrace, 'utf8');
+      expect(nodeTraceText).toContain('install-opencode-cli.js');
+      expect(nodeTraceText).toContain('--strict');
+      expect(nodeTraceText).toContain('--isolated-test');
+      expect(nodeTraceText).toContain('--no-fallback');
+      expect(externalHits).toBe(0);
+    } finally {
+      await new Promise<void>((resolve) => forbiddenExternalSrv.close(() => resolve()));
+    }
 
-      // Case 3: IMCODES_SKIP_OPENCODE=1 skips hook cleanly
-      const isoSkip = join(root, 'iso-skip');
-      const homeSkip = join(root, 'home-skip');
-      mkdirSync(join(isoSkip, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
-      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoSkip, 'daemon-runtime', 'releases', '0.9.5')]);
-      execFileSync(
-        runnerPath,
-        ['--isolated-root', isoSkip, '--home', homeSkip, '--confirm-fda-switch', '--no-service-control'],
-        { env: { ...process.env, IMCODES_SKIP_OPENCODE: '1', IMCODES_OPENCODE_INSTALL_HOOK: fakeHook }, encoding: 'utf8' },
-      );
-      expect(existsSync(join(homeSkip, '.opencode'))).toBe(false);
-
-      // Case 4: failing OpenCode install stays strictly non-blocking
-      const isoFail = join(root, 'iso-fail');
-      const homeFail = join(root, 'home-fail');
-      mkdirSync(join(isoFail, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
-      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoFail, 'daemon-runtime', 'releases', '0.9.5')]);
-      const outFail = execFileSync(
-        runnerPath,
-        ['--isolated-root', isoFail, '--home', homeFail, '--confirm-fda-switch', '--no-service-control'],
-        { env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: failHook }, encoding: 'utf8' },
-      );
-      expect(outFail).toContain('INSTALL_OK');
-
-      // Case 5: default node invocation wires --home "$EFF_HOME" --strict --no-fallback --isolated-test cleanly and stays isolated
-      let externalHits = 0;
-      const forbiddenExternalSrv = createServer((_req, res) => {
-        externalHits += 1;
-        res.statusCode = 500;
-        res.end('should-never-hit');
-      });
-      await new Promise<void>((resolve) => forbiddenExternalSrv.listen(0, '127.0.0.1', resolve));
-      const externalPort = (forbiddenExternalSrv.address() as { port: number }).port;
-      try {
-        const isoNode = join(root, 'iso-node');
-        const homeNode = join(root, 'home-node');
-        mkdirSync(join(isoNode, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
-        mkdirSync(join(homeNode, '.imcodes'), { recursive: true });
-        writeFileSync(
-          join(homeNode, '.imcodes', 'install.json'),
-          JSON.stringify({ registry: `http://127.0.0.1:${externalPort}` }),
-          'utf8',
-        );
-        execFileSync('cp', ['-R', `${rtDir}/.`, join(isoNode, 'daemon-runtime', 'releases', '0.9.5')]);
-        const nodeExecTrace = join(root, `node-exec-${os}.log`);
-        const isoNodeBin = join(isoNode, 'daemon-runtime', 'releases', '0.9.5', 'bin', 'node');
-        const compiledOcJs = join(process.cwd(), 'dist', 'src', 'node', 'install-opencode-cli.js');
-        if (existsSync(compiledOcJs)) {
-          writeFileSync(
-            join(isoNode, 'daemon-runtime', 'releases', '0.9.5', 'package', 'dist', 'src', 'node', 'install-opencode-cli.js'),
-            readFileSync(compiledOcJs),
-          );
-          writeFileSync(
-            isoNodeBin,
-            `#!/bin/sh\necho "NODE_EXEC args=$*" >> "${nodeExecTrace}"\nPATH="" exec "${process.execPath}" "$@"\n`,
-            { mode: 0o755 },
-          );
-        } else {
-          writeFileSync(
-            isoNodeBin,
-            `#!/bin/sh\necho "NODE_EXEC args=$*" >> "${nodeExecTrace}"\nexit 1\n`,
-            { mode: 0o755 },
-          );
-        }
-        const resNode = spawnSync(
-          runnerPath,
-          ['--isolated-root', isoNode, '--home', homeNode, '--confirm-fda-switch', '--no-service-control'],
-          {
-            env: {
-              ...process.env,
-              IMCODES_OPENCODE_INSTALL_HOOK: '',
-              IMCODES_OPENCODE_REGISTRY: 'http://127.0.0.1:9',
-            },
-            encoding: 'utf8',
-          },
-        );
-        expect(resNode.status).toBe(0);
-        expect(resNode.stdout).toContain('INSTALL_OK');
-        expect(resNode.stderr).toContain('WARNING: OpenCode CLI install failed (non-blocking)');
-        const nodeTraceText = readFileSync(nodeExecTrace, 'utf8');
-        expect(nodeTraceText).toContain('install-opencode-cli.js');
-        expect(nodeTraceText).toContain('--strict');
-        expect(nodeTraceText).toContain('--isolated-test');
-        expect(nodeTraceText).toContain('--no-fallback');
-        expect(externalHits).toBe(0);
-      } finally {
-        await new Promise<void>((resolve) => forbiddenExternalSrv.close(() => resolve()));
-      }
-
-      // Case 6: root installer drops privileges via runuser to target user, and warns/skips when no non-root target user resolves
-      const realIdBin = execFileSync('which', ['id'], { encoding: 'utf8' }).trim();
-      const fakePrivBin = join(root, 'fake-priv-bin');
-      mkdirSync(fakePrivBin, { recursive: true });
-      const privTrace = join(root, 'priv-trace.log');
-      writeFileSync(
-        join(fakePrivBin, 'id'),
-        `#!/bin/sh
+    // Case 6: root installer drops privileges via runuser to target user, and warns/skips when no non-root target user resolves
+    const realIdBin = execFileSync('which', ['id'], { encoding: 'utf8' }).trim();
+    const fakePrivBin = join(root, 'fake-priv-bin');
+    mkdirSync(fakePrivBin, { recursive: true });
+    const privTrace = join(root, 'priv-trace.log');
+    writeFileSync(
+      join(fakePrivBin, 'id'),
+      `#!/bin/sh
 if [ "$1" = "-u" ] && [ "$#" -eq 1 ]; then
-  echo 0
-  exit 0
+echo 0
+exit 0
 fi
 exec "${realIdBin}" "$@"
 `,
-        { mode: 0o755 },
-      );
-      writeFileSync(
-        join(fakePrivBin, 'runuser'),
-        `#!/bin/sh
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      join(fakePrivBin, 'runuser'),
+      `#!/bin/sh
 if [ "$1" = "-u" ]; then
-  target="$2"
-  shift 2
-  [ "$1" = "--" ] && shift
-  echo "RUNUSER_DROP user=$target cmd=$*" >> "${privTrace}"
-  exec "$@"
+target="$2"
+shift 2
+[ "$1" = "--" ] && shift
+echo "RUNUSER_DROP user=$target cmd=$*" >> "${privTrace}"
+exec "$@"
 fi
 exit 1
 `,
-        { mode: 0o755 },
-      );
-      const isoPriv = join(root, 'iso-priv');
-      const homePriv = join(root, 'home-priv');
-      mkdirSync(join(isoPriv, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
-      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoPriv, 'daemon-runtime', 'releases', '0.9.5')]);
-      const outPriv = execFileSync(
-        runnerPath,
-        ['--isolated-root', isoPriv, '--home', homePriv, '--confirm-fda-switch', '--no-service-control'],
-        {
-          env: {
-            ...process.env,
-            PATH: `${fakePrivBin}:${process.env.PATH ?? ''}`,
-            SUDO_USER: process.env.USER || execFileSync(realIdBin, ['-un'], { encoding: 'utf8' }).trim(),
-            IMCODES_OPENCODE_INSTALL_HOOK: fakeHook,
-          },
-          encoding: 'utf8',
+      { mode: 0o755 },
+    );
+    const isoPriv = join(root, 'iso-priv');
+    const homePriv = join(root, 'home-priv');
+    mkdirSync(join(isoPriv, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+    execFileSync('cp', ['-R', `${rtDir}/.`, join(isoPriv, 'daemon-runtime', 'releases', '0.9.5')]);
+    const outPriv = execFileSync(
+      runnerPath,
+      ['--isolated-root', isoPriv, '--home', homePriv, '--confirm-fda-switch', '--no-service-control'],
+      {
+        env: {
+          ...process.env,
+          PATH: `${fakePrivBin}:${process.env.PATH ?? ''}`,
+          SUDO_USER: process.env.USER || execFileSync(realIdBin, ['-un'], { encoding: 'utf8' }).trim(),
+          IMCODES_OPENCODE_INSTALL_HOOK: fakeHook,
         },
-      );
-      expect(outPriv).toContain('INSTALL_OK');
-      expect(existsSync(join(homePriv, '.opencode', 'bin', 'opencode'))).toBe(true);
-      expect(readFileSync(privTrace, 'utf8')).toContain('RUNUSER_DROP user=');
+        encoding: 'utf8',
+      },
+    );
+    expect(outPriv).toContain('INSTALL_OK');
+    expect(existsSync(join(homePriv, '.opencode', 'bin', 'opencode'))).toBe(true);
+    expect(readFileSync(privTrace, 'utf8')).toContain('RUNUSER_DROP user=');
 
-      // Missing non-root target user warns & skips cleanly when running as simulated uid 0
-      const fakeRootOnlyBin = join(root, 'fake-root-only-bin');
-      mkdirSync(fakeRootOnlyBin, { recursive: true });
-      const realStatBin = execFileSync('which', ['stat'], { encoding: 'utf8' }).trim();
-      writeFileSync(
-        join(fakeRootOnlyBin, 'id'),
-        `#!/bin/sh
+    // Missing non-root target user warns & skips cleanly when running as simulated uid 0
+    const fakeRootOnlyBin = join(root, 'fake-root-only-bin');
+    mkdirSync(fakeRootOnlyBin, { recursive: true });
+    const realStatBin = execFileSync('which', ['stat'], { encoding: 'utf8' }).trim();
+    writeFileSync(
+      join(fakeRootOnlyBin, 'id'),
+      `#!/bin/sh
 if [ "$1" = "-u" ]; then echo 0; exit 0; fi
 if [ "$1" = "-un" ]; then echo root; exit 0; fi
 exec "${realIdBin}" "$@"
 `,
-        { mode: 0o755 },
-      );
-      writeFileSync(
-        join(fakeRootOnlyBin, 'stat'),
-        `#!/bin/sh
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      join(fakeRootOnlyBin, 'stat'),
+      `#!/bin/sh
 case "$*" in
-  *"%U"*|*"%Su"*) echo root; exit 0 ;;
+*"%U"*|*"%Su"*) echo root; exit 0 ;;
 esac
 exec "${realStatBin}" "$@"
 `,
-        { mode: 0o755 },
-      );
-      const isoNoUser = join(root, 'iso-no-user');
-      const homeNoUser = join(root, 'home-no-user');
-      mkdirSync(join(isoNoUser, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
-      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoNoUser, 'daemon-runtime', 'releases', '0.9.5')]);
-      const resNoUser = spawnSync(
+      { mode: 0o755 },
+    );
+    const isoNoUser = join(root, 'iso-no-user');
+    const homeNoUser = join(root, 'home-no-user');
+    mkdirSync(join(isoNoUser, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+    execFileSync('cp', ['-R', `${rtDir}/.`, join(isoNoUser, 'daemon-runtime', 'releases', '0.9.5')]);
+    const resNoUser = spawnSync(
+      runnerPath,
+      ['--isolated-root', isoNoUser, '--home', homeNoUser, '--confirm-fda-switch', '--no-service-control'],
+      {
+        env: {
+          ...process.env,
+          PATH: `${fakeRootOnlyBin}:${process.env.PATH ?? ''}`,
+          SUDO_USER: '',
+          USER: 'root',
+          LOGNAME: 'root',
+          IMCODES_OPENCODE_INSTALL_HOOK: fakeHook,
+        },
+        encoding: 'utf8',
+      },
+    );
+    expect(resNoUser.status).toBe(0);
+    expect(resNoUser.stdout).toContain('INSTALL_OK');
+    expect(resNoUser.stderr).toContain('unable to resolve non-root target user');
+    expect(existsSync(join(homeNoUser, '.opencode'))).toBe(false);
+
+    // Case 7: symlinked .opencode/bin escaping isolated home is refused non-blockingly without writing outside target
+    const isoSym = join(root, 'iso-sym');
+    const homeSym = join(root, 'home-sym');
+    const outsideSymDir = makeTempDir(`imcodes-oc-outside-${os}-`);
+    mkdirSync(join(isoSym, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+    mkdirSync(join(homeSym, '.opencode'), { recursive: true });
+    symlinkSync(outsideSymDir, join(homeSym, '.opencode', 'bin'));
+    execFileSync('cp', ['-R', `${rtDir}/.`, join(isoSym, 'daemon-runtime', 'releases', '0.9.5')]);
+    const resSym = spawnSync(
+      runnerPath,
+      ['--isolated-root', isoSym, '--home', homeSym, '--confirm-fda-switch', '--no-service-control'],
+      {
+        env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: fakeHook },
+        encoding: 'utf8',
+      },
+    );
+    expect(resSym.status).toBe(0);
+    expect(resSym.stdout).toContain('INSTALL_OK');
+    expect(resSym.stderr).toContain('refusing symlinked OpenCode target path');
+    expect(readdirSync(outsideSymDir)).toEqual([]);
+
+    // Leaf binary symlink escaping home into sentinel file is rejected BEFORE hook runs
+    const isoLeaf = join(root, 'iso-leaf');
+    const homeLeaf = join(root, 'home-leaf');
+    const sentinelDir = makeTempDir(`imcodes-oc-sentinel-${os}-`);
+    const sentinelFile = join(sentinelDir, 'sentinel.txt');
+    writeFileSync(sentinelFile, 'SENTINEL_UNTOUCHED', 'utf8');
+    mkdirSync(join(isoLeaf, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+    mkdirSync(join(homeLeaf, '.opencode', 'bin'), { recursive: true });
+    symlinkSync(sentinelFile, join(homeLeaf, '.opencode', 'bin', 'opencode'));
+    execFileSync('cp', ['-R', `${rtDir}/.`, join(isoLeaf, 'daemon-runtime', 'releases', '0.9.5')]);
+    const resLeaf = spawnSync(
+      runnerPath,
+      ['--isolated-root', isoLeaf, '--home', homeLeaf, '--confirm-fda-switch', '--no-service-control'],
+      {
+        env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: fakeHook },
+        encoding: 'utf8',
+      },
+    );
+    expect(resLeaf.status).toBe(0);
+    expect(resLeaf.stdout).toContain('INSTALL_OK');
+    expect(resLeaf.stderr).toContain('refusing symlinked OpenCode target path');
+    expect(readFileSync(sentinelFile, 'utf8')).toBe('SENTINEL_UNTOUCHED');
+
+    // Case 8: LaunchAgent plist / Linux systemd inherited PATH extension keeps pre-existing agents AND discovers opencode
+    if (os === 'darwin') {
+      const plistPath = join(homeHook, 'Library', 'LaunchAgents', 'imcodes.daemon.plist');
+      const plistXml = readFileSync(plistPath, 'utf8');
+      const pathMatch = plistXml.match(/<key>PATH<\/key>\s*<string>([^<]+)<\/string>/);
+      expect(pathMatch).toBeTruthy();
+      const plistSparsePath = pathMatch![1];
+      expect(plistSparsePath).toContain('/opt/homebrew/bin:/usr/local/bin:');
+      expect(plistSparsePath).toContain(join(homeHook, '.opencode', 'bin'));
+      const macProbe = await detectInstalledAgentsWithMetadata({
+        deps: {
+          platform: 'darwin',
+          homeDir: homeHook,
+          env: { PATH: plistSparsePath },
+        },
+      });
+      expect(macProbe.agents.opencode).toEqual({ installed: true });
+    } else {
+      // Case 8 (Linux): keep direct bundled Node ExecStart so both Node & POSIX upgrade probes recognize
+      // imcodes.service (no environment.d / systemctl set-environment writes), while daemon home lookup discovers ~/.opencode/bin
+      const isoSys = join(root, 'iso-sys');
+      const homeSys = join(root, 'home-sys');
+      const nixAgentDir = join(root, 'nix-agents-bin');
+      mkdirSync(nixAgentDir, { recursive: true });
+      writeFileSync(join(nixAgentDir, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+      const envDSentinelDir = makeTempDir('imcodes-envd-sentinel-');
+      const envDSentinel = join(envDSentinelDir, 'sentinel.conf');
+      writeFileSync(envDSentinel, 'ENVD_UNTOUCHED', 'utf8');
+      mkdirSync(join(homeSys, '.config', 'environment.d'), { recursive: true });
+      symlinkSync(envDSentinel, join(homeSys, '.config', 'environment.d', '99-imcodes-opencode.conf'));
+
+      mkdirSync(join(isoSys, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoSys, 'daemon-runtime', 'releases', '0.9.5')]);
+      execFileSync(
         runnerPath,
-        ['--isolated-root', isoNoUser, '--home', homeNoUser, '--confirm-fda-switch', '--no-service-control'],
+        ['--isolated-root', isoSys, '--home', homeSys, '--confirm-fda-switch', '--apply-services'],
         {
-          env: {
-            ...process.env,
-            PATH: `${fakeRootOnlyBin}:${process.env.PATH ?? ''}`,
-            SUDO_USER: '',
-            USER: 'root',
-            LOGNAME: 'root',
-            IMCODES_OPENCODE_INSTALL_HOOK: fakeHook,
-          },
+          env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: fakeHook, IMCODES_SYSTEMCTL_BIN: fakeSvcBin },
           encoding: 'utf8',
         },
       );
-      expect(resNoUser.status).toBe(0);
-      expect(resNoUser.stdout).toContain('INSTALL_OK');
-      expect(resNoUser.stderr).toContain('unable to resolve non-root target user');
-      expect(existsSync(join(homeNoUser, '.opencode'))).toBe(false);
+      expect(readFileSync(envDSentinel, 'utf8')).toBe('ENVD_UNTOUCHED');
 
-      // Case 7: symlinked .opencode/bin escaping isolated home is refused non-blockingly without writing outside target
-      const isoSym = join(root, 'iso-sym');
-      const homeSym = join(root, 'home-sym');
-      const outsideSymDir = makeTempDir(`imcodes-oc-outside-${os}-`);
-      mkdirSync(join(isoSym, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
-      mkdirSync(join(homeSym, '.opencode'), { recursive: true });
-      symlinkSync(outsideSymDir, join(homeSym, '.opencode', 'bin'));
-      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoSym, 'daemon-runtime', 'releases', '0.9.5')]);
-      const resSym = spawnSync(
+      const svcPath = join(homeSys, '.config', 'systemd', 'user', 'imcodes.service');
+      const unitText = readFileSync(svcPath, 'utf8');
+      expect(unitText).not.toContain('Environment="PATH=');
+      const expectedNode = join(isoSys, 'daemon-runtime', 'current', 'bin', 'node');
+      const expectedEntry = join(isoSys, 'daemon-runtime', 'current', 'package', 'dist', 'src', 'index.js');
+      expect(unitText).toContain(`ExecStart=${expectedNode} ${expectedEntry} start --foreground`);
+
+      // Re-running BOTH Node probe/planner and POSIX fallback plan on generated unit preserves bundled upgrade behavior
+      const nodeProbe = probeDesktopInstallEnvironment({
+        platform: 'linux',
+        isolatedRoot: isoSys,
+        homeDir: homeSys,
+        daemonRuntimeRoot: join(isoSys, 'daemon-runtime'),
+        autostartPath: svcPath,
+        cliPath: join(isoSys, 'bin', 'imcodes'),
+        env: { PATH: `${nixAgentDir}:/usr/bin`, HOME: homeSys },
+      });
+      const nodePlan = planDesktopInstallerCompatibility(nodeProbe);
+      expect(nodePlan.preserveUserDaemonAutostart).toBe(false);
+      expect(nodePlan.stopUserDaemonTask).toBe(true);
+      expect(nodePlan.switchToBundledRuntime).toBe(true);
+
+      const posixPlanOut = execFileSync(
         runnerPath,
-        ['--isolated-root', isoSym, '--home', homeSym, '--confirm-fda-switch', '--no-service-control'],
-        {
-          env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: fakeHook },
-          encoding: 'utf8',
-        },
+        ['--phase', 'plan', '--isolated-root', isoSys, '--home', homeSys],
+        { encoding: 'utf8' },
       );
-      expect(resSym.status).toBe(0);
-      expect(resSym.stdout).toContain('INSTALL_OK');
-      expect(resSym.stderr).toContain('refusing symlinked OpenCode target path');
-      expect(readdirSync(outsideSymDir)).toEqual([]);
+      expect(posixPlanOut).toContain('preserve_autostart=0');
+      expect(posixPlanOut).toContain('stop_daemon=1');
 
-      // Leaf binary symlink escaping home into sentinel file is rejected BEFORE hook runs
-      const isoLeaf = join(root, 'iso-leaf');
-      const homeLeaf = join(root, 'home-leaf');
-      const sentinelDir = makeTempDir(`imcodes-oc-sentinel-${os}-`);
-      const sentinelFile = join(sentinelDir, 'sentinel.txt');
-      writeFileSync(sentinelFile, 'SENTINEL_UNTOUCHED', 'utf8');
-      mkdirSync(join(isoLeaf, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
-      mkdirSync(join(homeLeaf, '.opencode', 'bin'), { recursive: true });
-      symlinkSync(sentinelFile, join(homeLeaf, '.opencode', 'bin', 'opencode'));
-      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoLeaf, 'daemon-runtime', 'releases', '0.9.5')]);
-      const resLeaf = spawnSync(
-        runnerPath,
-        ['--isolated-root', isoLeaf, '--home', homeLeaf, '--confirm-fda-switch', '--no-service-control'],
-        {
-          env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: fakeHook },
-          encoding: 'utf8',
-        },
-      );
-      expect(resLeaf.status).toBe(0);
-      expect(resLeaf.stdout).toContain('INSTALL_OK');
-      expect(resLeaf.stderr).toContain('refusing symlinked OpenCode target path');
-      expect(readFileSync(sentinelFile, 'utf8')).toBe('SENTINEL_UNTOUCHED');
-
-      // Case 8: LaunchAgent plist / Linux systemd inherited PATH extension keeps pre-existing agents AND discovers opencode
-      if (os === 'darwin') {
-        const plistPath = join(homeHook, 'Library', 'LaunchAgents', 'imcodes.daemon.plist');
-        const plistXml = readFileSync(plistPath, 'utf8');
-        const pathMatch = plistXml.match(/<key>PATH<\/key>\s*<string>([^<]+)<\/string>/);
-        expect(pathMatch).toBeTruthy();
-        const plistSparsePath = pathMatch![1];
-        expect(plistSparsePath).toContain('/opt/homebrew/bin:/usr/local/bin:');
-        expect(plistSparsePath).toContain(join(homeHook, '.opencode', 'bin'));
-        const macProbe = await detectInstalledAgentsWithMetadata({
-          deps: {
-            platform: 'darwin',
-            homeDir: homeHook,
-            env: { PATH: plistSparsePath },
-          },
-        });
-        expect(macProbe.agents.opencode).toEqual({ installed: true });
-      } else {
-        // Case 8 (Linux): keep direct bundled Node ExecStart so both Node & POSIX upgrade probes recognize
-        // imcodes.service (no environment.d / systemctl set-environment writes), while daemon home lookup discovers ~/.opencode/bin
-        const isoSys = join(root, 'iso-sys');
-        const homeSys = join(root, 'home-sys');
-        const nixAgentDir = join(root, 'nix-agents-bin');
-        mkdirSync(nixAgentDir, { recursive: true });
-        writeFileSync(join(nixAgentDir, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-
-        const envDSentinelDir = makeTempDir('imcodes-envd-sentinel-');
-        const envDSentinel = join(envDSentinelDir, 'sentinel.conf');
-        writeFileSync(envDSentinel, 'ENVD_UNTOUCHED', 'utf8');
-        mkdirSync(join(homeSys, '.config', 'environment.d'), { recursive: true });
-        symlinkSync(envDSentinel, join(homeSys, '.config', 'environment.d', '99-imcodes-opencode.conf'));
-
-        mkdirSync(join(isoSys, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
-        execFileSync('cp', ['-R', `${rtDir}/.`, join(isoSys, 'daemon-runtime', 'releases', '0.9.5')]);
-        execFileSync(
-          runnerPath,
-          ['--isolated-root', isoSys, '--home', homeSys, '--confirm-fda-switch', '--apply-services'],
-          {
-            env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: fakeHook, IMCODES_SYSTEMCTL_BIN: fakeSvcBin },
-            encoding: 'utf8',
-          },
-        );
-        expect(readFileSync(envDSentinel, 'utf8')).toBe('ENVD_UNTOUCHED');
-
-        const svcPath = join(homeSys, '.config', 'systemd', 'user', 'imcodes.service');
-        const unitText = readFileSync(svcPath, 'utf8');
-        expect(unitText).not.toContain('Environment="PATH=');
-        const expectedNode = join(isoSys, 'daemon-runtime', 'current', 'bin', 'node');
-        const expectedEntry = join(isoSys, 'daemon-runtime', 'current', 'package', 'dist', 'src', 'index.js');
-        expect(unitText).toContain(`ExecStart=${expectedNode} ${expectedEntry} start --foreground`);
-
-        // Re-running BOTH Node probe/planner and POSIX fallback plan on generated unit preserves bundled upgrade behavior
-        const nodeProbe = probeDesktopInstallEnvironment({
+      // Sparse user-service PATH without ~/.opencode/bin discovers BOTH existing agent (codex) AND ~/.opencode/bin/opencode
+      const linuxProbe = await detectInstalledAgentsWithMetadata({
+        deps: {
           platform: 'linux',
-          isolatedRoot: isoSys,
           homeDir: homeSys,
-          daemonRuntimeRoot: join(isoSys, 'daemon-runtime'),
-          autostartPath: svcPath,
-          cliPath: join(isoSys, 'bin', 'imcodes'),
-          env: { PATH: `${nixAgentDir}:/usr/bin`, HOME: homeSys },
-        });
-        const nodePlan = planDesktopInstallerCompatibility(nodeProbe);
-        expect(nodePlan.preserveUserDaemonAutostart).toBe(false);
-        expect(nodePlan.stopUserDaemonTask).toBe(true);
-        expect(nodePlan.switchToBundledRuntime).toBe(true);
-
-        const posixPlanOut = execFileSync(
-          runnerPath,
-          ['--phase', 'plan', '--isolated-root', isoSys, '--home', homeSys],
-          { encoding: 'utf8' },
-        );
-        expect(posixPlanOut).toContain('preserve_autostart=0');
-        expect(posixPlanOut).toContain('stop_daemon=1');
-
-        // Sparse user-service PATH without ~/.opencode/bin discovers BOTH existing agent (codex) AND ~/.opencode/bin/opencode
-        const linuxProbe = await detectInstalledAgentsWithMetadata({
-          deps: {
-            platform: 'linux',
-            homeDir: homeSys,
-            env: { PATH: `${nixAgentDir}:/usr/bin` },
-          },
-        });
-        expect(linuxProbe.agents.codex).toEqual({ installed: true });
-        expect(linuxProbe.agents.opencode).toEqual({ installed: true });
-      }
+          env: { PATH: `${nixAgentDir}:/usr/bin` },
+        },
+      });
+      expect(linuxProbe.agents.codex).toEqual({ installed: true });
+      expect(linuxProbe.agents.opencode).toEqual({ installed: true });
     }
-  }, 60_000);
+    },
+    60_000,
+  );
 
   it('wires OpenCode CLI auto-install cleanly into Windows installer ps1 and single-transaction PostInstall Inno Setup', async () => {
     const ps1 = renderWindowsPhaseAInstallerPs1({ version: '2026.11.7132-dev.7022', cliWrapperContent: '@echo off\r\n' });
