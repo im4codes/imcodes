@@ -7,6 +7,7 @@ import { WsBridge } from '../src/ws/bridge.js';
 import type { Database } from '../src/db/client.js';
 import type { Env } from '../src/env.js';
 import { signJwt } from '../src/security/crypto.js';
+import { SERVER_ID_HEADER } from '../../shared/http-header-names.js';
 import { SESSION_IDENTITY_WS } from '../../shared/session-identity-ws.js';
 import {
   SESSION_IDENTITY_PROJECT_MAX_CHARS,
@@ -354,5 +355,41 @@ describe('/api/session-identities', () => {
     expect(put.status).toBe(200);
     const result = await put.json() as { profile: { content: string } };
     expect(Array.from(result.profile.content)).toHaveLength(SESSION_IDENTITY_SESSION_MAX_CHARS);
+  });
+
+  it('accepts X-Server-Id header fallback on GET/PUT/DELETE /api/session-identities when serverId query param is omitted', async () => {
+    const serverId = `srv-${Math.random().toString(36).slice(2)}`;
+    await connectDaemon(serverId, db);
+    const body = { scope: 'project', scopeKey: 'repo-hdr', content: 'Header identity' };
+    const put = await app.request('/api/session-identities', {
+      method: 'PUT',
+      headers: {
+        Authorization: bearer(),
+        'Content-Type': 'application/json',
+        [SERVER_ID_HEADER]: serverId,
+      },
+      body: JSON.stringify(body),
+    });
+    expect(put.status).toBe(200);
+    expect(await put.json()).toMatchObject({ profile: { content: 'Header identity' } });
+
+    const get = await app.request('/api/session-identities?scope=project&scopeKey=repo-hdr', {
+      headers: {
+        Authorization: bearer(),
+        [SERVER_ID_HEADER]: serverId,
+      },
+    });
+    expect(get.status).toBe(200);
+    expect(await get.json()).toMatchObject({ profile: { content: 'Header identity' } });
+
+    const del = await app.request('/api/session-identities?scope=project&scopeKey=repo-hdr', {
+      method: 'DELETE',
+      headers: {
+        Authorization: bearer(),
+        [SERVER_ID_HEADER]: serverId,
+      },
+    });
+    expect(del.status).toBe(200);
+    expect(await del.json()).toEqual({ deleted: true });
   });
 });

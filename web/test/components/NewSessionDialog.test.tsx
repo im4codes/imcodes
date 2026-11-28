@@ -32,6 +32,10 @@ vi.mock('../../src/api.js', async (importOriginal) => ({
   clearSessionIdentityProfile: (...args: unknown[]) => clearSessionIdentityProfileMock(...args),
 }));
 
+vi.mock('../../src/session-identity-refresh.js', () => ({
+  requestSessionIdentityRefresh: vi.fn(async () => {}),
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, _opts?: Record<string, unknown>) => {
@@ -2397,5 +2401,65 @@ describe('NewSessionDialog', () => {
       ccPreset: 'MiniMax',
       requestedModel: 'MiniMax-M2.7',
     }));
+  });
+
+  it('passes serverId and sessionName context to saveSessionIdentityProfile when creating session with pending identity', async () => {
+    const ws = makeWs();
+    const onClose = vi.fn();
+    const onSessionStarted = vi.fn();
+    render(
+      <NewSessionDialog
+        serverId="srv-custom-1"
+        ws={ws as any}
+        onClose={onClose}
+        onSessionStarted={onSessionStarted}
+        isProviderConnected={() => false}
+      />,
+    );
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), {
+      target: { value: 'test-identity-project' },
+    });
+    fireEvent.input(screen.getByPlaceholderText('~/.imcodes/projects/my-project'), {
+      target: { value: '/tmp/test-identity-project' },
+    });
+
+    const identityTextarea = await screen.findByLabelText('session-identity-content') as HTMLTextAreaElement;
+    await waitFor(() => expect(identityTextarea.disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', { name: 'identityChooseFile' }));
+    fireEvent.click(screen.getByText('mock-select-identity-file'));
+    expect(identityTextarea.value).toBe('Identity loaded from a selected file.');
+
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      project: 'test-identity-project',
+    }));
+
+    act(() => {
+      ws.emit({
+        type: 'session.event',
+        event: 'started',
+        session: 'deck_test_identity_project_brain',
+        state: 'idle',
+      });
+    });
+
+    await waitFor(() => {
+      expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scope: 'session',
+          scopeKey: 'srv-custom-1:deck_test_identity_project_brain',
+          content: 'Identity loaded from a selected file.',
+          sourceFile: '/home/user/agent-identity.md',
+        }),
+        {
+          serverId: 'srv-custom-1',
+          sessionName: 'deck_test_identity_project_brain',
+        },
+      );
+      expect(onSessionStarted).toHaveBeenCalledWith('deck_test_identity_project_brain');
+      expect(onClose).toHaveBeenCalledOnce();
+    });
   });
 });

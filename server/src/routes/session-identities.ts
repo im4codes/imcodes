@@ -30,8 +30,8 @@ sessionIdentityRoutes.get('/all', async (c) => {
  * ingress pod-sticky-routes any request carrying it -- CLAUDE.md's
  * convention going forward). USER scope ignores it (content lives here).
  */
-function requestServerId(c: { req: { query: (name: string) => string | undefined } }): string | undefined {
-  return c.req.query('serverId') || undefined;
+function requestServerId(c: { req: { query: (name: string) => string | undefined; header: (name: string) => string | undefined } }): string | undefined {
+  return c.req.query('serverId') || c.req.header(SERVER_ID_HEADER) || undefined;
 }
 
 sessionIdentityRoutes.get('/', async (c) => {

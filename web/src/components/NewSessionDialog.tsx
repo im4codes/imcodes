@@ -631,7 +631,7 @@ export function NewSessionDialog({
               scopeKey: `${serverId}:${sessionName}`,
               content: normalizeSessionIdentityContent(pendingSessionIdentity),
               ...(pendingSessionIdentitySourceFile ? { sourceFile: pendingSessionIdentitySourceFile } : {}),
-            });
+            }, { serverId, sessionName });
             await requestSessionIdentityRefresh(ws, sessionName);
           } catch {
             onToast?.(t('session.identityCreateApplyFailed'));
