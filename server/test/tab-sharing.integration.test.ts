@@ -1206,17 +1206,16 @@ describe('tab sharing APIs', () => {
       { JWT_SIGNING_KEY: JWT_KEY } as never,
       () => resolveAuth(),
     );
-    handlers.get('message')?.(JSON.stringify({ type: 'auth', serverId, token: daemonToken }));
+    await (handlers.get('message')?.(JSON.stringify({ type: 'auth', serverId, token: daemonToken })) as unknown as Promise<void>);
     await authDone;
-    handlers.get('message')?.(JSON.stringify({
+    await (handlers.get('message')?.(JSON.stringify({
       type: 'session_list',
       sessions: [
         { name: sessionName, project: 'Alpha', label: 'Live Alpha', state: 'running', agentType: 'claude-code' },
         { name: 'deck_live_only_brain', project: 'LiveOnly', label: 'Control Center', state: 'idle', agentType: 'codex-sdk' },
         { name: 'deck_incognito_brain', project: 'Hidden', label: 'Secret', state: 'running', agentType: 'claude-code-sdk', incognito: true },
       ],
-    }));
-    await new Promise((r) => setTimeout(r, 20));
+    })) as unknown as Promise<void>);
 
     const res = await app.request('/api/shares/open', {
       method: 'POST',
