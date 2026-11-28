@@ -77,6 +77,7 @@ export const DAEMON_TOKEN_ROUTES: readonly DaemonTokenRoute[] = [
   full('GET', PORT_FORWARD_API_PATH),
   full('DELETE', PORT_FORWARD_API_PATH),
   full('DELETE', `${PORT_FORWARD_API_PATH}/:tunnelId`),
+  { method: 'POST', path: `${server}/heartbeat`, roles: [NODE_ROLE.FULL, NODE_ROLE.CONTROLLED] },
   full('POST', `${server}/machine-direct-upload`),
   full('POST', `${server}/machine-direct-fetch`),
   full('POST', `${server}/machine-file-handle`),

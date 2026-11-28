@@ -594,6 +594,11 @@ serverRoutes.post('/:id/heartbeat', async (c) => {
   if (!authed.ok) return daemonAuthFailure(c, authed);
 
   const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
+  // Read-only credential validity probe used by installer re-runs so an offline
+  // controlled node is not transiently marked online before its service restarts.
+  if (body?.probeOnly === true) {
+    return c.json({ ok: true, probeOnly: true });
+  }
   const daemonVersion = typeof body?.daemonVersion === 'string' ? body.daemonVersion : undefined;
   await updateServerHeartbeat(c.env.DB, serverId, daemonVersion);
   return c.json({ ok: true });

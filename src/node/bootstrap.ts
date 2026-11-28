@@ -12,21 +12,31 @@ import {
   assertProductionServerUrl,
   defaultCredentialPath,
   defaultInstallIdentityPath,
+  defaultPendingReenrollmentPath,
   defaultStagedExecutablePath,
   generateInstallIdentity,
+  hashEnrollmentToken,
   loadCredential,
   loadInstallIdentity,
+  loadPendingReenrollment,
   openVerifiedEnrollmentSource,
   persistCredential,
   persistInstallIdentity,
+  persistPendingReenrollment,
   probeControlledNodeCredentialStatus,
   redeemEnrollmentV2,
+  removePendingReenrollment,
   type ControlledNodeCredential,
   type ControlledNodeCredentialProbeStatus,
   type PendingInstallIdentity,
+  type PendingReenrollmentRecord,
   type StagedExecutableReceipt,
   type VerifiedEnrollmentSource,
 } from './enrollment.js';
+import {
+  controlledNodeEndpointsPath,
+  resetEndpointStateForCredential,
+} from './server-endpoints.js';
 import {
   assertProcessElevated,
   installDefinition,
@@ -114,6 +124,15 @@ export interface ControlledNodeBootstrapDeps {
    * installer re-runs when a fresh enrollment blob is present.
    */
   probeExistingCredential?: (credential: ControlledNodeCredential) => Promise<ControlledNodeCredentialProbeStatus>;
+  /** Protected pending re-enrollment record lifecycle for idempotent crash recovery. */
+  loadPendingReenrollment?: () => Promise<PendingReenrollmentRecord | null>;
+  persistPendingReenrollment?: (record: PendingReenrollmentRecord) => Promise<void>;
+  removePendingReenrollment?: () => Promise<void>;
+  /** Isolate/reset server-endpoints cache when rotating credential or target server. */
+  resetEndpointState?: (
+    next: Pick<ControlledNodeCredential, 'serverId' | 'serverUrl'>,
+    previous: Pick<ControlledNodeCredential, 'serverId' | 'serverUrl'>,
+  ) => Promise<void>;
   installDefinition: (exePath: string) => Promise<ServiceReceipt>;
   inspectDefinition: (receipt: ServiceReceipt) => Promise<ServiceReceipt>;
   /**
@@ -187,6 +206,8 @@ export type BootstrapResult =
 /** Production deps wired to the real enrollment/installer/journal + fs. */
 export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
   const credentialPath = defaultCredentialPath();
+  const pendingReenrollmentPath = defaultPendingReenrollmentPath(credentialPath);
+  const journalPath = journalPathFor(credentialPath);
   const sourceExecutablePath = process.execPath;
   return {
     loadCredential: () => loadCredential(credentialPath),
@@ -197,6 +218,15 @@ export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
     redeemEnrollmentV2: (blob, identity) => redeemEnrollmentV2(blob, identity),
     persistCredential: (credential) => persistCredential(credential, credentialPath),
     probeExistingCredential: (credential) => probeControlledNodeCredentialStatus(credential),
+    loadPendingReenrollment: () => loadPendingReenrollment(pendingReenrollmentPath),
+    persistPendingReenrollment: (record) => persistPendingReenrollment(record, pendingReenrollmentPath),
+    removePendingReenrollment: () => removePendingReenrollment(pendingReenrollmentPath),
+    resetEndpointState: (next, previous) => resetEndpointStateForCredential(
+      controlledNodeEndpointsPath(journalPath),
+      previous,
+      next,
+      { allowLoopbackHttp: process.env.IMCODES_NODE_ALLOW_HTTP_ENROLL === '1' },
+    ),
     installDefinition: (exePath) => installDefinition(exePath),
     inspectDefinition: (receipt) => inspectDefinition(receipt),
     inspectServiceState: (receipt) => inspectServiceState(receipt),
@@ -804,29 +834,33 @@ function ensureBootstrapPortForwardTrust(
   }
 }
 
-async function reenrollExistingInstallation(
+async function commitPendingReenrollment(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
-  resolved: ResolvedEnrollmentSource,
-  source: VerifiedEnrollmentSource,
+  existing: ControlledNodeCredential,
+  record: PendingReenrollmentRecord,
+  newCredential: ControlledNodeCredential,
+  resolved: ResolvedEnrollmentSource | null,
+  source: VerifiedEnrollmentSource | null,
   publisherTrustError: string | undefined,
 ): Promise<BootstrapResult> {
-  assertProductionServerUrl(resolved.blob.serverUrl);
-  const sourceArtifact = await deps.inspectSourceArtifact(deps.sourceExecutablePath);
-  const stagedReceipt = await source.stageTrailerFreeExecutable(
-    deps.stagedExecutablePath,
-    resolved.trailerStart,
-    resolved.windowsAuthenticode,
-  );
-  await deps.prepareCredentialDir();
-  const freshIdentity: PendingInstallIdentity = {
-    ...deps.generateInstallIdentity(),
-    sourceExePath: deps.sourceExecutablePath,
+  let sourceArtifact: SourceArtifactIdentity | undefined;
+  let stagedReceipt: StagedExecutableReceipt | undefined;
+  if (resolved && source) {
+    sourceArtifact = await deps.inspectSourceArtifact(deps.sourceExecutablePath);
+    stagedReceipt = await source.stageTrailerFreeExecutable(
+      deps.stagedExecutablePath,
+      resolved.trailerStart,
+      resolved.windowsAuthenticode,
+    );
+  }
+  const previousEndpointTarget = {
+    serverId: record.previousServerId ?? existing.serverId,
+    serverUrl: record.previousServerUrl ?? existing.serverUrl,
   };
-  // Redeem BEFORE overwriting credential.json, install-identity.json, or
-  // install-journal.json so an expired/offline ticket leaves existing state intact.
-  const newCredential = await deps.redeemEnrollmentV2(resolved.blob, freshIdentity);
-  await deps.persistInstallIdentity(freshIdentity);
+  await deps.resetEndpointState?.(newCredential, previousEndpointTarget);
+  await deps.prepareCredentialDir();
+  await deps.persistInstallIdentity(record.identity);
   await deps.persistCredential(newCredential);
 
   const cleanupStatus = journal.cleanupStatus && journal.cleanupStatus !== 'pending'
@@ -835,16 +869,17 @@ async function reenrollExistingInstallation(
   journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
     now: Math.max(deps.now, journal.updatedAt),
     previous: journal,
-    installId: freshIdentity.installId,
-    nodeTokenHash: freshIdentity.nodeTokenHash,
+    installId: record.identity.installId,
+    nodeTokenHash: record.identity.nodeTokenHash,
     serverId: newCredential.serverId,
     stagedExePath: journal.stagedExePath ?? deps.stagedExecutablePath,
-    stagedReceipt,
-    sourceExePath: deps.sourceExecutablePath,
-    sourceArtifact,
+    ...(stagedReceipt ? { stagedReceipt } : {}),
+    sourceExePath: record.identity.sourceExePath,
+    ...(sourceArtifact ? { sourceArtifact } : {}),
     cleanupStatus,
     allowIdentityRotation: true,
   });
+  await deps.removePendingReenrollment?.();
   const pfTrust = ensureBootstrapPortForwardTrust(deps);
   journal = await ensureServiceStartRequested(deps, journal, { startService: true });
   return {
@@ -854,6 +889,67 @@ async function reenrollExistingInstallation(
     publisherTrustError,
     ...pfTrust,
   };
+}
+
+async function reenrollExistingInstallation(
+  deps: ControlledNodeBootstrapDeps,
+  journal: InstallJournal,
+  existing: ControlledNodeCredential,
+  resolved: ResolvedEnrollmentSource,
+  source: VerifiedEnrollmentSource,
+  abiProfile: ControlledNodeAbiProfile,
+  existingPending: PendingReenrollmentRecord | null,
+  publisherTrustError: string | undefined,
+): Promise<BootstrapResult> {
+  assertProductionServerUrl(resolved.blob.serverUrl);
+  // Read-only source inspection BEFORE redeem; never overwrite the formal
+  // staged executable until redeemEnrollmentV2 succeeds so a failed redeem
+  // keeps isCurrentExecutableStable === true for the healthy existing service.
+  await deps.inspectSourceArtifact(deps.sourceExecutablePath);
+  await deps.prepareCredentialDir();
+
+  const targetOrigin = normalizeServerOriginForCompare(resolved.blob.serverUrl);
+  const enrollTokenHash = hashEnrollmentToken(resolved.blob.enrollToken);
+  const reusePending = Boolean(
+    existingPending
+    && !existingPending.redeemedCredential
+    && existingPending.targetOrigin === targetOrigin
+    && existingPending.enrollTokenHash === enrollTokenHash
+    && normalizeControlledNodeAbiProfile(existingPending.abiProfile) === abiProfile,
+  );
+  let record: PendingReenrollmentRecord = reusePending && existingPending
+    ? existingPending
+    : {
+      version: 1,
+      targetOrigin,
+      enrollTokenHash,
+      abiProfile,
+      identity: {
+        ...deps.generateInstallIdentity(),
+        sourceExePath: deps.sourceExecutablePath,
+      },
+      previousServerId: existing.serverId,
+      previousServerUrl: existing.serverUrl,
+      createdAt: Math.max(deps.now, journal.updatedAt),
+    };
+  if (!reusePending) {
+    await deps.persistPendingReenrollment?.(record);
+  }
+
+  const newCredential = await deps.redeemEnrollmentV2(resolved.blob, record.identity);
+  record = { ...record, redeemedCredential: newCredential };
+  await deps.persistPendingReenrollment?.(record);
+
+  return commitPendingReenrollment(
+    deps,
+    journal,
+    existing,
+    record,
+    newCredential,
+    resolved,
+    source,
+    publisherTrustError,
+  );
 }
 
 async function ensureServiceStartRequested(
@@ -892,7 +988,31 @@ function isCredentialAclDriftError(error: unknown): boolean {
   return message.startsWith('windows_credential_acl_insecure:') || message === 'credential_permissions_insecure';
 }
 
+const bootstrapSerialQueues = new Map<string, Promise<void>>();
+
+async function withBootstrapSerialLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+  const prev = bootstrapSerialQueues.get(lockKey) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const next = prev.then(() => gate, () => gate);
+  bootstrapSerialQueues.set(lockKey, next);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (bootstrapSerialQueues.get(lockKey) === next) {
+      bootstrapSerialQueues.delete(lockKey);
+    }
+  }
+}
+
 export async function bootstrapControlledNodeWithDisposition(deps: ControlledNodeBootstrapDeps): Promise<BootstrapResult> {
+  const lockKey = `${deps.credentialPath}\0${deps.journalPath}`;
+  return withBootstrapSerialLock(lockKey, () => bootstrapControlledNodeWithDispositionLocked(deps));
+}
+
+async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNodeBootstrapDeps): Promise<BootstrapResult> {
   const abiProfile = deps.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE;
   let existing: ControlledNodeCredential | null;
   let preloadedJournal: InstallJournal | null = null;
@@ -988,14 +1108,42 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
 
     let source: VerifiedEnrollmentSource | null = null;
     try {
+      const pendingReenrollment = (await deps.loadPendingReenrollment?.()) ?? null;
       source = await deps.openVerifiedEnrollmentSource(deps.sourceExecutablePath);
       const resolved = await resolveEnrollmentSource(deps, source);
+      const targetOrigin = resolved ? normalizeServerOriginForCompare(resolved.blob.serverUrl) : null;
+      const enrollTokenHash = resolved ? hashEnrollmentToken(resolved.blob.enrollToken) : null;
+      const pendingCommittedMatchesExisting = Boolean(
+        pendingReenrollment?.redeemedCredential
+        && existing.serverId === pendingReenrollment.redeemedCredential.serverId
+        && existing.token === pendingReenrollment.redeemedCredential.token,
+      );
+      const pendingMatchesResolved = Boolean(
+        pendingReenrollment
+        && resolved
+        && pendingReenrollment.targetOrigin === targetOrigin
+        && pendingReenrollment.enrollTokenHash === enrollTokenHash
+        && normalizeControlledNodeAbiProfile(pendingReenrollment.abiProfile) === abiProfile,
+      );
+      if (pendingReenrollment?.redeemedCredential && (pendingCommittedMatchesExisting || pendingMatchesResolved)) {
+        return await commitPendingReenrollment(
+          deps,
+          journal,
+          existing,
+          pendingReenrollment,
+          pendingReenrollment.redeemedCredential,
+          resolved,
+          source,
+          publisherTrustError,
+        );
+      }
       if (resolved) {
-        const serverUrlChanged = normalizeServerOriginForCompare(existing.serverUrl)
-          !== normalizeServerOriginForCompare(resolved.blob.serverUrl);
-        let shouldReenroll = serverUrlChanged;
+        const serverUrlChanged = normalizeServerOriginForCompare(existing.serverUrl) !== targetOrigin;
+        let shouldReenroll = serverUrlChanged || (pendingMatchesResolved && !pendingReenrollment?.redeemedCredential);
         if (serverUrlChanged) {
           deps.warn('controlled node enrollment serverUrl differs from existing credential; re-enrolling with fresh install identity');
+        } else if (shouldReenroll) {
+          deps.warn('controlled node resuming pending re-enrollment with durable install identity');
         } else if (deps.probeExistingCredential) {
           const probeStatus = await deps.probeExistingCredential(existing);
           if (probeStatus === 'revoked') {
@@ -1004,7 +1152,16 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
           }
         }
         if (shouldReenroll) {
-          return await reenrollExistingInstallation(deps, journal, resolved, source, publisherTrustError);
+          return await reenrollExistingInstallation(
+            deps,
+            journal,
+            existing,
+            resolved,
+            source,
+            abiProfile,
+            pendingReenrollment,
+            publisherTrustError,
+          );
         }
       }
       if (journal.phase === 'files_staged') {

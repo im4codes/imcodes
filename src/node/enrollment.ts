@@ -546,6 +546,22 @@ export function defaultPendingDaemonBindPath(credentialPath = defaultCredentialP
   return join(dirname(credentialPath), 'pending-daemon-bind.json');
 }
 
+export function defaultPendingReenrollmentPath(credentialPath = defaultCredentialPath()): string {
+  return join(dirname(credentialPath), 'pending-reenrollment.json');
+}
+
+export interface PendingReenrollmentRecord {
+  version: 1;
+  targetOrigin: string;
+  enrollTokenHash: string;
+  abiProfile: ControlledNodeAbiProfile;
+  identity: PendingInstallIdentity;
+  previousServerId?: string;
+  previousServerUrl?: string;
+  redeemedCredential?: ControlledNodeCredential;
+  createdAt: number;
+}
+
 export interface PendingDaemonBindPrepared {
   workerUrl: string;
   serverId: string;
@@ -606,7 +622,7 @@ export interface ProtectedSecretLoadOptions {
   assertCredentialDirSecured?: (dir: string) => void | Promise<void>;
 }
 
-async function assertSecretPathProtected(path: string, label: 'credential' | 'install_identity' | 'pending_bind', options: ProtectedSecretLoadOptions): Promise<void> {
+async function assertSecretPathProtected(path: string, label: 'credential' | 'install_identity' | 'pending_bind' | 'pending_reenrollment', options: ProtectedSecretLoadOptions): Promise<void> {
   const platform = options.platform ?? process.platform;
   if (platform === 'win32') {
     const st = await lstat(path);
@@ -673,6 +689,85 @@ export async function removePendingDaemonBind(
 ): Promise<void> {
   try {
     await assertWritablePathIsNotSymlink(path, 'pending_bind_path_is_symlink');
+    await unlink(path);
+  } catch (error) {
+    if (isNotFoundError(error)) return;
+    throw error;
+  }
+}
+
+export function hashEnrollmentToken(enrollToken: string): string {
+  return hashNodeToken(enrollToken);
+}
+
+function isValidPendingInstallIdentityValue(value: unknown): value is PendingInstallIdentity {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const parsed = value as Partial<PendingInstallIdentity>;
+  if (!parsed.installId || !parsed.nodeToken || !parsed.nodeTokenHash || !parsed.sourceExePath) return false;
+  if (hashNodeToken(parsed.nodeToken) !== parsed.nodeTokenHash) return false;
+  if (!isEnrollmentNodeTokenHash(parsed.nodeTokenHash)) return false;
+  return true;
+}
+
+function isValidControlledNodeCredentialValue(value: unknown): value is ControlledNodeCredential {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const parsed = value as Partial<ControlledNodeCredential>;
+  if (parsed.nodeRole !== NODE_ROLE.CONTROLLED || !parsed.serverId || !parsed.token || !parsed.serverUrl) return false;
+  if (parsed.nodeId !== undefined && !isControlledNodeId(parsed.nodeId)) return false;
+  return true;
+}
+
+function isValidPendingReenrollmentRecord(value: unknown): value is PendingReenrollmentRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const r = value as Partial<PendingReenrollmentRecord>;
+  if (r.version !== 1) return false;
+  if (typeof r.targetOrigin !== 'string' || !r.targetOrigin) return false;
+  if (typeof r.enrollTokenHash !== 'string' || !isEnrollmentNodeTokenHash(r.enrollTokenHash)) return false;
+  if (typeof r.abiProfile !== 'string' || !r.abiProfile) return false;
+  if (!isValidPendingInstallIdentityValue(r.identity)) return false;
+  if (r.previousServerId !== undefined && (typeof r.previousServerId !== 'string' || !r.previousServerId)) return false;
+  if (r.previousServerUrl !== undefined && (typeof r.previousServerUrl !== 'string' || !r.previousServerUrl)) return false;
+  if (r.redeemedCredential !== undefined) {
+    if (!isValidControlledNodeCredentialValue(r.redeemedCredential)) return false;
+    if (r.redeemedCredential.token !== r.identity.nodeToken) return false;
+  }
+  if (typeof r.createdAt !== 'number' || !Number.isFinite(r.createdAt) || r.createdAt < 0) return false;
+  return true;
+}
+
+export async function loadPendingReenrollment(
+  path = defaultPendingReenrollmentPath(),
+  options: ProtectedSecretLoadOptions = {},
+): Promise<PendingReenrollmentRecord | null> {
+  try {
+    await assertSecretPathProtected(path, 'pending_reenrollment', options);
+    const parsed = JSON.parse(await readFile(path, 'utf8')) as unknown;
+    if (!isValidPendingReenrollmentRecord(parsed)) {
+      throw new Error('pending_reenrollment_invalid');
+    }
+    return parsed;
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+}
+
+export async function persistPendingReenrollment(
+  record: PendingReenrollmentRecord,
+  path = defaultPendingReenrollmentPath(),
+): Promise<void> {
+  if (!isValidPendingReenrollmentRecord(record)) {
+    throw new Error('pending_reenrollment_invalid');
+  }
+  await assertWritablePathIsNotSymlink(path, 'pending_reenrollment_path_is_symlink');
+  await writeProtectedJson(path, record);
+}
+
+export async function removePendingReenrollment(
+  path = defaultPendingReenrollmentPath(),
+): Promise<void> {
+  try {
+    await assertWritablePathIsNotSymlink(path, 'pending_reenrollment_path_is_symlink');
     await unlink(path);
   } catch (error) {
     if (isNotFoundError(error)) return;
@@ -846,7 +941,7 @@ export async function probeControlledNodeCredentialStatus(
         authorization: `Bearer ${credential.token}`,
         'content-type': 'application/json',
       },
-      body: '{}',
+      body: JSON.stringify({ probeOnly: true }),
       redirect: 'error',
       signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
     });

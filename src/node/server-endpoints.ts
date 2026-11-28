@@ -18,6 +18,10 @@ import {
 
 export interface ControlledNodeEndpointState {
   version: typeof CONTROLLED_NODE_ENDPOINTS_FILE_VERSION;
+  /** Enrolled serverId owning this state; isolates stale alternate endpoints across re-enrollment. */
+  serverId?: string;
+  /** Enrolled primary origin owning this state; isolates old relay realms across server retargeting. */
+  primaryOrigin?: string;
   /** Set by the machine's root user (`imcodes-node set-server-url`). */
   pinned: string[];
   /** Set from the authenticated heartbeat ack. */
@@ -42,6 +46,9 @@ export function parseEndpointState(value: unknown, options: NormalizeEndpointOpt
   if (!value || typeof value !== 'object' || Array.isArray(value)) return state;
   const record = value as Record<string, unknown>;
   if (record.version !== CONTROLLED_NODE_ENDPOINTS_FILE_VERSION) return state;
+  if (typeof record.serverId === 'string' && record.serverId.trim()) state.serverId = record.serverId.trim();
+  const primaryOrigin = normalizeControlledNodeEndpointOrigin(record.primaryOrigin, options);
+  if (primaryOrigin) state.primaryOrigin = primaryOrigin;
   state.pinned = normalizeControlledNodeEndpointList(record.pinned, options);
   state.advertised = normalizeControlledNodeEndpointList(record.advertised, options);
   const lastGood = normalizeControlledNodeEndpointOrigin(record.lastGood, options);
@@ -282,4 +289,116 @@ export async function updatePinnedEndpoints(
   }
   await writeEndpointState(path, { ...state, pinned });
   return pinned;
+}
+
+function normalizeOriginForScope(serverUrl: string, options: NormalizeEndpointOptions = {}): string {
+  const normalized = normalizeControlledNodeEndpointOrigin(serverUrl, options);
+  if (normalized) return normalized;
+  try {
+    return new URL(serverUrl).origin.toLowerCase();
+  } catch {
+    return serverUrl.trim().replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+/**
+ * Scope persisted endpoint state to the active credential. Cross-origin retargeting
+ * clears pinned/advertised/lastGood/dropped from the old relay realm; same-origin
+ * serverId rotation clears advertised/lastGood/dropped while preserving same-origin pins.
+ */
+export function scopeEndpointStateForCredential(
+  state: ControlledNodeEndpointState,
+  credential: { serverId: string; serverUrl: string },
+  options: NormalizeEndpointOptions = {},
+): ControlledNodeEndpointState {
+  const credOrigin = normalizeOriginForScope(credential.serverUrl, options);
+  if (state.primaryOrigin !== undefined && state.primaryOrigin !== credOrigin) {
+    return {
+      ...emptyEndpointState(),
+      serverId: credential.serverId,
+      primaryOrigin: credOrigin,
+    };
+  }
+  if (state.serverId !== undefined && state.serverId !== credential.serverId) {
+    return {
+      ...emptyEndpointState(),
+      serverId: credential.serverId,
+      primaryOrigin: credOrigin,
+      pinned: state.pinned,
+    };
+  }
+  return {
+    ...state,
+    serverId: credential.serverId,
+    primaryOrigin: credOrigin,
+  };
+}
+
+/**
+ * Atomically clear old relay endpoint trust on re-enrollment BEFORE the new
+ * credential takes effect, preventing stale lastGood/advertised/dropped (and old
+ * pins on cross-server retarget) from ever receiving the new credential.
+ */
+export async function resetEndpointStateForCredential(
+  path: string,
+  previous: { serverId: string; serverUrl: string },
+  next: { serverId: string; serverUrl: string },
+  options: NormalizeEndpointOptions = {},
+): Promise<void> {
+  const onDisk = await readEndpointState(path, options);
+  const nextOrigin = normalizeOriginForScope(next.serverUrl, options);
+  const prevOrigin = normalizeOriginForScope(previous.serverUrl, options);
+  const sameOrigin = nextOrigin === prevOrigin && (!onDisk.primaryOrigin || onDisk.primaryOrigin === nextOrigin);
+  await writeEndpointState(path, {
+    ...emptyEndpointState(),
+    serverId: next.serverId,
+    primaryOrigin: nextOrigin,
+    pinned: sameOrigin ? onDisk.pinned : [],
+  });
+}
+
+export async function createRuntimeEndpointSelector(
+  endpointsPath: string,
+  credential: { serverId: string; serverUrl: string },
+  options: {
+    now?: () => number;
+    onRotate?: (event: { from: string; to: string; reason: string }) => void;
+    normalizeOptions?: NormalizeEndpointOptions;
+  } = {},
+): Promise<ControlledNodeEndpointSelector> {
+  const normalizeOptions = options.normalizeOptions ?? {};
+  const credOrigin = normalizeOriginForScope(credential.serverUrl, normalizeOptions);
+  const initial = scopeEndpointStateForCredential(
+    await readEndpointState(endpointsPath, normalizeOptions),
+    credential,
+    normalizeOptions,
+  );
+  return new ControlledNodeEndpointSelector(
+    credential.serverUrl,
+    initial,
+    {
+      ...(options.now ? { now: options.now } : {}),
+      ...(options.onRotate ? { onRotate: options.onRotate } : {}),
+      reload: async () => scopeEndpointStateForCredential(
+        await readEndpointState(endpointsPath, normalizeOptions),
+        credential,
+        normalizeOptions,
+      ),
+      persist: async (state) => {
+        const onDisk = await readEndpointState(endpointsPath, normalizeOptions);
+        // Never allow an old runtime process holding a superseded credential to
+        // overwrite or reactivate endpoint state after a re-enroll/retarget.
+        if ((onDisk.serverId && onDisk.serverId !== credential.serverId)
+          || (onDisk.primaryOrigin && onDisk.primaryOrigin !== credOrigin)) {
+          return;
+        }
+        await writeEndpointState(endpointsPath, {
+          ...state,
+          pinned: onDisk.pinned,
+          serverId: credential.serverId,
+          primaryOrigin: credOrigin,
+        });
+      },
+    },
+  );
 }

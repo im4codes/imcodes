@@ -36,10 +36,8 @@ import {
 } from './health-lease.js';
 import { CONTROLLED_NODE_SERVICE, isProcessElevated } from './installer.js';
 import {
-  ControlledNodeEndpointSelector,
   controlledNodeEndpointsPath,
-  readEndpointState,
-  writeEndpointState,
+  createRuntimeEndpointSelector,
 } from './server-endpoints.js';
 import { type ControlledNodeCredential, defaultCredentialPath, defaultStagedExecutablePath, persistCredential, readEnrollmentBlob } from './enrollment.js';
 import { createControlledNodeIdAdopter } from './controlled-node-id-adoption.js';
@@ -446,23 +444,14 @@ async function main(): Promise<void> {
     })
     : undefined;
   liveness?.start();
-  // The addresses the node may dial: its enrolled one, plus root-pinned and server-advertised alternates (a damaged file = none).
+  // The addresses the node may dial: its enrolled one, plus root-pinned and server-advertised alternates scoped to this credential.
   const endpointsPath = controlledNodeEndpointsPath(deps.journalPath);
-  const endpoints = new ControlledNodeEndpointSelector(
-    credential.serverUrl,
-    await readEndpointState(endpointsPath),
-    {
-      reload: () => readEndpointState(endpointsPath),
-      // The node owns advertised/lastGood/dropped; the root's pinned list is re-read from disk so a concurrent edit is never lost.
-      persist: async (state) => {
-        const onDisk = await readEndpointState(endpointsPath);
-        await writeEndpointState(endpointsPath, { ...state, pinned: onDisk.pinned });
-      },
-      onRotate: ({ from, to, reason }) => {
-        logger.warn({ from, to, reason }, 'controlled node switches to another server address');
-      },
+  const endpoints = await createRuntimeEndpointSelector(endpointsPath, credential, {
+    normalizeOptions: { allowLoopbackHttp: process.env.IMCODES_NODE_ALLOW_HTTP_ENROLL === '1' },
+    onRotate: ({ from, to, reason }) => {
+      logger.warn({ from, to, reason }, 'controlled node switches to another server address');
     },
-  );
+  });
   const signedShellArtifact = resolveRemoteDesktopAccountShellArtifact();
   const macosRemoteDesktopWorker = process.platform === 'darwin'
     && (process.arch === 'arm64' || process.arch === 'x64')

@@ -149,4 +149,35 @@ describe('daemon credentials are admitted only on explicitly called routes', () 
     expect(() => daemonApiUrl('https://example.invalid', 'DELETE', '/api/machines')).toThrow(DAEMON_TOKEN_ROUTE_NOT_ALLOWED);
     expect(matchDaemonTokenRoute('GET', '/api/aliases', NODE_ROLE.CONTROLLED)).toBeUndefined();
   });
+
+  it('controlled heartbeat probeOnly authenticates without updating DB status/heartbeat and rejects revoked tokens', async () => {
+    const controlledEnv = environment(NODE_ROLE.CONTROLLED);
+    const executeSpy = vi.spyOn(controlledEnv.DB, 'execute');
+    const app = buildApp(controlledEnv);
+
+    const probeRes = await app.request('/api/server/srv-1/heartbeat', {
+      method: 'POST',
+      headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ probeOnly: true }),
+    });
+    expect(probeRes.status).toBe(200);
+    expect(await probeRes.json()).toEqual({ ok: true, probeOnly: true });
+    expect(executeSpy).not.toHaveBeenCalled();
+
+    const beatRes = await app.request('/api/server/srv-1/heartbeat', {
+      method: 'POST',
+      headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ daemonVersion: '1.2.3' }),
+    });
+    expect(beatRes.status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+
+    const revokedApp = buildApp(environment(NODE_ROLE.CONTROLLED, 1));
+    const revokedProbe = await revokedApp.request('/api/server/srv-1/heartbeat', {
+      method: 'POST',
+      headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ probeOnly: true }),
+    });
+    expect(revokedProbe.status).toBe(401);
+  });
 });

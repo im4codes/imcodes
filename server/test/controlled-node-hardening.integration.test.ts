@@ -737,6 +737,35 @@ describe('daemon-token routes reject controlled nodes', () => {
     expect(res.status).toBe(200);
   });
 
+  it('supports read-only probeOnly heartbeat checks without flipping an offline node online', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const node = await controlledCredential(userId);
+    await db.execute("UPDATE servers SET status = 'offline', last_heartbeat_at = NULL WHERE id = $1", [node.serverId]);
+
+    const probe = await app.request(`/api/server/${node.serverId}/heartbeat`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${node.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ probeOnly: true }),
+    });
+    expect(probe.status).toBe(200);
+    expect(await probe.json()).toEqual({ ok: true, probeOnly: true });
+    const afterValidProbe = await db.queryOne<{ status: string; last_heartbeat_at: number | null }>(
+      'SELECT status, last_heartbeat_at FROM servers WHERE id = $1',
+      [node.serverId],
+    );
+    expect(afterValidProbe).toEqual({ status: 'offline', last_heartbeat_at: null });
+
+    await db.execute('UPDATE servers SET revoked_at = $1 WHERE id = $2', [Date.now(), node.serverId]);
+    const revokedProbe = await app.request(`/api/server/${node.serverId}/heartbeat`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${node.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ probeOnly: true }),
+    });
+    expect(revokedProbe.status).toBe(401);
+  });
+
   it('rejects a revoked full daemon, which these routes never used to check', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;

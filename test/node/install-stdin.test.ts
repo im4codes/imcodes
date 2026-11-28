@@ -22,15 +22,28 @@ import {
 } from '../../src/node/install-cli.js';
 import {
   bootstrapControlledNodeWithDisposition,
+  isCurrentExecutableStable,
   type ControlledNodeBootstrapDeps,
 } from '../../src/node/bootstrap.js';
 import {
+  loadPendingReenrollment,
   openVerifiedEnrollmentSource,
+  persistPendingReenrollment,
   probeControlledNodeCredentialStatus,
+  removePendingReenrollment,
   type ControlledNodeCredential,
   type PendingInstallIdentity,
+  type PendingReenrollmentRecord,
   type VerifiedEnrollmentSource,
 } from '../../src/node/enrollment.js';
+import {
+  controlledNodeEndpointsPath,
+  createRuntimeEndpointSelector,
+  emptyEndpointState,
+  readEndpointState,
+  resetEndpointStateForCredential,
+  writeEndpointState,
+} from '../../src/node/server-endpoints.js';
 import {
   INSTALL_JOURNAL_VERSION,
   writeInstallPhase,
@@ -168,7 +181,7 @@ describe('bootstrapControlledNodeWithDisposition via stdin enrollment', () => {
     const identity: PendingInstallIdentity = {
       installId: 'inst-stdin-1',
       nodeToken: 'node-secret-tok',
-      nodeTokenHash: 'b'.repeat(64),
+      nodeTokenHash: createHash('sha256').update('node-secret-tok', 'utf8').digest('hex'),
       sourceExePath: sourcePath,
     };
     const serviceReceipt: ServiceReceipt = {
@@ -181,10 +194,12 @@ describe('bootstrapControlledNodeWithDisposition via stdin enrollment', () => {
     const state: {
       credential: ControlledNodeCredential | null;
       identity: PendingInstallIdentity | null;
+      pendingReenrollment: PendingReenrollmentRecord | null;
       journal: InstallJournal;
     } = {
       credential: null,
       identity: null,
+      pendingReenrollment: null,
       journal: { version: INSTALL_JOURNAL_VERSION, phase: 'uninstalled', updatedAt: 0 },
     };
     const journalPath = join(dir, 'install.json');
@@ -203,6 +218,12 @@ describe('bootstrapControlledNodeWithDisposition via stdin enrollment', () => {
         ...(blob.abiProfile ? { abiProfile: blob.abiProfile } : {}),
       })),
       persistCredential: vi.fn(async (cred) => { state.credential = cred; }),
+      loadPendingReenrollment: vi.fn(async () => state.pendingReenrollment),
+      persistPendingReenrollment: vi.fn(async (rec) => { state.pendingReenrollment = rec; }),
+      removePendingReenrollment: vi.fn(async () => { state.pendingReenrollment = null; }),
+      resetEndpointState: vi.fn(async (next, prev) => {
+        await resetEndpointStateForCredential(controlledNodeEndpointsPath(journalPath), prev, next);
+      }),
       installDefinition: vi.fn(async () => serviceReceipt),
       inspectDefinition: vi.fn(async (r) => r),
       inspectServiceState: vi.fn(async () => ({
@@ -723,6 +744,327 @@ describe('bootstrapControlledNodeWithDisposition via stdin enrollment', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('preserves formal staged executable and stable runtime health when cross-server redeem fails with different installer bytes (P0-1)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-stdin-preserve-bin-'));
+    try {
+      const oldSourcePath = join(dir, 'old-installer');
+      const newSourcePath = join(dir, 'new-installer');
+      const stagedPath = join(dir, 'staged', 'imcodes-node');
+      const oldBytes = Buffer.from('#!/bin/sh\necho OLD_HEALTHY_BINARY_BYTES\n');
+      const newBytes = Buffer.from('#!/bin/sh\necho DIFFERENT_NEW_BINARY_BYTES_LONGER\n');
+      await writeFile(oldSourcePath, oldBytes, { mode: 0o700 });
+      await writeFile(newSourcePath, newBytes, { mode: 0o700 });
+      const opened = await openVerifiedEnrollmentSource(oldSourcePath);
+      const oldStagedReceipt = await opened.stageTrailerFreeExecutable(stagedPath, oldBytes.length);
+      await opened.close();
+
+      const oldSha = createHash('sha256').update(oldBytes).digest('hex');
+      const journalPath = join(dir, 'install.json');
+      let j = await writeInstallPhase(journalPath, 'elevated', { now: 1_700_000_000_000 });
+      j = await writeInstallPhase(journalPath, 'credential_prepared', {
+        now: 1_700_000_000_001,
+        previous: j,
+        installId: 'inst-old',
+        nodeTokenHash: 'b'.repeat(64),
+        sourceExePath: oldSourcePath,
+        sourceArtifact: { sha256: oldSha, size: oldBytes.length },
+      });
+      j = await writeInstallPhase(journalPath, 'files_staged', {
+        now: 1_700_000_000_002,
+        previous: j,
+        stagedExePath: stagedPath,
+        stagedReceipt: oldStagedReceipt,
+      });
+      j = await writeInstallPhase(journalPath, 'enrolled', {
+        now: 1_700_000_000_003,
+        previous: j,
+        serverId: 'srv-old',
+        cleanupStatus: 'skipped',
+      });
+      j = await writeInstallPhase(journalPath, 'service_registered', {
+        now: 1_700_000_000_004,
+        previous: j,
+        serviceName: 'imcodes-node',
+        serviceReceipt: { name: 'imcodes-node', platform: 'linux', action: stagedPath },
+      });
+      j = await writeInstallPhase(journalPath, 'service_start_requested', {
+        now: 1_700_000_000_005,
+        previous: j,
+        serviceStartRequestedAt: 1_700_000_000_005,
+      });
+      j = await writeInstallPhase(journalPath, 'service_healthy', {
+        now: 1_700_000_000_006,
+        previous: j,
+        healthyAt: 1_700_000_000_006,
+      });
+
+      const existingCred: ControlledNodeCredential = {
+        serverId: 'srv-old',
+        token: 'old-healthy-tok',
+        serverUrl: 'https://old-relay.example.com',
+        nodeRole: 'controlled',
+      };
+      const pendingPath = join(dir, 'pending-reenrollment.json');
+      const { deps, state } = createBootstrapFixture(dir, newSourcePath, stagedPath, newBytes, {
+        now: 1_700_000_001_000,
+        enrollmentBlob: { serverUrl: 'https://new-relay.example.com', enrollToken: 'expired-tok' },
+        journalPath,
+        loadCredential: vi.fn(async () => state.credential),
+        loadPendingReenrollment: () => loadPendingReenrollment(pendingPath),
+        persistPendingReenrollment: (rec) => persistPendingReenrollment(rec, pendingPath),
+        removePendingReenrollment: () => removePendingReenrollment(pendingPath),
+        redeemEnrollmentV2: vi.fn(async () => {
+          throw new Error('enrollment_redeem_failed:410');
+        }),
+        loadInstallJournal: vi.fn(async () => j),
+        writeInstallPhase: vi.fn(async (p, phase, opts) => {
+          j = await writeInstallPhase(p, phase, opts);
+          state.journal = j;
+          return j;
+        }),
+      });
+      state.credential = existingCred;
+      state.journal = j;
+
+      await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow(/enrollment_redeem_failed:410/);
+      // Formal executable and receipt remain untouched and stable!
+      expect(await readFile(stagedPath)).toEqual(oldBytes);
+      await expect(isCurrentExecutableStable(j, stagedPath)).resolves.toBe(true);
+
+      // Subsequent real stable runtime startup stays on run_runtime and does NOT restart itself.
+      const stableStartService = vi.fn(async () => {});
+      const stableRes = await bootstrapControlledNodeWithDisposition({
+        ...deps,
+        enrollmentBlob: undefined,
+        sourceExecutablePath: stagedPath,
+        isStableRuntime: (cur) => isCurrentExecutableStable(cur, stagedPath),
+        startService: stableStartService,
+      });
+      expect(stableRes.disposition).toBe('run_runtime');
+      expect(stableRes.credential).toEqual(existingCred);
+      expect(stableStartService).not.toHaveBeenCalled();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reuses durable pending re-enrollment identity on retry after lost HTTP response and completes journal commit after credential-only crash (P0-2)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-stdin-pending-retry-'));
+    try {
+      const sourcePath = join(dir, 'downloaded-imcodes-node-v2');
+      const stagedPath = join(dir, 'staged', 'imcodes-node');
+      const oldBytes = Buffer.from('OLD_BYTES');
+      const newBytes = Buffer.from('NEW_BYTES_V2');
+      await writeFile(sourcePath, newBytes, { mode: 0o700 });
+
+      const { journalPath, journal: initialJournal } = await seedHealthyInstallation(dir, sourcePath, stagedPath, oldBytes);
+      let currentJournal = initialJournal;
+      const pendingPath = join(dir, 'pending-reenrollment.json');
+
+      const existingCred: ControlledNodeCredential = {
+        serverId: 'srv-old',
+        token: 'old-revoked-tok',
+        serverUrl: 'https://relay.example.com',
+        nodeRole: 'controlled',
+      };
+      const oldIdentity: PendingInstallIdentity = {
+        installId: 'inst-old',
+        nodeToken: 'old-revoked-tok',
+        nodeTokenHash: 'b'.repeat(64),
+        sourceExePath: join(dir, 'old-installer'),
+      };
+      let genCount = 0;
+      const redeemedIdentities: Array<{ installId: string; nodeTokenHash: string }> = [];
+      let simulateLostHttp = true;
+      let simulateJournalWriteCrash = true;
+      let expectedCred!: ControlledNodeCredential;
+
+      const { deps, state } = createBootstrapFixture(dir, sourcePath, stagedPath, newBytes, {
+        now: 1_700_000_001_000,
+        enrollmentBlob: { serverUrl: 'https://relay.example.com', enrollToken: 'single-use-tok' },
+        journalPath,
+        loadCredential: vi.fn(async () => state.credential),
+        loadInstallIdentity: vi.fn(async () => state.identity),
+        loadPendingReenrollment: () => loadPendingReenrollment(pendingPath),
+        persistPendingReenrollment: (rec) => persistPendingReenrollment(rec, pendingPath),
+        removePendingReenrollment: () => removePendingReenrollment(pendingPath),
+        probeExistingCredential: vi.fn(async (cred) => (cred.serverId === 'srv-old' ? 'revoked' : 'valid')),
+        generateInstallIdentity: vi.fn(() => {
+          genCount += 1;
+          return {
+            installId: `inst-gen-${genCount}`,
+            nodeToken: `tok-gen-${genCount}`,
+            nodeTokenHash: createHash('sha256').update(`tok-gen-${genCount}`, 'utf8').digest('hex'),
+            sourceExePath: sourcePath,
+          };
+        }),
+        redeemEnrollmentV2: vi.fn(async (blob, id) => {
+          redeemedIdentities.push({ installId: id.installId, nodeTokenHash: id.nodeTokenHash });
+          expectedCred = {
+            serverId: 'srv-idempotent-1',
+            nodeId: '1234567890',
+            token: id.nodeToken,
+            serverUrl: blob.serverUrl,
+            nodeRole: 'controlled',
+          };
+          if (simulateLostHttp) {
+            simulateLostHttp = false;
+            throw new Error('network_timeout_after_server_commit');
+          }
+          return expectedCred;
+        }),
+        loadInstallJournal: vi.fn(async () => currentJournal),
+        writeInstallPhase: vi.fn(async (p, phase, opts) => {
+          if (simulateJournalWriteCrash) {
+            simulateJournalWriteCrash = false;
+            throw new Error('simulated_disk_fail_after_credential_persist');
+          }
+          currentJournal = await writeInstallPhase(p, phase, opts);
+          state.journal = currentJournal;
+          return currentJournal;
+        }),
+      });
+      state.credential = existingCred;
+      state.identity = oldIdentity;
+      state.journal = initialJournal;
+
+      // Attempt 1: server commits, HTTP response lost -> pending-reenrollment.json stays on disk, credential/journal untouched.
+      await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow(/network_timeout_after_server_commit/);
+      const savedPending = await loadPendingReenrollment(pendingPath);
+      expect(savedPending?.identity.installId).toBe('inst-gen-1');
+      expect(savedPending?.redeemedCredential).toBeUndefined();
+      expect(state.credential).toEqual(existingCred);
+
+      // Attempt 2: retries with EXACT SAME installId/nodeTokenHash, receives credential, persists credential, then crashes before journal write!
+      await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow(/simulated_disk_fail_after_credential_persist/);
+      expect(genCount).toBe(1);
+      expect(redeemedIdentities).toEqual([
+        { installId: 'inst-gen-1', nodeTokenHash: savedPending!.identity.nodeTokenHash },
+        { installId: 'inst-gen-1', nodeTokenHash: savedPending!.identity.nodeTokenHash },
+      ]);
+      // Credential is now newCred (probing 'valid'!), yet journal STILL has 'srv-old' and pending still has redeemedCredential.
+      expect(state.credential).toEqual(expectedCred);
+      expect(currentJournal.serverId).toBe('srv-old');
+      const committedPending = await loadPendingReenrollment(pendingPath);
+      expect(committedPending?.redeemedCredential).toEqual(expectedCred);
+
+      // Attempt 3: finishes committing journal rotation WITHOUT re-redeeming or calling probe, removes pending file, restarts service.
+      const res3 = await bootstrapControlledNodeWithDisposition(deps);
+      expect(res3.disposition).toBe('handoff_complete');
+      expect(res3.credential).toEqual(expectedCred);
+      expect(redeemedIdentities).toHaveLength(2);
+      expect(currentJournal.serverId).toBe('srv-idempotent-1');
+      expect(currentJournal.installId).toBe('inst-gen-1');
+      expect(currentJournal.nodeTokenHash).toBe(savedPending!.identity.nodeTokenHash);
+      expect(await loadPendingReenrollment(pendingPath)).toBeNull();
+      expect(deps.startService).toHaveBeenCalledTimes(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes concurrent bootstrap invocations and isolates old relay endpoints on retarget (P0-2 + P0-3)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-stdin-concurrent-endpoints-'));
+    try {
+      const sourcePath = join(dir, 'downloaded-imcodes-node');
+      const stagedPath = join(dir, 'staged', 'imcodes-node');
+      const bytes = Buffer.from('BINARY_BYTES');
+      await writeFile(sourcePath, bytes, { mode: 0o700 });
+
+      const { journalPath, journal: initialJournal } = await seedHealthyInstallation(dir, sourcePath, stagedPath, bytes);
+      let currentJournal = initialJournal;
+      const endpointsPath = controlledNodeEndpointsPath(journalPath);
+      await writeEndpointState(endpointsPath, {
+        ...emptyEndpointState(),
+        serverId: 'srv-old',
+        primaryOrigin: 'https://old-relay.example.com',
+        pinned: ['https://old-pin.example.com'],
+        advertised: ['https://old-alt.example.com'],
+        lastGood: 'https://old-alt.example.com',
+        dropped: { 'https://old-drop.example.com': 9_999_999_999_999 },
+      });
+
+      const oldRuntimeSelector = await createRuntimeEndpointSelector(endpointsPath, {
+        serverId: 'srv-old',
+        serverUrl: 'https://old-relay.example.com',
+      });
+      expect(oldRuntimeSelector.current()).toBe('https://old-alt.example.com');
+
+      const existingCred: ControlledNodeCredential = {
+        serverId: 'srv-old',
+        token: 'old-tok',
+        serverUrl: 'https://old-relay.example.com',
+        nodeRole: 'controlled',
+      };
+      const newCred: ControlledNodeCredential = {
+        serverId: 'srv-new',
+        nodeId: '2233445566',
+        token: 'node-secret-tok',
+        serverUrl: 'https://new-relay.example.com',
+        nodeRole: 'controlled',
+      };
+
+      const callOrder: string[] = [];
+      let releaseRedeem!: () => void;
+      const redeemGate = new Promise<void>((r) => { releaseRedeem = r; });
+      const { deps, state } = createBootstrapFixture(dir, sourcePath, stagedPath, bytes, {
+        now: 1_700_000_001_000,
+        enrollmentBlob: { serverUrl: 'https://new-relay.example.com', enrollToken: 'retarget-tok' },
+        journalPath,
+        loadCredential: vi.fn(async () => state.credential),
+        probeExistingCredential: vi.fn(async (cred) => (cred.serverId === 'srv-new' ? 'valid' : 'revoked')),
+        redeemEnrollmentV2: vi.fn(async () => {
+          callOrder.push('redeem');
+          await redeemGate;
+          return newCred;
+        }),
+        resetEndpointState: vi.fn(async (next, prev) => {
+          callOrder.push('resetEndpoints');
+          await resetEndpointStateForCredential(endpointsPath, prev, next);
+        }),
+        persistCredential: vi.fn(async (cred) => {
+          callOrder.push('persistCredential');
+          state.credential = cred;
+        }),
+        loadInstallJournal: vi.fn(async () => currentJournal),
+        writeInstallPhase: vi.fn(async (p, phase, opts) => {
+          currentJournal = await writeInstallPhase(p, phase, opts);
+          state.journal = currentJournal;
+          return currentJournal;
+        }),
+      });
+      state.credential = existingCred;
+      state.journal = initialJournal;
+
+      const p1 = bootstrapControlledNodeWithDisposition(deps);
+      const p2 = bootstrapControlledNodeWithDisposition(deps);
+      await new Promise((r) => setTimeout(r, 15));
+      releaseRedeem();
+      const [r1, r2] = await Promise.all([p1, p2]);
+
+      expect(r1.credential).toEqual(newCred);
+      expect(r2.credential).toEqual(newCred);
+      expect(deps.redeemEnrollmentV2).toHaveBeenCalledTimes(1);
+      expect(callOrder.indexOf('resetEndpoints')).toBeLessThan(callOrder.indexOf('persistCredential'));
+
+      // Late write by still-in-memory old runtime cannot re-activate old lastGood/advertised/dropped.
+      oldRuntimeSelector.setAdvertised(['https://old-alt.example.com']);
+      oldRuntimeSelector.recordSuccess();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(await readEndpointState(endpointsPath)).toEqual({
+        ...emptyEndpointState(),
+        serverId: 'srv-new',
+        primaryOrigin: 'https://new-relay.example.com',
+      });
+
+      const newRuntimeSelector = await createRuntimeEndpointSelector(endpointsPath, newCred);
+      expect(newRuntimeSelector.current()).toBe('https://new-relay.example.com');
+      expect(newRuntimeSelector.candidates()).toEqual(['https://new-relay.example.com']);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('probeControlledNodeCredentialStatus', () => {
@@ -732,7 +1074,7 @@ describe('probeControlledNodeCredentialStatus', () => {
     serverUrl: 'https://relay.example.com',
   };
 
-  it('returns revoked on 401 and posts bearer token to /api/server/:id/heartbeat', async () => {
+  it('returns revoked on 401 and posts read-only probeOnly bearer request to /api/server/:id/heartbeat', async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 }));
     const status = await probeControlledNodeCredentialStatus(baseCred, fetchMock as unknown as typeof fetch);
     expect(status).toBe('revoked');
@@ -741,6 +1083,7 @@ describe('probeControlledNodeCredentialStatus', () => {
       expect.objectContaining({
         method: 'POST',
         redirect: 'error',
+        body: JSON.stringify({ probeOnly: true }),
         headers: expect.objectContaining({ authorization: 'Bearer tok-secret-1' }),
       }),
     );

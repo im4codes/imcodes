@@ -12,9 +12,12 @@ import {
 import {
   ControlledNodeEndpointSelector,
   controlledNodeEndpointsPath,
+  createRuntimeEndpointSelector,
   emptyEndpointState,
   parseEndpointState,
   readEndpointState,
+  resetEndpointStateForCredential,
+  scopeEndpointStateForCredential,
   updatePinnedEndpoints,
   writeEndpointState,
   type ControlledNodeEndpointState,
@@ -124,6 +127,67 @@ describe('endpoint state file', () => {
     expect(await updatePinnedEndpoints(path, { remove: PROXY })).toEqual([]);
     await updatePinnedEndpoints(path, { add: PROXY });
     expect(await updatePinnedEndpoints(path, { clear: true })).toEqual([]);
+  });
+
+  it('isolates old relay endpoints on cross-origin retarget and blocks stale runtime reactivation', async () => {
+    const dir = await tempDir();
+    const path = join(dir, CONTROLLED_NODE_ENDPOINTS_FILE);
+    const NEW_PRIMARY = 'https://new-relay.example';
+    const OLD_PIN = 'https://old-pin.example';
+    await writeEndpointState(path, {
+      ...emptyEndpointState(),
+      serverId: 'srv-old',
+      primaryOrigin: PRIMARY,
+      pinned: [OLD_PIN],
+      advertised: [PROXY],
+      lastGood: PROXY,
+      dropped: { [OTHER]: 9_999_999_999_999 },
+    });
+
+    // Old runtime selector still in memory before process restart.
+    const oldSelector = await createRuntimeEndpointSelector(path, { serverId: 'srv-old', serverUrl: PRIMARY });
+    expect(oldSelector.current()).toBe(PROXY);
+
+    // Retarget resets disk state to new serverId + new primaryOrigin.
+    await resetEndpointStateForCredential(
+      path,
+      { serverId: 'srv-old', serverUrl: PRIMARY },
+      { serverId: 'srv-new', serverUrl: NEW_PRIMARY },
+    );
+
+    // Late writes from the old runtime MUST NOT reactivate old lastGood/advertised/dropped.
+    oldSelector.setAdvertised([OTHER]);
+    oldSelector.recordSuccess();
+    await new Promise((r) => setTimeout(r, 20));
+    const onDisk = await readEndpointState(path);
+    expect(onDisk).toEqual({
+      ...emptyEndpointState(),
+      serverId: 'srv-new',
+      primaryOrigin: NEW_PRIMARY,
+    });
+
+    // New runtime sees zero old-realm endpoints on first dial or fallback.
+    const newSelector = await createRuntimeEndpointSelector(path, { serverId: 'srv-new', serverUrl: NEW_PRIMARY });
+    expect(newSelector.current()).toBe(NEW_PRIMARY);
+    expect(newSelector.candidates()).toEqual([NEW_PRIMARY]);
+  });
+
+  it('clears lastGood/advertised/dropped on same-origin serverId rotation while keeping same-origin pins', () => {
+    const scoped = scopeEndpointStateForCredential({
+      ...emptyEndpointState(),
+      serverId: 'srv-old',
+      primaryOrigin: PRIMARY,
+      pinned: [PROXY],
+      advertised: [OTHER],
+      lastGood: OTHER,
+      dropped: { [OTHER]: 123 },
+    }, { serverId: 'srv-new', serverUrl: PRIMARY });
+    expect(scoped).toEqual({
+      ...emptyEndpointState(),
+      serverId: 'srv-new',
+      primaryOrigin: PRIMARY,
+      pinned: [PROXY],
+    });
   });
 });
 
