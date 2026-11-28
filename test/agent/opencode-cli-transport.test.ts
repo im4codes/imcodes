@@ -7,7 +7,10 @@ import {
   OPENCODE_TRANSPORT_MODES,
   buildOpenCodeCliCommand,
   classifyOpenCodeVersion,
+  inspectOpenCodeSqliteSession,
+  inspectOpenCodeSqliteSessions,
   isLoopbackHostname,
+  isRecoverableFreeLimitOnlyEmbeddedSession,
   probeOpenCodeCli,
   redactSecretText,
   resetOpenCodeCliCache,
@@ -2452,5 +2455,668 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
         else process.env[k] = v;
       }
     }
+  }, 45_000);
+
+  it('graduates free-limit-only embedded sessions to installed v1/v2 CLI while keeping completed history and accurate fallback hint', async () => {
+    const root = mkTemp('oc-grad-');
+    const stateHome = join(root, 'imcodes-state');
+    const xdgData = join(root, 'xdg-data');
+    mkdirSync(stateHome, { recursive: true });
+    mkdirSync(xdgData, { recursive: true });
+    process.env.IMCODES_HOME = stateHome;
+    process.env.XDG_DATA_HOME = xdgData;
+
+    const { DatabaseSync } = await import('node:sqlite');
+    const embDbPath = join(stateHome, 'opencode-sdk.db');
+
+    // Seed real embedded DB via embedded provider first so exact schema (session_v2 / session_message) matches runtime.
+    const pSeed = new OpenCodeSdkProvider();
+    let freeLimitOnlyId = '';
+    let completedWithFreeLimitId = '';
+    let userOnlyId = '';
+    const seededIds: string[] = [];
+    pSeed.onSessionInfo((_sid, info) => {
+      if (info.resumeId) seededIds.push(info.resumeId);
+    });
+    await pSeed.connect({ transport: 'embedded', cwd: root } as any);
+    await pSeed.createSession({ sessionKey: 'seed-free-only', cwd: root });
+    freeLimitOnlyId = seededIds.at(-1)!;
+    await pSeed.createSession({ sessionKey: 'seed-completed', cwd: root });
+    completedWithFreeLimitId = seededIds.at(-1)!;
+    await pSeed.createSession({ sessionKey: 'seed-user-only', cwd: root });
+    userOnlyId = seededIds.at(-1)!;
+    await pSeed.disconnect();
+
+    const db = new DatabaseSync(embDbPath);
+    const now = Date.now();
+    const nextSeq = (sid: string): number => Number(
+      (db.prepare('SELECT COALESCE(MAX(seq), -1) AS m FROM session_message WHERE session_id = ?').get(sid) as { m: number }).m,
+    ) + 1;
+    // 1a. free-limit-only session_v2: user prompt + failed assistant (provider.free-limit) + failed outcome
+    db.prepare(
+      'INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).run('sm_fl_1', freeLimitOnlyId, 'user', nextSeq(freeLimitOnlyId), now + 10, now + 10, JSON.stringify({ text: 'hi' }));
+    db.prepare(
+      'INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).run('sm_fl_2', freeLimitOnlyId, 'assistant', nextSeq(freeLimitOnlyId), now + 20, now + 20, JSON.stringify({
+      finish: 'error',
+      content: [],
+      error: { type: 'provider.free-limit', message: 'Free usage limit reached.' },
+    }));
+    // Malformed non-JSON row must not throw or corrupt classification
+    db.prepare(
+      'INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).run('sm_fl_bad', freeLimitOnlyId, 'outcome', nextSeq(freeLimitOnlyId), now + 30, now + 30, '{not-valid-json');
+    db.prepare('UPDATE session_v2 SET time_updated = ? WHERE id = ?').run(now + 30, freeLimitOnlyId);
+
+    // 1b. completed assistant turn PLUS later free-limit error -> MUST NOT graduate!
+    db.prepare(
+      'INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).run('sm_comp_1', completedWithFreeLimitId, 'user', nextSeq(completedWithFreeLimitId), now + 10, now + 10, JSON.stringify({ text: 'hello' }));
+    db.prepare(
+      'INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).run('sm_comp_2', completedWithFreeLimitId, 'assistant', nextSeq(completedWithFreeLimitId), now + 20, now + 20, JSON.stringify({
+      finish: 'stop',
+      content: [{ type: 'text', text: 'Working answer' }],
+    }));
+    db.prepare(
+      'INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).run('sm_comp_3', completedWithFreeLimitId, 'assistant', nextSeq(completedWithFreeLimitId), now + 30, now + 30, JSON.stringify({
+      finish: 'error',
+      content: [],
+      error: { type: 'provider.free-limit', message: 'Free usage limit reached.' },
+    }));
+    db.prepare('UPDATE session_v2 SET time_updated = ? WHERE id = ?').run(now + 30, completedWithFreeLimitId);
+
+    // 1c. user/malformed-only session with NO free-limit error -> MUST NOT graduate!
+    db.prepare(
+      'INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).run('sm_usr_1', userOnlyId, 'user', nextSeq(userOnlyId), now + 10, now + 10, JSON.stringify({ text: 'draft only' }));
+    db.prepare(
+      'INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).run('sm_usr_bad', userOnlyId, 'assistant', nextSeq(userOnlyId), now + 20, now + 20, 'corrupt-json');
+    db.close();
+
+    // Verify legacy `session` + `message` SQLite schema classification too
+    const v1ShapeDbPath = join(root, 'legacy-shape.db');
+    const v1ShapeDb = new DatabaseSync(v1ShapeDbPath);
+    v1ShapeDb.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER);
+      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+    `);
+    v1ShapeDb.prepare('INSERT INTO session (id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run('ses_leg_fl', root, 'leg-fl', now, now + 10);
+    v1ShapeDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
+      'm_leg_fl', 'ses_leg_fl', now + 10, now + 10, JSON.stringify({ role: 'assistant', finish: 'error', error: { message: 'Free usage limit reached.' } }),
+    );
+    v1ShapeDb.prepare('INSERT INTO session (id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run('ses_leg_ok', root, 'leg-ok', now, now + 20);
+    v1ShapeDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
+      'm_leg_ok', 'ses_leg_ok', now + 15, now + 15, JSON.stringify({ role: 'assistant', finish: 'stop' }),
+    );
+    v1ShapeDb.close();
+
+    // Acceptance 1 assertions
+    const snapFreeOnly = await inspectOpenCodeSqliteSession(freeLimitOnlyId, [embDbPath]);
+    expect(snapFreeOnly).toMatchObject({ hasCompletedAssistantTurn: false, hasFreeLimitError: true });
+    expect(isRecoverableFreeLimitOnlyEmbeddedSession(snapFreeOnly)).toBe(true);
+
+    const snapCompleted = await inspectOpenCodeSqliteSession(completedWithFreeLimitId, [embDbPath]);
+    expect(snapCompleted).toMatchObject({ hasCompletedAssistantTurn: true, hasFreeLimitError: true });
+    expect(isRecoverableFreeLimitOnlyEmbeddedSession(snapCompleted)).toBe(false);
+
+    const snapUserOnly = await inspectOpenCodeSqliteSession(userOnlyId, [embDbPath]);
+    expect(snapUserOnly).toMatchObject({ hasCompletedAssistantTurn: false, hasFreeLimitError: false });
+    expect(isRecoverableFreeLimitOnlyEmbeddedSession(snapUserOnly)).toBe(false);
+
+    expect(await inspectOpenCodeSqliteSession('ses_does_not_exist', [embDbPath])).toBeNull();
+    expect(isRecoverableFreeLimitOnlyEmbeddedSession(null)).toBe(false);
+
+    expect(isRecoverableFreeLimitOnlyEmbeddedSession(await inspectOpenCodeSqliteSession('ses_leg_fl', [v1ShapeDbPath]))).toBe(true);
+    expect(isRecoverableFreeLimitOnlyEmbeddedSession(await inspectOpenCodeSqliteSession('ses_leg_ok', [v1ShapeDbPath]))).toBe(false);
+
+    // Acceptance 2 + 4 + 5 + stale-route Boundary under v1-cli
+    const v1Bin = makeFakeExecutable(join(root, 'v1grad'), 'opencode', '#!/bin/sh\necho "1.18.4"\n');
+    const v1Q = createAsyncQueue<Record<string, any>>();
+    let v1CreateSeq = 0;
+    const v1Prompts: Array<{ sessionID: string; text: string }> = [];
+    const v1CreatedIds: string[] = [];
+    openCodeV1RuntimeHooks.start = vi.fn(async (opts) => {
+      opts.signal.addEventListener('abort', v1Q.close, { once: true });
+      return {
+        client: {
+          session: {
+            create: vi.fn(async () => {
+              const id = `ses-v1-grad-${++v1CreateSeq}`;
+              v1CreatedIds.push(id);
+              return { data: { id } };
+            }),
+            get: vi.fn(async () => {
+              const err: any = new Error('404 session not found');
+              err.status = 404;
+              throw err;
+            }),
+            list: vi.fn(async () => ({ data: [] })),
+            message: vi.fn(async () => ({ data: null })),
+            messages: vi.fn(async () => ({ data: [] })),
+            prompt: vi.fn(async () => ({ data: {} })),
+            promptAsync: vi.fn(async (req: any) => {
+              v1Prompts.push({ sessionID: req?.path?.id ?? req?.sessionID, text: req?.body?.parts?.[0]?.text ?? '' });
+              return { data: undefined };
+            }),
+            abort: vi.fn(async () => ({ data: true })),
+          },
+          provider: { list: vi.fn(async () => ({ data: { connected: [], all: [], default: {} } })) },
+          event: { subscribe: vi.fn(async () => ({ stream: v1Q.stream })) },
+          postSessionIdPermissionsPermissionId: vi.fn(async () => ({ data: true })),
+        } as any,
+        server: { url: 'http://127.0.0.1:42019', close: vi.fn(async () => { v1Q.close(); }) },
+      };
+    });
+
+    const pV1Grad = new OpenCodeSdkProvider();
+    const v1Infos: Array<{ sid: string; resumeId?: string; owner?: string }> = [];
+    const v1Errors: Array<{ sid: string; code: string; message: string }> = [];
+    pV1Grad.onSessionInfo((sid, info) => v1Infos.push({ sid, resumeId: info.resumeId, owner: info.openCodeStorageOwner }));
+    pV1Grad.onError((sid, err) => v1Errors.push({ sid, code: err.code, message: err.message }));
+    await pV1Grad.connect({ binaryPath: v1Bin, cwd: root } as any);
+
+    // 2a. Free-limit-only restoreSession + createSession (unowned AND openCodeStorageOwner='embedded') graduate cleanly WITHOUT embeddedFallbackDelegate!
+    expect(await pV1Grad.restoreSession(freeLimitOnlyId)).toBe(true);
+    expect((pV1Grad as any).embeddedFallbackDelegate).toBeNull();
+
+    await pV1Grad.createSession({
+      sessionKey: 'v1-grad-unowned',
+      cwd: root,
+      skipCreate: true,
+      resumeId: freeLimitOnlyId,
+    });
+    expect(v1Infos.at(-1)).toMatchObject({ sid: 'v1-grad-unowned', resumeId: 'ses-v1-grad-1', owner: 'v1-cli' });
+    expect((pV1Grad as any).embeddedFallbackDelegate).toBeNull();
+
+    await pV1Grad.createSession({
+      sessionKey: 'v1-grad-owned',
+      cwd: root,
+      skipCreate: true,
+      resumeId: freeLimitOnlyId,
+      openCodeStorageOwner: 'embedded',
+    });
+    expect(v1Infos.at(-1)).toMatchObject({ sid: 'v1-grad-owned', resumeId: 'ses-v1-grad-2', owner: 'v1-cli' });
+    expect((pV1Grad as any).embeddedFallbackDelegate).toBeNull();
+
+    // 5. Missing openCodeStorageOwner='embedded' STILL fails with SESSION_NOT_FOUND
+    await expect(pV1Grad.createSession({
+      sessionKey: 'v1-missing-emb',
+      cwd: root,
+      skipCreate: true,
+      resumeId: 'ses_missing_emb_xyz',
+      openCodeStorageOwner: 'embedded',
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND });
+
+    // 4 & Boundary: Restore completed-history embedded session on route 'v1-sticky-route' -> uses embeddedFallbackDelegate,
+    // emits legacy-embedded-session guidance on free-limit error (NOT "Install the official OpenCode CLI"),
+    // then re-restoring 'v1-sticky-route' with freeLimitOnlyId clears embeddedFallbackRoutes so send/setSessionAgentId/endSession hit v1Delegate!
+    await pV1Grad.createSession({
+      sessionKey: 'v1-sticky-route',
+      cwd: root,
+      skipCreate: true,
+      resumeId: completedWithFreeLimitId,
+      openCodeStorageOwner: 'embedded',
+    });
+    expect(v1Infos.at(-1)).toMatchObject({ sid: 'v1-sticky-route', resumeId: completedWithFreeLimitId, owner: 'embedded' });
+    const fbDelegate = (pV1Grad as any).embeddedFallbackDelegate as OpenCodeSdkProvider;
+    expect(fbDelegate).toBeTruthy();
+    expect(((pV1Grad as any).embeddedFallbackRoutes as Set<string>).has('v1-sticky-route')).toBe(true);
+
+    // Trigger free-limit error inside cliEmbeddedFallback delegate via send error path
+    const fbState = (fbDelegate as any).sessions.get('v1-sticky-route');
+    const origFbPrompt = fbState.client.sessions.prompt;
+    fbState.client.sessions.prompt = vi.fn(async () => {
+      throw Object.assign(new Error('Free usage limit reached.'), { type: 'provider.free-limit', status: 429 });
+    });
+    const fbErr = await pV1Grad.send('v1-sticky-route', 'test hint').catch((e) => e);
+    expect(fbErr).toMatchObject({
+      code: PROVIDER_ERROR_CODES.RATE_LIMITED,
+    });
+    expect(fbErr.message).toContain('This legacy session is bound to embedded storage.');
+    expect(fbErr.message).not.toContain('Install the official OpenCode CLI');
+    expect(v1Errors).toEqual([]);
+    fbState.client.sessions.prompt = origFbPrompt;
+
+    // Now re-restore the same routeKey with freeLimitOnlyId -> MUST graduate AND clear embeddedFallbackRoutes!
+    await pV1Grad.createSession({
+      sessionKey: 'v1-sticky-route',
+      cwd: root,
+      skipCreate: true,
+      resumeId: freeLimitOnlyId,
+      openCodeStorageOwner: 'embedded',
+    });
+    expect(v1Infos.at(-1)).toMatchObject({ sid: 'v1-sticky-route', resumeId: 'ses-v1-grad-3', owner: 'v1-cli' });
+    expect(((pV1Grad as any).embeddedFallbackRoutes as Set<string>).has('v1-sticky-route')).toBe(false);
+
+    pV1Grad.setSessionAgentId('v1-sticky-route', 'opencode/big-pickle');
+    await pV1Grad.send('v1-sticky-route', 'hello graduated v1');
+    expect(v1Prompts.some((p) => p.sessionID === 'ses-v1-grad-3' && p.text.includes('hello graduated v1'))).toBe(true);
+    await pV1Grad.endSession('v1-sticky-route');
+    await pV1Grad.disconnect();
+
+    // Verify pure embedded mode (no active CLI) STILL keeps original "Install the official OpenCode CLI" hint
+    const pPureEmb = new OpenCodeSdkProvider();
+    const pureErrors: string[] = [];
+    pPureEmb.onError((_sid, err) => pureErrors.push(err.message));
+    await pPureEmb.connect({ transport: 'embedded', databasePath: embDbPath, cwd: root } as any);
+    await pPureEmb.createSession({ sessionKey: 'pure-emb-route', cwd: root });
+    const pureState = (pPureEmb as any).sessions.get('pure-emb-route');
+    pureState.client.sessions.prompt = vi.fn(async () => {
+      throw Object.assign(new Error('Free usage limit reached.'), { type: 'provider.free-limit', status: 429 });
+    });
+    const pureErr = await pPureEmb.send('pure-emb-route', 'pure prompt').catch((e) => e);
+    expect(pureErr).toMatchObject({
+      code: PROVIDER_ERROR_CODES.RATE_LIMITED,
+    });
+    expect(pureErr.message).toContain('Install the official OpenCode CLI (`opencode`)');
+    expect(pureErrors).toEqual([]);
+
+    // Boundary: explicit transport='embedded' NEVER graduates freeLimitOnlyId even though it has free-limit-only history!
+    const pureInfos: Array<{ sid: string; resumeId?: string; owner?: string }> = [];
+    pPureEmb.onSessionInfo((sid, info) => pureInfos.push({ sid, resumeId: info.resumeId, owner: info.openCodeStorageOwner }));
+    await pPureEmb.createSession({
+      sessionKey: 'pure-emb-stay',
+      cwd: root,
+      skipCreate: true,
+      resumeId: freeLimitOnlyId,
+      openCodeStorageOwner: 'embedded',
+    });
+    expect(pureInfos.at(-1)).toMatchObject({ sid: 'pure-emb-stay', resumeId: freeLimitOnlyId, owner: 'embedded' });
+    await pPureEmb.disconnect();
+
+    // Acceptance 3 & 4 under v2-cli (mock v2 HTTP server)
+    const v2GradLog = join(root, 'v2-grad.log');
+    writeFileSync(v2GradLog, '', 'utf8');
+    process.env.V2_GRAD_LOG = v2GradLog;
+    const v2GradScript = join(root, 'v2-grad-host.mjs');
+    writeFileSync(v2GradScript, `
+      import http from 'node:http';
+      import { appendFileSync } from 'node:fs';
+      if (process.argv.includes('--version')) {
+        console.log('opencode v2.4.2');
+        process.exit(0);
+      }
+      let seq = 0;
+      const logFile = process.env.V2_GRAD_LOG;
+      const srv = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+          const pathname = new URL(req.url || '/', 'http://127.0.0.1').pathname;
+          if (pathname === '/api/info') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ version: '2.4.2', urls: [] })); return; }
+          if (pathname === '/api/event') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write('data: ' + JSON.stringify({ type: 'server.connected', properties: {} }) + '\\n\\n'); return; }
+          if (pathname === '/api/provider') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ data: [{ id: 'opencode', name: 'OpenCode', activation: 'ready' }] })); return; }
+          if (pathname === '/api/model') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ data: [{ id: 'opencode/big-pickle', providerID: 'opencode', modelID: 'big-pickle', enabled: true, type: 'chat' }] })); return; }
+          if (pathname === '/api/model/default') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ data: { providerID: 'opencode', modelID: 'big-pickle' } })); return; }
+          if (pathname === '/api/session' && req.method === 'POST') {
+            const id = 'ses-v2-grad-' + (++seq);
+            appendFileSync(logFile, JSON.stringify({ op: 'create', id }) + '\\n');
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ data: { id, location: { directory: ${JSON.stringify(root)} } } }));
+            return;
+          }
+          if (pathname.startsWith('/api/session/') && req.method === 'GET') {
+            res.statusCode = 404;
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ message: 'Not Found' }));
+            return;
+          }
+          if (pathname.startsWith('/api/experimental/mcp/')) { res.statusCode = 204; res.end(); return; }
+          res.setHeader('content-type', 'application/json');
+          res.end('{}');
+        });
+      });
+      srv.listen(0, '127.0.0.1', () => { console.log('listening on http://127.0.0.1:' + srv.address().port); });
+      process.on('SIGTERM', () => process.exit(0));
+    `, 'utf8');
+    const v2GradBin = makeFakeExecutable(join(root, 'v2grad'), 'opencode', `#!/bin/sh\nexec "${process.execPath}" "${v2GradScript}" "$@"\n`);
+
+    const pV2Grad = new OpenCodeSdkProvider();
+    const v2Infos: Array<{ sid: string; resumeId?: string; owner?: string }> = [];
+    pV2Grad.onSessionInfo((sid, info) => v2Infos.push({ sid, resumeId: info.resumeId, owner: info.openCodeStorageOwner }));
+    await pV2Grad.connect({ binaryPath: v2GradBin, cwd: root } as any);
+
+    // Both restoreSession and unowned/owned createSession graduate cleanly under v2-cli without embeddedFallbackDelegate
+    expect(await pV2Grad.restoreSession(freeLimitOnlyId)).toBe(true);
+    expect((pV2Grad as any).embeddedFallbackDelegate).toBeNull();
+
+    await pV2Grad.createSession({
+      sessionKey: 'v2-grad-unowned',
+      cwd: root,
+      skipCreate: true,
+      resumeId: freeLimitOnlyId,
+    });
+    expect(v2Infos.at(-1)).toMatchObject({ sid: 'v2-grad-unowned', resumeId: 'ses-v2-grad-1', owner: 'v2-cli' });
+    expect((pV2Grad as any).embeddedFallbackDelegate).toBeNull();
+
+    await pV2Grad.createSession({
+      sessionKey: 'v2-grad-owned',
+      cwd: root,
+      skipCreate: true,
+      resumeId: freeLimitOnlyId,
+      openCodeStorageOwner: 'embedded',
+    });
+    expect(v2Infos.at(-1)).toMatchObject({ sid: 'v2-grad-owned', resumeId: 'ses-v2-grad-2', owner: 'v2-cli' });
+    expect((pV2Grad as any).embeddedFallbackDelegate).toBeNull();
+
+    // Missing openCodeStorageOwner='embedded' rejects with SESSION_NOT_FOUND under v2-cli too
+    await expect(pV2Grad.createSession({
+      sessionKey: 'v2-missing-emb',
+      cwd: root,
+      skipCreate: true,
+      resumeId: 'ses_missing_v2_emb',
+      openCodeStorageOwner: 'embedded',
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND });
+
+    // Completed-history embedded session still stays on embeddedFallbackDelegate under v2-cli
+    await pV2Grad.createSession({
+      sessionKey: 'v2-keep-emb',
+      cwd: root,
+      skipCreate: true,
+      resumeId: completedWithFreeLimitId,
+      openCodeStorageOwner: 'embedded',
+    });
+    expect(v2Infos.at(-1)).toMatchObject({ sid: 'v2-keep-emb', resumeId: completedWithFreeLimitId, owner: 'embedded' });
+
+    delete process.env.V2_GRAD_LOG;
+    await pV2Grad.disconnect();
+  }, 45_000);
+
+  it('preserves competing v1/v2 CLI history on unowned free-limit-only embedded collision while still graduating embedded-only sessions', async () => {
+    const root = mkTemp('oc-coll-');
+    const stateHome = join(root, 'imcodes-state');
+    const xdgData = join(root, 'xdg-data');
+    const v1DataDir = join(xdgData, 'opencode');
+    mkdirSync(stateHome, { recursive: true });
+    mkdirSync(v1DataDir, { recursive: true });
+    process.env.IMCODES_HOME = stateHome;
+    process.env.XDG_DATA_HOME = xdgData;
+
+    const { DatabaseSync } = await import('node:sqlite');
+    const embDbPath = join(stateHome, 'opencode-sdk.db');
+    const v1DbPath = join(v1DataDir, 'opencode.db');
+
+    const collV1ImportId = 'ses_coll_v1_import';
+    const collV1SmallerId = 'ses_coll_v1_smaller';
+    const collV1RestoreId = 'ses_coll_v1_restore';
+    const collV2LiveId = 'ses_coll_v2_live';
+    const collV1LiveId = 'ses_coll_v1_live';
+    const pureEmbFreeId = 'ses_pure_emb_grad';
+
+    // Bootstrap exact embedded SQLite schema + valid session rows via embedded OpenCodeSdkProvider
+    const pSeed = new OpenCodeSdkProvider();
+    const seededIds: string[] = [];
+    pSeed.onSessionInfo((_sid, info) => {
+      if (info.resumeId) seededIds.push(info.resumeId);
+    });
+    await pSeed.connect({ transport: 'embedded', cwd: root } as any);
+    const seedTargetIds = [collV1ImportId, collV1SmallerId, collV1RestoreId, collV2LiveId, collV1LiveId, pureEmbFreeId];
+    for (const targetId of seedTargetIds) {
+      await pSeed.createSession({ sessionKey: `seed-${targetId}`, cwd: root });
+    }
+    await pSeed.disconnect();
+
+    const now = Date.now();
+    const embDb = new DatabaseSync(embDbPath);
+    const renameEmbSession = (index: number, targetId: string, updatedAt: number): void => {
+      const origId = seededIds[index]!;
+      embDb.prepare('DELETE FROM session_message WHERE session_id = ?').run(origId);
+      embDb.prepare('UPDATE session_v2 SET id = ?, title = ?, time_created = ?, time_updated = ? WHERE id = ?').run(
+        targetId, targetId, now - 10_000, updatedAt, origId,
+      );
+    };
+    const insertEmbFreeLimitFailure = (id: string, seqStart: number, retries: number): void => {
+      embDb.prepare(
+        'INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      ).run(`${id}_u`, id, 'user', seqStart, now, now, JSON.stringify({ text: 'hi' }));
+      for (let i = 0; i < retries; i++) {
+        embDb.prepare(
+          'INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        ).run(`${id}_err_${i}`, id, 'assistant', seqStart + 1 + i, now + 10 + i, now + 10 + i, JSON.stringify({
+          finish: 'error',
+          content: [],
+          error: { type: 'provider.free-limit', message: 'Free usage limit reached.' },
+        }));
+      }
+    };
+
+    // Case 1a: embedded has 2 msgs (free-limit-only), v1 DB has 4 valid msgs
+    renameEmbSession(0, collV1ImportId, now + 100);
+    insertEmbFreeLimitFailure(collV1ImportId, 0, 1);
+    // Case 1b: embedded has MORE msgs (5 rows, free-limit-only), v1 DB has 2 valid msgs
+    renameEmbSession(1, collV1SmallerId, now + 5_000);
+    insertEmbFreeLimitFailure(collV1SmallerId, 0, 4);
+    // Case 1c: restoreSession() collision (v2 404 + v1 4 valid msgs + embedded free-limit-only)
+    renameEmbSession(2, collV1RestoreId, now + 100);
+    insertEmbFreeLimitFailure(collV1RestoreId, 0, 1);
+    // Case 2: embedded has MORE msgs (5 rows, free-limit-only), v2 live server has 2 completed msgs
+    renameEmbSession(3, collV2LiveId, now + 5_000);
+    insertEmbFreeLimitFailure(collV2LiveId, 0, 4);
+    // Case 3: embedded has MORE msgs (5 rows, free-limit-only), v1 live server has 2 completed msgs
+    renameEmbSession(4, collV1LiveId, now + 5_000);
+    insertEmbFreeLimitFailure(collV1LiveId, 0, 4);
+    // Case 4 (positive control): ONLY exists in embedded DB as free-limit-only
+    renameEmbSession(5, pureEmbFreeId, now + 100);
+    insertEmbFreeLimitFailure(pureEmbFreeId, 0, 1);
+    embDb.close();
+
+    // Seed v1 SQLite DB with valid history for collV1ImportId (4 msgs) and collV1SmallerId (2 msgs)
+    const v1Db = new DatabaseSync(v1DbPath);
+    v1Db.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER);
+      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+    `);
+    const seedV1Turns = (sid: string, turns: number): void => {
+      v1Db.prepare('INSERT INTO session (id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run(sid, root, sid, now - 5_000, now - 1_000);
+      for (let t = 0; t < turns; t++) {
+        const uId = `${sid}_m_u_${t}`;
+        const aId = `${sid}_m_a_${t}`;
+        v1Db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
+          uId, sid, now - 4_000 + t * 100, now - 4_000 + t * 100, JSON.stringify({ role: 'user', agent: 'build' }),
+        );
+        v1Db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run(
+          `${uId}_p`, uId, sid, now - 4_000 + t * 100, now - 4_000 + t * 100, JSON.stringify({ type: 'text', text: `v1 prompt ${t}` }),
+        );
+        v1Db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
+          aId, sid, now - 3_950 + t * 100, now - 3_950 + t * 100, JSON.stringify({ role: 'assistant', agent: 'build', finish: 'stop', time: { completed: now - 3_950 + t * 100 } }),
+        );
+        v1Db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run(
+          `${aId}_p`, aId, sid, now - 3_950 + t * 100, now - 3_950 + t * 100, JSON.stringify({ type: 'text', text: `v1 reply ${t}` }),
+        );
+      }
+    };
+    seedV1Turns(collV1ImportId, 2); // 4 messages total
+    seedV1Turns(collV1SmallerId, 1); // 2 messages total (< 5 failed rows in embedded!)
+    seedV1Turns(collV1RestoreId, 2); // 4 messages total for restoreSession() check
+    v1Db.close();
+
+    // v2 mock server with collV2LiveId pre-populated + stateful /api/experimental/session/import
+    const v2CollLog = join(root, 'v2-coll.log');
+    writeFileSync(v2CollLog, '', 'utf8');
+    process.env.V2_COLL_LOG = v2CollLog;
+    const v2CollScript = join(root, 'v2-coll-host.mjs');
+    writeFileSync(v2CollScript, `
+      import http from 'node:http';
+      import { appendFileSync } from 'node:fs';
+      if (process.argv.includes('--version')) {
+        console.log('opencode v2.4.2');
+        process.exit(0);
+      }
+      let seq = 0;
+      const logFile = process.env.V2_COLL_LOG;
+      const sessions = new Map([
+        [${JSON.stringify(collV2LiveId)}, { id: ${JSON.stringify(collV2LiveId)}, location: { directory: ${JSON.stringify(root)} }, time: { created: ${now - 5000}, updated: ${now - 1000} } }],
+      ]);
+      const sessionMessages = new Map([
+        [${JSON.stringify(collV2LiveId)}, [
+          { id: 'v2_live_u1', type: 'user', time: { created: ${now - 4000} } },
+          { id: 'v2_live_a1', type: 'assistant', finish: 'stop', content: [{ type: 'text', text: 'live v2 answer' }], time: { created: ${now - 3000}, completed: ${now - 3000} } },
+        ]],
+      ]);
+      const srv = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+          const pathname = new URL(req.url || '/', 'http://127.0.0.1').pathname;
+          if (pathname === '/api/info') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ version: '2.4.2', urls: [] })); return; }
+          if (pathname === '/api/event') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write('data: ' + JSON.stringify({ type: 'server.connected', properties: {} }) + '\\n\\n'); return; }
+          if (pathname === '/api/provider') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ data: [{ id: 'opencode', name: 'OpenCode', activation: 'ready' }] })); return; }
+          if (pathname === '/api/model') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ data: [{ id: 'opencode/big-pickle', providerID: 'opencode', modelID: 'big-pickle', enabled: true, type: 'chat' }] })); return; }
+          if (pathname === '/api/model/default') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ data: { providerID: 'opencode', modelID: 'big-pickle' } })); return; }
+          if (pathname === '/api/session' && req.method === 'POST') {
+            const id = 'ses-v2-coll-created-' + (++seq);
+            sessions.set(id, { id, location: { directory: ${JSON.stringify(root)} }, time: { created: Date.now(), updated: Date.now() } });
+            sessionMessages.set(id, []);
+            appendFileSync(logFile, JSON.stringify({ op: 'create', id }) + '\\n');
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ data: sessions.get(id) }));
+            return;
+          }
+          if (pathname === '/api/experimental/session/import' && req.method === 'POST') {
+            const parsed = JSON.parse(body || '{}');
+            const id = parsed?.info?.id;
+            const msgs = Array.isArray(parsed?.messages) ? parsed.messages : [];
+            sessions.set(id, { ...parsed.info, location: parsed.location ?? { directory: ${JSON.stringify(root)} } });
+            sessionMessages.set(id, msgs);
+            appendFileSync(logFile, JSON.stringify({ op: 'import', id, msgCount: msgs.length }) + '\\n');
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ data: sessions.get(id) }));
+            return;
+          }
+          const msgMatch = pathname.match(/^\\/api\\/session\\/([^/]+)\\/message$/);
+          if (msgMatch && req.method === 'GET') {
+            const sid = decodeURIComponent(msgMatch[1]);
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ data: sessionMessages.get(sid) ?? [] }));
+            return;
+          }
+          const getMatch = pathname.match(/^\\/api\\/session\\/([^/]+)$/);
+          if (getMatch && req.method === 'GET') {
+            const sid = decodeURIComponent(getMatch[1]);
+            if (sessions.has(sid)) {
+              res.setHeader('content-type', 'application/json');
+              res.end(JSON.stringify({ data: sessions.get(sid) }));
+            } else {
+              res.statusCode = 404;
+              res.setHeader('content-type', 'application/json');
+              res.end(JSON.stringify({ message: 'Not Found' }));
+            }
+            return;
+          }
+          if (pathname.startsWith('/api/experimental/mcp/')) { res.statusCode = 204; res.end(); return; }
+          res.setHeader('content-type', 'application/json');
+          res.end('{}');
+        });
+      });
+      srv.listen(0, '127.0.0.1', () => { console.log('listening on http://127.0.0.1:' + srv.address().port); });
+      process.on('SIGTERM', () => process.exit(0));
+    `, 'utf8');
+    const v2CollBin = makeFakeExecutable(join(root, 'v2coll'), 'opencode', `#!/bin/sh\nexec "${process.execPath}" "${v2CollScript}" "$@"\n`);
+
+    const pV2Coll = new OpenCodeSdkProvider();
+    const v2Infos: Array<{ sid: string; resumeId?: string; owner?: string }> = [];
+    pV2Coll.onSessionInfo((sid, info) => v2Infos.push({ sid, resumeId: info.resumeId, owner: info.openCodeStorageOwner }));
+    await pV2Coll.connect({ binaryPath: v2CollBin, cwd: root } as any);
+
+    // 1a. v2 404 + v1 DB has 4 valid records + embedded DB has free-limit-only -> imports v1 DB, preserves collV1ImportId, NO create!
+    await pV2Coll.createSession({ sessionKey: 'v2-coll-1', cwd: root, skipCreate: true, resumeId: collV1ImportId });
+    expect(v2Infos.at(-1)).toMatchObject({ sid: 'v2-coll-1', resumeId: collV1ImportId, owner: 'v2-cli' });
+    let logLines = readFileSync(v2CollLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(logLines).toContainEqual({ op: 'import', id: collV1ImportId, msgCount: 4 });
+    expect(logLines.some((e) => e.op === 'create')).toBe(false);
+
+    // 1b. v2 404 + v1 DB has 2 valid records + embedded DB has MORE failed rows (5) -> STILL imports 2 v1 records, NO create!
+    await pV2Coll.createSession({ sessionKey: 'v2-coll-1b', cwd: root, skipCreate: true, resumeId: collV1SmallerId });
+    expect(v2Infos.at(-1)).toMatchObject({ sid: 'v2-coll-1b', resumeId: collV1SmallerId, owner: 'v2-cli' });
+    logLines = readFileSync(v2CollLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(logLines).toContainEqual({ op: 'import', id: collV1SmallerId, msgCount: 2 });
+    expect(logLines.some((e) => e.op === 'create')).toBe(false);
+
+    // 1c. restoreSession() under v2-cli (v2 404 + v1 4 valid msgs + embedded free-limit-only) -> imports v1, NO create!
+    expect(await pV2Coll.restoreSession(collV1RestoreId)).toBe(true);
+    logLines = readFileSync(v2CollLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(logLines).toContainEqual({ op: 'import', id: collV1RestoreId, msgCount: 4 });
+    expect(logLines.some((e) => e.op === 'create')).toBe(false);
+
+    // 2. Live v2 has completed turn + embedded has MORE failed rows (5) -> keeps live collV2LiveId, NO create, NO embeddedFallbackDelegate!
+    await pV2Coll.createSession({ sessionKey: 'v2-coll-2', cwd: root, skipCreate: true, resumeId: collV2LiveId });
+    expect(v2Infos.at(-1)).toMatchObject({ sid: 'v2-coll-2', resumeId: collV2LiveId, owner: 'v2-cli' });
+    expect((pV2Coll as any).embeddedFallbackDelegate).toBeNull();
+    logLines = readFileSync(v2CollLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(logLines.some((e) => e.op === 'create')).toBe(false);
+
+    // 4a. Positive control under v2-cli: pure embedded free-limit-only still graduates to new CLI ID
+    await pV2Coll.createSession({ sessionKey: 'v2-grad-ctrl', cwd: root, skipCreate: true, resumeId: pureEmbFreeId });
+    expect(v2Infos.at(-1)).toMatchObject({ sid: 'v2-grad-ctrl', resumeId: 'ses-v2-coll-created-1', owner: 'v2-cli' });
+    logLines = readFileSync(v2CollLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(logLines).toContainEqual({ op: 'create', id: 'ses-v2-coll-created-1' });
+
+    delete process.env.V2_COLL_LOG;
+    await pV2Coll.disconnect();
+
+    // 3 + 4b. Unowned collision & positive control under v1-cli
+    const v1Bin = makeFakeExecutable(join(root, 'v1coll'), 'opencode', '#!/bin/sh\necho "1.18.4"\n');
+    const v1Q = createAsyncQueue<Record<string, any>>();
+    let v1CreateSeq = 0;
+    openCodeV1RuntimeHooks.start = vi.fn(async (opts) => {
+      opts.signal.addEventListener('abort', v1Q.close, { once: true });
+      return {
+        client: {
+          session: {
+            create: vi.fn(async () => ({ data: { id: `ses-v1-coll-created-${++v1CreateSeq}` } })),
+            get: vi.fn(async (req: any) => {
+              if (req?.path?.id === collV1LiveId) {
+                return { data: { id: collV1LiveId, time: { created: now - 5000, updated: now - 1000 } } };
+              }
+              const err: any = new Error('404 session not found');
+              err.status = 404;
+              throw err;
+            }),
+            list: vi.fn(async () => ({ data: [] })),
+            message: vi.fn(async () => ({ data: null })),
+            messages: vi.fn(async (req: any) => {
+              if (req?.path?.id === collV1LiveId) {
+                return {
+                  data: [
+                    { info: { id: 'v1_m1', role: 'user', time: { created: now - 4000 } }, parts: [] },
+                    { info: { id: 'v1_m2', role: 'assistant', finish: 'stop', time: { created: now - 3000, completed: now - 3000 } }, parts: [] },
+                  ],
+                };
+              }
+              return { data: [] };
+            }),
+            prompt: vi.fn(async () => ({ data: {} })),
+            promptAsync: vi.fn(async () => ({ data: undefined })),
+            abort: vi.fn(async () => ({ data: true })),
+          },
+          provider: { list: vi.fn(async () => ({ data: { connected: [], all: [], default: {} } })) },
+          event: { subscribe: vi.fn(async () => ({ stream: v1Q.stream })) },
+          postSessionIdPermissionsPermissionId: vi.fn(async () => ({ data: true })),
+        } as any,
+        server: { url: 'http://127.0.0.1:42029', close: vi.fn(async () => { v1Q.close(); }) },
+      };
+    });
+
+    const pV1Coll = new OpenCodeSdkProvider();
+    const v1Infos: Array<{ sid: string; resumeId?: string; owner?: string }> = [];
+    pV1Coll.onSessionInfo((sid, info) => v1Infos.push({ sid, resumeId: info.resumeId, owner: info.openCodeStorageOwner }));
+    await pV1Coll.connect({ binaryPath: v1Bin, cwd: root } as any);
+
+    await pV1Coll.createSession({ sessionKey: 'v1-coll-live', cwd: root, skipCreate: true, resumeId: collV1LiveId });
+    expect(v1Infos.at(-1)).toMatchObject({ sid: 'v1-coll-live', resumeId: collV1LiveId, owner: 'v1-cli' });
+    expect(v1CreateSeq).toBe(0);
+    expect((pV1Coll as any).embeddedFallbackDelegate).toBeNull();
+
+    await pV1Coll.createSession({ sessionKey: 'v1-grad-ctrl', cwd: root, skipCreate: true, resumeId: pureEmbFreeId });
+    expect(v1Infos.at(-1)).toMatchObject({ sid: 'v1-grad-ctrl', resumeId: 'ses-v1-coll-created-1', owner: 'v1-cli' });
+    expect(v1CreateSeq).toBe(1);
+    expect((pV1Coll as any).embeddedFallbackDelegate).toBeNull();
+
+    await pV1Coll.disconnect();
   }, 45_000);
 });

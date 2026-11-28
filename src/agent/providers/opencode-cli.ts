@@ -1447,6 +1447,37 @@ export interface OpenCodeSqliteSessionSnapshot {
   timeUpdated: number;
   messageCount: number;
   latestMessageTime: number;
+  hasCompletedAssistantTurn: boolean;
+  hasFreeLimitError: boolean;
+}
+
+function parseSqliteJsonRecord(raw: unknown): Record<string, unknown> | null {
+  if (typeof raw !== 'string') return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function isFreeLimitErrorRecord(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const rec = error as Record<string, unknown>;
+  const typeStr = typeof rec.type === 'string' ? rec.type.toLowerCase() : '';
+  const nameStr = typeof rec.name === 'string' ? rec.name.toLowerCase() : '';
+  const msgStr = typeof rec.message === 'string' ? rec.message.toLowerCase() : '';
+  return typeStr.includes('free-limit')
+    || nameStr.includes('free-limit')
+    || msgStr.includes('free usage limit');
+}
+
+export function isRecoverableFreeLimitOnlyEmbeddedSession(
+  snapshot: Pick<OpenCodeSqliteSessionSnapshot, 'hasCompletedAssistantTurn' | 'hasFreeLimitError'> | null,
+): boolean {
+  return Boolean(snapshot && !snapshot.hasCompletedAssistantTurn && snapshot.hasFreeLimitError);
 }
 
 /** Compare completeness of two copies of the same session ID.
@@ -1488,12 +1519,32 @@ export async function inspectOpenCodeSqliteSessions(
         if (rowV2) {
           let messageCount = 0;
           let latestMessageTime = 0;
+          let hasCompletedAssistantTurn = false;
+          let hasFreeLimitError = false;
           if (tables.has('session_message')) {
-            const agg = db.prepare(
-              'SELECT COUNT(*) AS cnt, COALESCE(MAX(COALESCE(time_updated, time_created)), 0) AS latest FROM session_message WHERE session_id = ?',
-            ).get(sessionId) as { cnt?: number; latest?: number } | undefined;
-            messageCount = Number(agg?.cnt ?? 0);
-            latestMessageTime = Number(agg?.latest ?? 0);
+            const msgRows = db.prepare(
+              'SELECT type, time_created, time_updated, data FROM session_message WHERE session_id = ?',
+            ).all(sessionId) as Array<{ type?: unknown; time_created?: number; time_updated?: number; data?: unknown }>;
+            messageCount = msgRows.length;
+            for (const row of msgRows) {
+              const t = Number(row.time_updated ?? row.time_created ?? 0);
+              if (t > latestMessageTime) latestMessageTime = t;
+              const parsed = parseSqliteJsonRecord(row.data);
+              if (!parsed) continue;
+              if (isFreeLimitErrorRecord(parsed.error)) {
+                hasFreeLimitError = true;
+              }
+              if (row.type === 'assistant') {
+                const hasError = Boolean(parsed.error);
+                const finish = typeof parsed.finish === 'string' ? parsed.finish : undefined;
+                const hasContent = Array.isArray(parsed.content) && parsed.content.length > 0;
+                const timeRec = parsed.time && typeof parsed.time === 'object' ? (parsed.time as Record<string, unknown>) : undefined;
+                const hasCompletedTime = timeRec?.completed !== undefined;
+                if (!hasError && finish !== 'error' && (hasContent || (finish !== undefined && finish !== '') || hasCompletedTime)) {
+                  hasCompletedAssistantTurn = true;
+                }
+              }
+            }
           }
           results.push({
             dbPath: dbFile,
@@ -1501,6 +1552,8 @@ export async function inspectOpenCodeSqliteSessions(
             timeUpdated: Number(rowV2.time_updated ?? rowV2.time_created ?? 0),
             messageCount,
             latestMessageTime,
+            hasCompletedAssistantTurn,
+            hasFreeLimitError,
           });
           continue;
         }
@@ -1512,12 +1565,29 @@ export async function inspectOpenCodeSqliteSessions(
         if (rowV1) {
           let messageCount = 0;
           let latestMessageTime = 0;
+          let hasCompletedAssistantTurn = false;
+          let hasFreeLimitError = false;
           if (tables.has('message')) {
-            const agg = db.prepare(
-              'SELECT COUNT(*) AS cnt, COALESCE(MAX(COALESCE(time_updated, time_created)), 0) AS latest FROM message WHERE session_id = ?',
-            ).get(sessionId) as { cnt?: number; latest?: number } | undefined;
-            messageCount = Number(agg?.cnt ?? 0);
-            latestMessageTime = Number(agg?.latest ?? 0);
+            const msgRows = db.prepare(
+              'SELECT time_created, time_updated, data FROM message WHERE session_id = ?',
+            ).all(sessionId) as Array<{ time_created?: number; time_updated?: number; data?: unknown }>;
+            messageCount = msgRows.length;
+            for (const row of msgRows) {
+              const t = Number(row.time_updated ?? row.time_created ?? 0);
+              if (t > latestMessageTime) latestMessageTime = t;
+              const parsed = parseSqliteJsonRecord(row.data);
+              if (!parsed) continue;
+              if (isFreeLimitErrorRecord(parsed.error)) {
+                hasFreeLimitError = true;
+              }
+              if (parsed.role === 'assistant') {
+                const hasError = Boolean(parsed.error);
+                const finish = typeof parsed.finish === 'string' ? parsed.finish : undefined;
+                if (!hasError && finish !== 'error') {
+                  hasCompletedAssistantTurn = true;
+                }
+              }
+            }
           }
           results.push({
             dbPath: dbFile,
@@ -1525,6 +1595,8 @@ export async function inspectOpenCodeSqliteSessions(
             timeUpdated: Number(rowV1.time_updated ?? rowV1.time_created ?? 0),
             messageCount,
             latestMessageTime,
+            hasCompletedAssistantTurn,
+            hasFreeLimitError,
           });
         }
       }

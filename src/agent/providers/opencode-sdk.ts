@@ -48,11 +48,13 @@ import {
   compareOpenCodeSessionSnapshots,
   inspectOpenCodeSqliteSession,
   inspectOpenCodeSqliteSessions,
+  isRecoverableFreeLimitOnlyEmbeddedSession,
   isLoopbackHostname,
   redactSecretText,
   resolveOpenCodeTransport,
   startOpenCodeV2CliHost,
   stopOpenCodeServerAndWait,
+  type OpenCodeSqliteSessionSnapshot,
   type OpenCodeTransportResolution,
 } from './opencode-cli.js';
 import { OpenCodeV1CliProvider } from './opencode-v1-compat.js';
@@ -2043,7 +2045,17 @@ async function readLegacySessionImportPayload(
     if (rawCandidates.length > 1) {
       const snapshots = await inspectOpenCodeSqliteSessions(sessionId, rawCandidates);
       if (snapshots.length > 1) {
-        snapshots.sort((a, b) => compareOpenCodeSessionSnapshots(b, a));
+        const v1Set = new Set(resolveOpenCodeV1DbCandidates());
+        const embeddedSet = new Set(resolveOpenCodeEmbeddedDbCandidates(databasePath));
+        const isDeprioritizedEmbeddedFailure = (snap: OpenCodeSqliteSessionSnapshot): boolean => (
+          !v1Set.has(snap.dbPath) && embeddedSet.has(snap.dbPath) && isRecoverableFreeLimitOnlyEmbeddedSession(snap)
+        );
+        snapshots.sort((a, b) => {
+          const aFailed = isDeprioritizedEmbeddedFailure(a);
+          const bFailed = isDeprioritizedEmbeddedFailure(b);
+          if (aFailed !== bFailed) return aFailed ? 1 : -1;
+          return compareOpenCodeSessionSnapshots(b, a);
+        });
         const ranked = snapshots.map((s) => s.dbPath);
         orderedCandidates = [...ranked, ...rawCandidates.filter((c) => !ranked.includes(c))];
       } else {
@@ -2244,8 +2256,13 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   private openCodeCredentialProvenanceDirty = false;
   private readonly seenEventIds = new Set<string>();
   private readonly hostGroupKey = randomUUID();
+  private readonly cliEmbeddedFallback: boolean;
   private client: OpenCodeClientLike | null = null;
   private server: OpenCodeServerLike | null = null;
+
+  constructor(options?: { cliEmbeddedFallback?: boolean }) {
+    this.cliEmbeddedFallback = Boolean(options?.cliEmbeddedFallback);
+  }
   private lifecycleAbort: AbortController | null = null;
   private connectInFlight: Promise<void> | null = null;
   private databasePath: string | undefined;
@@ -2333,11 +2350,45 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     return this.v1Delegate;
   }
 
+  private async clearEmbeddedFallbackRoute(routeId: string): Promise<void> {
+    if (!this.embeddedFallbackRoutes.has(routeId)) return;
+    this.embeddedFallbackRoutes.delete(routeId);
+    await this.embeddedFallbackDelegate?.endSession(routeId).catch(() => {});
+  }
+
+  private async shouldGraduateFreeLimitOnlyEmbeddedSession(resumeId: string): Promise<boolean> {
+    const embeddedCandidates = resolveOpenCodeEmbeddedDbCandidates(this.databasePath);
+    const snapshot = await inspectOpenCodeSqliteSession(resumeId, embeddedCandidates);
+    return isRecoverableFreeLimitOnlyEmbeddedSession(snapshot);
+  }
+
+  private async shouldGraduateUnownedV2Session(resumeId: string): Promise<boolean> {
+    const v1Candidates = resolveOpenCodeV1DbCandidates();
+    if (v1Candidates.length > 0) {
+      const v1Snapshots = await inspectOpenCodeSqliteSessions(resumeId, v1Candidates);
+      if (v1Snapshots.length > 0) return false;
+    }
+    return await this.shouldGraduateFreeLimitOnlyEmbeddedSession(resumeId);
+  }
+
+  private async createFreshSessionOnActiveCli(config: SessionConfig): Promise<string> {
+    const freshConfig: SessionConfig = {
+      ...config,
+      skipCreate: false,
+      resumeId: undefined,
+      openCodeStorageOwner: undefined,
+    };
+    if (this.v1Delegate) {
+      return await this.v1Delegate.createSession(freshConfig);
+    }
+    return await this.createSession(freshConfig);
+  }
+
   private async ensureEmbeddedFallbackDelegate(): Promise<OpenCodeSdkProvider> {
     if (this.embeddedFallbackDelegate) return this.embeddedFallbackDelegate;
     if (this.embeddedFallbackConnectPromise) return await this.embeddedFallbackConnectPromise;
     const task = (async () => {
-      const fallback = new OpenCodeSdkProvider();
+      const fallback = new OpenCodeSdkProvider({ cliEmbeddedFallback: true });
       this.wireDelegate(fallback);
       await fallback.connect({
         ...this.connectConfig,
@@ -2534,6 +2585,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     if (!embeddedSnap && !v1Snap) return 'missing';
     if (embeddedSnap && !v1Snap) return 'embedded';
     if (!embeddedSnap && v1Snap) return 'v1-cli';
+    if (isRecoverableFreeLimitOnlyEmbeddedSession(embeddedSnap)) {
+      return 'v1-cli';
+    }
     const cmp = compareOpenCodeSessionSnapshots(
       {
         messageCount: embeddedSnap!.messageCount,
@@ -2556,7 +2610,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   ): Promise<boolean> {
     const embeddedCandidates = resolveOpenCodeEmbeddedDbCandidates(this.databasePath);
     const embeddedSnap = await inspectOpenCodeSqliteSession(resumeId, embeddedCandidates);
-    if (!embeddedSnap) return false;
+    if (!embeddedSnap || isRecoverableFreeLimitOnlyEmbeddedSession(embeddedSnap)) return false;
     let v2MessageCount = 0;
     let v2LatestMsgTime = 0;
     let countedMessages = false;
@@ -2599,18 +2653,18 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   async createSession(config: SessionConfig): Promise<string> {
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const resumeId = safeString(config.resumeId);
-    if ((!config.skipCreate || config.fresh) && this.embeddedFallbackRoutes.has(routeId)) {
-      this.embeddedFallbackRoutes.delete(routeId);
-      await this.embeddedFallbackDelegate?.endSession(routeId).catch(() => {});
+    if (!config.skipCreate || config.fresh) {
+      await this.clearEmbeddedFallbackRoute(routeId);
     }
 
     const activeMode = this.transportResolution?.mode ?? OPENCODE_TRANSPORT_MODES.EMBEDDED;
+    const isCliMode = activeMode === OPENCODE_TRANSPORT_MODES.V1_CLI || activeMode === OPENCODE_TRANSPORT_MODES.V2_CLI;
     const recordedOwner = config.openCodeStorageOwner;
     let confirmedV1Migration: { payload: Record<string, unknown>; sourceDbPath: string } | null = null;
 
     // Centralized storage-owner validation for resumes BEFORE touching any incompatible runtime/store:
     // - compatible stores read directly from that store
-    // - embedded owner under CLI mode reuses embeddedFallbackDelegate
+    // - embedded owner under CLI mode reuses embeddedFallbackDelegate (unless only failed with free-limit)
     // - v1-cli owner under v2-cli/embedded verifies the v1 source DB first and only updates owner after confirmed migration
     // - v2-cli owner under v1-cli or embedded fails explicitly with CLI recovery guidance without touching embedded DB
     if (config.skipCreate && resumeId) {
@@ -2618,10 +2672,21 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         activeMode !== OPENCODE_TRANSPORT_MODES.EMBEDDED
         && (this.embeddedFallbackRoutes.has(routeId) || recordedOwner === 'embedded')
       ) {
-        const fallback = await this.ensureEmbeddedFallbackDelegate();
-        const restoredRoute = await fallback.createSession(config);
-        this.embeddedFallbackRoutes.add(restoredRoute);
-        return restoredRoute;
+        if (isCliMode && await this.shouldGraduateFreeLimitOnlyEmbeddedSession(resumeId)) {
+          await this.clearEmbeddedFallbackRoute(routeId);
+          if (recordedOwner === 'embedded') {
+            logger.info(
+              { provider: this.id, routeId, resumeId, activeMode },
+              'Graduating free-limit-only embedded OpenCode session to active CLI runtime',
+            );
+            return await this.createFreshSessionOnActiveCli(config);
+          }
+        } else {
+          const fallback = await this.ensureEmbeddedFallbackDelegate();
+          const restoredRoute = await fallback.createSession(config);
+          this.embeddedFallbackRoutes.add(restoredRoute);
+          return restoredRoute;
+        }
       }
 
       if (recordedOwner === 'v2-cli' && activeMode !== OPENCODE_TRANSPORT_MODES.V2_CLI) {
@@ -2666,6 +2731,14 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
           throw providerError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `OpenCode session was not found during restore: ${resumeId}`, false);
         }
         if (resolvedOwner === 'embedded') {
+          if (isCliMode && await this.shouldGraduateFreeLimitOnlyEmbeddedSession(resumeId)) {
+            await this.clearEmbeddedFallbackRoute(routeId);
+            logger.info(
+              { provider: this.id, routeId, resumeId, activeMode },
+              'Graduating unowned free-limit-only embedded OpenCode session to v1 CLI runtime',
+            );
+            return await this.createFreshSessionOnActiveCli(config);
+          }
           const fallback = await this.ensureEmbeddedFallbackDelegate();
           const restoredRoute = await fallback.createSession(config);
           this.embeddedFallbackRoutes.add(restoredRoute);
@@ -2692,7 +2765,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const sessionRuntime = await this.startSessionRuntime(config, cwd, nativeAgentsFenced);
     const guardTools = Boolean(this.toolExecutionGuard);
     const createPermissions = buildOpenCodeGuardedSessionPermissions(nativeAgentsFenced, guardTools);
-    let info: OpenCodeSessionInfoLike;
+    let info!: OpenCodeSessionInfoLike;
     if (config.skipCreate && resumeId) {
       try {
         if (confirmedV1Migration) {
@@ -2704,14 +2777,40 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         } else if (recordedOwner === 'v2-cli' || recordedOwner === 'embedded') {
           info = await sessionRuntime.client.sessions.get({ sessionID: resumeId });
         } else {
-          info = await this.ensureSessionPresentOrImportLegacy(
-            sessionRuntime.client,
-            resumeId,
-            cwd,
-          );
+          let handledViaGraduation = false;
+          if (activeMode === OPENCODE_TRANSPORT_MODES.V2_CLI) {
+            try {
+              info = await sessionRuntime.client.sessions.get({ sessionID: resumeId });
+            } catch (getError) {
+              if (isNotFoundError(getError) && await this.shouldGraduateUnownedV2Session(resumeId)) {
+                handledViaGraduation = true;
+              } else {
+                info = await this.ensureSessionPresentOrImportLegacy(
+                  sessionRuntime.client,
+                  resumeId,
+                  cwd,
+                );
+              }
+            }
+          } else {
+            info = await this.ensureSessionPresentOrImportLegacy(
+              sessionRuntime.client,
+              resumeId,
+              cwd,
+            );
+          }
+          if (handledViaGraduation) {
+            await this.closeStartedRuntime(sessionRuntime);
+            await this.clearEmbeddedFallbackRoute(routeId);
+            logger.info(
+              { provider: this.id, routeId, resumeId, activeMode },
+              'Graduating unowned free-limit-only embedded OpenCode session to v2 CLI runtime',
+            );
+            return await this.createFreshSessionOnActiveCli(config);
+          }
           if (
             activeMode === OPENCODE_TRANSPORT_MODES.V2_CLI
-            && await this.isEmbeddedCopyMoreCompleteThanV2(sessionRuntime.client, info, resumeId)
+            && await this.isEmbeddedCopyMoreCompleteThanV2(sessionRuntime.client, info!, resumeId)
           ) {
             await this.closeStartedRuntime(sessionRuntime);
             const fallback = await this.ensureEmbeddedFallbackDelegate();
@@ -3149,7 +3248,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         if (isNotFoundError(err)) return { exists: false };
       }
     }
-    let info: OpenCodeSessionInfoLike;
+    let info!: OpenCodeSessionInfoLike;
     try {
       info = await client.sessions.get({ sessionID: sessionId });
     } catch (err) {
@@ -3364,21 +3463,38 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       const owner = await this.resolveV1VsEmbeddedOwner(sessionId, { cwd: this.catalogDirectory });
       if (owner === 'missing') return false;
       if (owner === 'embedded') {
+        if (await this.shouldGraduateFreeLimitOnlyEmbeddedSession(sessionId)) {
+          return true;
+        }
         const fallback = await this.ensureEmbeddedFallbackDelegate();
         return await fallback.restoreSession(sessionId);
       }
       return await this.v1Delegate.restoreSession(sessionId);
     }
     const client = this.assertConnected();
+    const isV2Cli = this.transportResolution?.mode === OPENCODE_TRANSPORT_MODES.V2_CLI;
+    if (isV2Cli) {
+      try {
+        const existing = await client.sessions.get({ sessionID: sessionId });
+        return safeString(existing?.id) === sessionId;
+      } catch (getError) {
+        if (isNotFoundError(getError) && await this.shouldGraduateUnownedV2Session(sessionId)) {
+          return true;
+        }
+      }
+    }
     try {
       const session = await this.ensureSessionPresentOrImportLegacy(client, sessionId, this.catalogDirectory);
       return safeString(session?.id) === sessionId;
     } catch (error) {
       if (
-        this.transportResolution?.mode === OPENCODE_TRANSPORT_MODES.V2_CLI
+        isV2Cli
         && isNotFoundError(error)
         && await inspectOpenCodeSqliteSession(sessionId, resolveOpenCodeEmbeddedDbCandidates(this.databasePath))
       ) {
+        if (await this.shouldGraduateUnownedV2Session(sessionId)) {
+          return true;
+        }
         const fallback = await this.ensureEmbeddedFallbackDelegate();
         return await fallback.restoreSession(sessionId);
       }
@@ -6068,7 +6184,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     ) {
       const isFreeLimit = errorType.includes('free-limit') || lower.includes('free usage limit');
       const hint = isFreeLimit && this.transportResolution?.mode === OPENCODE_TRANSPORT_MODES.EMBEDDED
-        ? ' Install the official OpenCode CLI (`opencode`) or configure a provider API key to avoid embedded free-tier limits.'
+        ? (this.cliEmbeddedFallback
+          ? ' This legacy session is bound to embedded storage. Start a new session or reset this session to use the installed OpenCode CLI, or configure a provider API key.'
+          : ' Install the official OpenCode CLI (`opencode`) or configure a provider API key to avoid embedded free-tier limits.')
         : '';
       return providerError(PROVIDER_ERROR_CODES.RATE_LIMITED, `OpenCode ${operation} failed: ${message}${hint}`, true);
     }
