@@ -20,6 +20,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parse as parseYaml } from 'yaml';
 import { detectInstalledAgentsWithMetadata } from '../../src/agent/agent-availability.js';
+import { planDesktopInstallerCompatibility } from '../../shared/desktop-installer-compatibility.js';
+import { probeDesktopInstallEnvironment } from '../../src/node/desktop-installer-probe.js';
 // @ts-expect-error ESM script module
 import { buildLinuxInstallers } from '../../scripts/build-linux-installer.mjs';
 // @ts-expect-error ESM script module
@@ -2965,8 +2967,8 @@ exec "${realStatBin}" "$@"
         });
         expect(macProbe.agents.opencode).toEqual({ installed: true });
       } else {
-        // Case 8 (Linux): imcodes.service ExecStart wrapper inherits manager PATH (preserving Nix/custom agents)
-        // and appends ~/.opencode/bin WITHOUT writing to user-controlled ~/.config/environment.d or systemctl set-environment
+        // Case 8 (Linux): keep direct bundled Node ExecStart so both Node & POSIX upgrade probes recognize
+        // imcodes.service (no environment.d / systemctl set-environment writes), while daemon home lookup discovers ~/.opencode/bin
         const isoSys = join(root, 'iso-sys');
         const homeSys = join(root, 'home-sys');
         const nixAgentDir = join(root, 'nix-agents-bin');
@@ -2991,46 +2993,42 @@ exec "${realStatBin}" "$@"
         );
         expect(readFileSync(envDSentinel, 'utf8')).toBe('ENVD_UNTOUCHED');
 
-        // Conflicting directory at .config/environment.d/99-imcodes-opencode.conf stays non-blocking & untouched
-        const isoEnvConflict = join(root, 'iso-envd-conflict');
-        const homeEnvConflict = join(root, 'home-envd-conflict');
-        mkdirSync(join(isoEnvConflict, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
-        mkdirSync(join(homeEnvConflict, '.config', 'environment.d', '99-imcodes-opencode.conf'), { recursive: true });
-        execFileSync('cp', ['-R', `${rtDir}/.`, join(isoEnvConflict, 'daemon-runtime', 'releases', '0.9.5')]);
-        const resConflict = execFileSync(
-          runnerPath,
-          ['--isolated-root', isoEnvConflict, '--home', homeEnvConflict, '--confirm-fda-switch', '--apply-services'],
-          {
-            env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: fakeHook, IMCODES_SYSTEMCTL_BIN: fakeSvcBin },
-            encoding: 'utf8',
-          },
-        );
-        expect(resConflict).toContain('INSTALL_OK');
-
         const svcPath = join(homeSys, '.config', 'systemd', 'user', 'imcodes.service');
         const unitText = readFileSync(svcPath, 'utf8');
         expect(unitText).not.toContain('Environment="PATH=');
-        const execMatch = unitText.match(/^ExecStart=(.+)$/m);
-        expect(execMatch).toBeTruthy();
-        const launchedPathOut = join(root, 'daemon-launched-path.txt');
-        writeFileSync(
-          join(isoSys, 'daemon-runtime', 'releases', '0.9.5', 'bin', 'node'),
-          `#!/bin/sh\nprintf '%s' "$PATH" > "${launchedPathOut}"\n`,
-          { mode: 0o755 },
-        );
-        const execRes = spawnSync('/bin/sh', ['-c', `exec ${execMatch![1]}`], {
-          env: { PATH: `${nixAgentDir}:/usr/bin` },
-          encoding: 'utf8',
+        const expectedNode = join(isoSys, 'daemon-runtime', 'current', 'bin', 'node');
+        const expectedEntry = join(isoSys, 'daemon-runtime', 'current', 'package', 'dist', 'src', 'index.js');
+        expect(unitText).toContain(`ExecStart=${expectedNode} ${expectedEntry} start --foreground`);
+
+        // Re-running BOTH Node probe/planner and POSIX fallback plan on generated unit preserves bundled upgrade behavior
+        const nodeProbe = probeDesktopInstallEnvironment({
+          platform: 'linux',
+          isolatedRoot: isoSys,
+          homeDir: homeSys,
+          daemonRuntimeRoot: join(isoSys, 'daemon-runtime'),
+          autostartPath: svcPath,
+          cliPath: join(isoSys, 'bin', 'imcodes'),
+          env: { PATH: `${nixAgentDir}:/usr/bin`, HOME: homeSys },
         });
-        expect(execRes.status).toBe(0);
-        const daemonRuntimePath = readFileSync(launchedPathOut, 'utf8').trim();
-        expect(daemonRuntimePath).toContain(nixAgentDir);
-        expect(daemonRuntimePath).toContain(join(homeSys, '.opencode', 'bin'));
+        const nodePlan = planDesktopInstallerCompatibility(nodeProbe);
+        expect(nodePlan.preserveUserDaemonAutostart).toBe(false);
+        expect(nodePlan.stopUserDaemonTask).toBe(true);
+        expect(nodePlan.switchToBundledRuntime).toBe(true);
+
+        const posixPlanOut = execFileSync(
+          runnerPath,
+          ['--phase', 'plan', '--isolated-root', isoSys, '--home', homeSys],
+          { encoding: 'utf8' },
+        );
+        expect(posixPlanOut).toContain('preserve_autostart=0');
+        expect(posixPlanOut).toContain('stop_daemon=1');
+
+        // Sparse user-service PATH without ~/.opencode/bin discovers BOTH existing agent (codex) AND ~/.opencode/bin/opencode
         const linuxProbe = await detectInstalledAgentsWithMetadata({
           deps: {
             platform: 'linux',
             homeDir: homeSys,
-            env: { PATH: daemonRuntimePath },
+            env: { PATH: `${nixAgentDir}:/usr/bin` },
           },
         });
         expect(linuxProbe.agents.codex).toEqual({ installed: true });
@@ -3039,14 +3037,15 @@ exec "${realStatBin}" "$@"
     }
   });
 
-  it('wires OpenCode CLI auto-install cleanly into Windows installer ps1 and single-transaction PostInstall Inno Setup', () => {
+  it('wires OpenCode CLI auto-install cleanly into Windows installer ps1 and single-transaction PostInstall Inno Setup', async () => {
     const ps1 = renderWindowsPhaseAInstallerPs1({ version: '2026.11.7132-dev.7022', cliWrapperContent: '@echo off\r\n' });
     expect(ps1).toContain('function Install-OpenCodeCliBestEffort');
     expect(ps1).toContain('function Test-IsElevatedOrSystemProcess');
     expect(ps1).toContain('function Test-PathHasReparsePoint');
-    expect(ps1).toContain('function Sync-OpenCodeProcessPath');
     expect(ps1).not.toContain('IMCodesUnElevRunner');
-    expect(ps1).toContain('if (-not (Test-IsElevatedOrSystemProcess)) {\n      Sync-OpenCodeProcessPath');
+    expect(ps1).not.toContain('Sync-OpenCodeProcessPath');
+    expect(ps1).not.toContain('$DeferUserDaemon');
+    expect(ps1).not.toContain('$ActivateUserDaemon');
     expect(ps1).toContain('Assert-SafeTargetPath $ocBinDir $RealProfile -EntryMode');
     expect(ps1).toContain('install-opencode-cli.js');
     expect(ps1).toContain('--isolated-test');
@@ -3060,16 +3059,29 @@ exec "${realStatBin}" "$@"
 
     const iss = renderWindowsInnoSetupIss({ version: '2026.11.7132-dev.7022' });
     const runSection = iss.slice(iss.indexOf('[Run]'), iss.indexOf('[UninstallRun]'));
-    const postIdx = runSection.indexOf('-Mode PostInstall');
     const ocIdx = runSection.indexOf('-Mode InstallOpenCode');
-    expect(postIdx).toBeGreaterThan(-1);
-    expect(ocIdx).toBeGreaterThan(postIdx);
+    const postIdx = runSection.indexOf('-Mode PostInstall');
+    expect(ocIdx).toBeGreaterThan(-1);
+    expect(postIdx).toBeGreaterThan(ocIdx);
     expect(runSection).not.toContain('-Mode ApplyServices');
+    expect(runSection).not.toContain('-DeferUserDaemon');
+    expect(runSection).not.toContain('-ActivateUserDaemon');
     expect(runSection).toContain('-SkipOpenCode');
-    expect(runSection).toContain('-DeferUserDaemon');
-    expect(runSection).toContain('-ActivateUserDaemon');
     expect(runSection).toContain('-ApplyServices');
     expect(runSection).toContain('runasoriginaluser');
+
+    // Sparse Windows service PATH still resolves %USERPROFILE%\.opencode\bin\opencode.exe via home lookup
+    const winHome = 'C:\\Users\\alice';
+    const expectedWinOc = 'C:\\Users\\alice\\.opencode\\bin\\opencode.exe';
+    const winProbe = await detectInstalledAgentsWithMetadata({
+      deps: {
+        platform: 'win32',
+        homeDir: winHome,
+        env: { PATH: 'C:\\Windows\\System32' },
+        isExecutableFile: async (p) => p.toLowerCase() === expectedWinOc.toLowerCase(),
+      },
+    });
+    expect(winProbe.agents.opencode).toEqual({ installed: true });
   });
 
   it.skipIf(process.platform !== 'win32')(
@@ -3153,8 +3165,9 @@ exec "${realStatBin}" "$@"
       const offlineLog = readFileSync(logOfflinePath, 'utf8');
       expect(offlineLog).toContain('WARNING: OpenCode CLI install failed exit=1');
 
-      // Clean install 2-step sequence: elevated PostInstall -SkipOpenCode -ApplyServices -DeferUserDaemon leaves
-      // user PATH & ActivateUserDaemon untouched, then non-elevated InstallOpenCode -ActivateUserDaemon activates once with opencode on PATH
+      // Clean install 2-step sequence matching Inno [Run]:
+      // Step 1: non-elevated InstallOpenCode runs WITHOUT touching NodeRoot/snapshot.json
+      // Step 2: PostInstall -SkipOpenCode -ApplyServices runs once and calls ActivateUserDaemon once without injecting .opencode\bin into process PATH
       const cleanIso = join(root, 'iso-clean-seq');
       const cleanNode = join(cleanIso, 'ProgramData', 'imcodes-node');
       const cleanRt = join(cleanIso, 'ProgramFiles', 'IM.codes', 'daemon-runtime');
@@ -3168,8 +3181,8 @@ exec "${realStatBin}" "$@"
       writeFileSync(
         svcHookPath,
         `param([string]$Action, [string]$PayloadJson)
-$found = $null -ne (Get-Command opencode -ErrorAction SilentlyContinue)
-Add-Content -LiteralPath '${svcTracePath.replace(/'/g, "''")}' -Value "$Action|opencode=$found|path=$env:PATH"
+$hasOcInProcPath = ($env:PATH -like '*\\.opencode\\bin*')
+Add-Content -LiteralPath '${svcTracePath.replace(/'/g, "''")}' -Value "$Action|ocProcPath=$hasOcInProcPath"
 `,
         'utf8',
       );
@@ -3187,42 +3200,25 @@ New-Item -ItemType Directory -Force -Path $b | Out-Null
         'powershell.exe',
         [
           '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1Path,
-          '-Mode', 'PostInstall', '-SkipOpenCode', '-ApplyServices', '-DeferUserDaemon', '-IsolatedRoot', cleanIso,
-          '-Version', '2026.11.7132-dev.7022', '-RuntimeRoot', cleanRt, '-NodeRoot', cleanNode, '-ServiceHookScript', svcHookPath,
+          '-Mode', 'InstallOpenCode', '-IsolatedRoot', cleanIso,
+          '-Version', '2026.11.7132-dev.7022', '-RuntimeRoot', cleanRt,
+          '-OpenCodeInstallHook', ocPopulateHook,
         ],
         { encoding: 'utf8' },
       );
-      expect(readFileSync(svcTracePath, 'utf8')).not.toContain('ActivateUserDaemon|');
       execFileSync(
         'powershell.exe',
         [
           '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1Path,
-          '-Mode', 'InstallOpenCode', '-ActivateUserDaemon', '-IsolatedRoot', cleanIso,
-          '-Version', '2026.11.7132-dev.7022', '-RuntimeRoot', cleanRt, '-NodeRoot', cleanNode,
-          '-OpenCodeInstallHook', ocPopulateHook, '-ServiceHookScript', svcHookPath,
+          '-Mode', 'PostInstall', '-SkipOpenCode', '-ApplyServices', '-IsolatedRoot', cleanIso,
+          '-Version', '2026.11.7132-dev.7022', '-RuntimeRoot', cleanRt, '-NodeRoot', cleanNode, '-ServiceHookScript', svcHookPath,
         ],
         { encoding: 'utf8' },
       );
       const svcTraceLines = readFileSync(svcTracePath, 'utf8').trim().split(/\r?\n/);
       const activateLines = svcTraceLines.filter((l) => l.startsWith('ActivateUserDaemon|'));
       expect(activateLines).toHaveLength(1);
-      expect(activateLines[0]).toContain('opencode=True');
-
-      // Elevated context never injects user .opencode\\bin into elevated PATH even with ActivateUserDaemon
-      const elevHarness = join(root, 'win-elev-path-check.ps1');
-      writeFileSync(
-        elevHarness,
-        `$ErrorActionPreference = 'Stop'
-$src = Get-Content -LiteralPath '${ps1Path.replace(/'/g, "''")}' -Raw
-if ($src.IndexOf('if (-not (Test-IsElevatedOrSystemProcess))') -lt 0) { throw 'missing_elevated_gate' }
-$idx1 = $src.IndexOf('function Register-WindowsServices')
-$idx2 = $src.IndexOf('if ($Mode -eq ''Rollback'')')
-$regBlock = $src.Substring($idx1, $idx2 - $idx1)
-if ($regBlock.IndexOf('if (-not (Test-IsElevatedOrSystemProcess))') -lt 0) { throw 'missing_reg_elevated_gate' }
-`,
-        'utf8',
-      );
-      execFileSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', elevHarness], { encoding: 'utf8' });
+      expect(activateLines[0]).toContain('ocProcPath=False');
     },
   );
 });

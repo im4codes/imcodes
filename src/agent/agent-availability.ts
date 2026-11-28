@@ -417,8 +417,8 @@ async function probeOpenCode(deps: AgentAvailabilityProbeDeps, requireSdkPackage
     }
     return { installed: true };
   }
-  // Matches `OpenCodeDriver` (`opencode` tmux PTY CLI): PATH only.
-  return probeBinary(deps, 'opencode', { includeWindowsGlobalNpmDirs: false }, 'opencode CLI not found');
+  const trailingDirs = deps.homeDir ? [pathModuleFor(deps.platform).join(deps.homeDir, '.opencode', 'bin')] : [];
+  return probeBinary(deps, 'opencode', { includeWindowsGlobalNpmDirs: false, trailingDirs }, 'opencode CLI not found');
 }
 
 async function probeGrokSdk(deps: AgentAvailabilityProbeDeps): Promise<AgentAvailabilityEntry> {

@@ -1925,9 +1925,6 @@ if [ "$PRESERVE_AUTOSTART" -eq 0 ]; then
 </plist>
 EOF
   else
-    sd_oc_bin="$(printf '%s' "$EFF_HOME/.opencode/bin" | sed -e 's/%/%%/g' -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g')"
-    sd_node_bin="$(printf '%s' "$CURRENT_LINK/bin/node" | sed -e 's/%/%%/g' -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g')"
-    sd_entry_js="$(printf '%s' "$CURRENT_LINK/package/dist/src/index.js" | sed -e 's/%/%%/g' -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g')"
     cat > "$auto_tmp" <<EOF
 [Unit]
 Description=IM.codes Coding Daemon
@@ -1935,7 +1932,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c 'case ":\\$PATH:" in *":\\$1:"*) ;; *) [ -n "\\$PATH" ] && PATH="\\$PATH:\\$1" || PATH="\\$1";; esac; export PATH; exec "\\$2" "\\$3" start --foreground' _ "$sd_oc_bin" "$sd_node_bin" "$sd_entry_js"
+ExecStart=$CURRENT_LINK/bin/node $CURRENT_LINK/package/dist/src/index.js start --foreground
 Restart=always
 RestartSec=5
 
