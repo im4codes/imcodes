@@ -16,6 +16,11 @@ export interface LaunchOptions {
   codexModel?: string;
   /** OpenCode session ID for `opencode -s <ID>`. */
   opencodeSessionId?: string;
+  /** Optional OpenCode CLI resolution overrides (used cleanly in tests). */
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
+  platform?: NodeJS.Platform;
+  isElevated?: boolean;
   /**
    * Launch this agent process with native agent tools withheld (an IM.codes
    * managed session). Genuinely unmanaged launches omit it and keep defaults.

@@ -3042,6 +3042,10 @@ exec "${realStatBin}" "$@"
     expect(ps1).toContain('function Install-OpenCodeCliBestEffort');
     expect(ps1).toContain('function Test-IsElevatedOrSystemProcess');
     expect(ps1).toContain('function Test-PathHasReparsePoint');
+    expect(ps1.indexOf("if ($Mode -eq 'InstallOpenCode')")).toBeLessThan(
+      ps1.indexOf('$plan = Invoke-PhaseAProbe'),
+    );
+    expect(ps1).toContain("$containerTargets = if ($Mode -eq 'InstallOpenCode')");
     expect(ps1).not.toContain('IMCodesUnElevRunner');
     expect(ps1).not.toContain('Sync-OpenCodeProcessPath');
     expect(ps1).not.toContain('$DeferUserDaemon');
@@ -3219,6 +3223,41 @@ New-Item -ItemType Directory -Force -Path $b | Out-Null
       const activateLines = svcTraceLines.filter((l) => l.startsWith('ActivateUserDaemon|'));
       expect(activateLines).toHaveLength(1);
       expect(activateLines[0]).toContain('ocProcPath=False');
+
+      // Protected/PermissionDenied NodeRoot MUST NOT abort InstallOpenCode, while PostInstall still runs Invoke-PhaseAProbe
+      const lockedIso = join(root, 'iso-locked-node');
+      const lockedNode = join(lockedIso, 'ProgramData', 'imcodes-node');
+      const lockedRt = join(lockedIso, 'ProgramFiles', 'IM.codes', 'daemon-runtime');
+      mkdirSync(lockedNode, { recursive: true });
+      mkdirSync(join(lockedRt, 'releases', '2026.11.7132-dev.7022'), { recursive: true });
+      const lockedTrace = join(root, 'locked-oc-trace.txt');
+      const lockedHook = join(root, 'locked-oc-hook.ps1');
+      writeFileSync(
+        lockedHook,
+        `param([string]$HomeDir)\nAdd-Content -LiteralPath '${lockedTrace.replace(/'/g, "''")}' -Value "LOCKED_OK:$HomeDir"\n`,
+        'utf8',
+      );
+      const acct = `${process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\` : ''}${process.env.USERNAME ?? ''}`;
+      if (acct) {
+        execFileSync('icacls.exe', [lockedNode, '/deny', `${acct}:(OI)(CI)F`], { stdio: 'ignore' });
+      }
+      try {
+        execFileSync(
+          'powershell.exe',
+          [
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1Path,
+            '-Mode', 'InstallOpenCode', '-IsolatedRoot', lockedIso,
+            '-Version', '2026.11.7132-dev.7022', '-RuntimeRoot', lockedRt, '-NodeRoot', lockedNode,
+            '-OpenCodeInstallHook', lockedHook,
+          ],
+          { encoding: 'utf8' },
+        );
+        expect(readFileSync(lockedTrace, 'utf8')).toContain('LOCKED_OK:');
+      } finally {
+        if (acct) {
+          execFileSync('icacls.exe', [lockedNode, '/remove:d', acct], { stdio: 'ignore' });
+        }
+      }
     },
   );
 });

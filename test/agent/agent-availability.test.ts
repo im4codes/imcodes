@@ -651,4 +651,24 @@ describe('detectInstalledAgents()', () => {
     });
     expect(relativeCli['copilot-sdk']?.installed).toBe(false);
   });
+
+  it('discovers ~/.opencode/bin/opencode under sparse PATH when non-elevated and honors PATH priority', async () => {
+    tempRoot = await mkdtemp(path.join(tmpdir(), 'imcodes opencode home '));
+    const homeOcDir = path.join(tempRoot, '.opencode', 'bin');
+    await mkdir(homeOcDir, { recursive: true });
+    const homeOcBin = path.join(homeOcDir, 'opencode');
+    await writeFile(homeOcBin, '#!/bin/sh\necho ok\n', 'utf8');
+    await chmod(homeOcBin, 0o755);
+
+    const detected = await detectInstalledAgents({
+      deps: {
+        platform: 'linux',
+        homeDir: tempRoot,
+        imcodesHomeDir: path.join(tempRoot, '.imcodes'),
+        env: { PATH: '/usr/bin' },
+        isProviderConnected: () => false,
+      },
+    });
+    expect(detected.opencode?.installed).toBe(true);
+  });
 });

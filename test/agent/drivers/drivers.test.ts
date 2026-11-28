@@ -1,7 +1,12 @@
+import { execFileSync, spawnSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { ClaudeCodeDriver } from '../../../src/agent/drivers/claude-code.js';
 import { CodexDriver } from '../../../src/agent/drivers/codex.js';
 import { OpenCodeDriver } from '../../../src/agent/drivers/opencode.js';
+import { resolveOpenCodeCliAsync, resolveOpenCodeCliSync } from '../../../src/agent/opencode-cli-path.js';
 import { ShellDriver } from '../../../src/agent/drivers/shell.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../../shared/cron-types.js';
 
@@ -252,6 +257,81 @@ describe('OpenCodeDriver', () => {
     const cmd = driver.buildResumeCommand('deck_proj_w1', { opencodeSessionId: 'oc-session-123', cwd: '/tmp/proj' });
     expect(cmd).toContain('opencode -s');
     expect(cmd).toContain('oc-session-123');
+  });
+
+  it('executes launch/resume from spaced ~/.opencode/bin under sparse PATH, prefers PATH when present, and refuses elevated home fallback', async () => {
+    const tempHome = mkdtempSync(path.join(tmpdir(), 'imcodes oc home '));
+    const pathBinDir = mkdtempSync(path.join(tmpdir(), 'imcodes-oc-path-'));
+    try {
+      const homeBinDir = path.join(tempHome, '.opencode', 'bin');
+      mkdirSync(homeBinDir, { recursive: true });
+      const homeBin = path.join(homeBinDir, 'opencode');
+      writeFileSync(homeBin, '#!/bin/sh\necho "HOME_OC:$*"\n', 'utf8');
+      chmodSync(homeBin, 0o755);
+
+      const sparseEnv = { PATH: '/usr/bin' };
+      const launchCmd = driver.buildLaunchCommand('deck_proj_w1', { env: sparseEnv, homeDir: tempHome, isElevated: false });
+      const resumeIdCmd = driver.buildResumeCommand('deck_proj_w1', {
+        opencodeSessionId: 'oc-123',
+        env: sparseEnv,
+        homeDir: tempHome,
+        isElevated: false,
+      });
+      const resumeFallbackCmd = driver.buildResumeCommand('deck_proj_w1', {
+        env: sparseEnv,
+        homeDir: tempHome,
+        isElevated: false,
+      });
+
+      const r1 = spawnSync('/bin/sh', ['-c', launchCmd], { env: sparseEnv, encoding: 'utf8' });
+      const r2 = spawnSync('/bin/sh', ['-c', resumeIdCmd], { env: sparseEnv, encoding: 'utf8' });
+      const r3 = spawnSync('/bin/sh', ['-c', resumeFallbackCmd], { env: sparseEnv, encoding: 'utf8' });
+      expect(r1.status).toBe(0);
+      expect(r1.stdout.trim()).toBe('HOME_OC:');
+      expect(r2.status).toBe(0);
+      expect(r2.stdout.trim()).toBe('HOME_OC:-s oc-123');
+      expect(r3.status).toBe(0);
+      expect(r3.stdout.trim()).toBe('HOME_OC:-c');
+
+      // PATH-installed opencode takes precedence over ~/.opencode/bin
+      const pathBin = path.join(pathBinDir, 'opencode');
+      writeFileSync(pathBin, '#!/bin/sh\necho "PATH_OC:$*"\n', 'utf8');
+      chmodSync(pathBin, 0o755);
+      const pathEnv = { PATH: `${pathBinDir}:/usr/bin` };
+      const launchOnPath = driver.buildLaunchCommand('deck_proj_w1', { env: pathEnv, homeDir: tempHome, isElevated: false });
+      expect(launchOnPath).toBe('opencode');
+      const rPath = spawnSync('/bin/sh', ['-c', launchOnPath], { env: pathEnv, encoding: 'utf8' });
+      expect(rPath.status).toBe(0);
+      expect(rPath.stdout.trim()).toBe('PATH_OC:');
+
+      // Elevated caller (Windows admin/SYSTEM or POSIX root with non-/root home) refuses user-writable home fallback
+      expect(resolveOpenCodeCliSync({ env: sparseEnv, homeDir: tempHome, platform: 'linux', isElevated: true }).source).toBe('missing');
+      const winResolved = await resolveOpenCodeCliAsync({
+        platform: 'win32',
+        env: { PATH: 'C:\\Windows\\System32' },
+        homeDir: 'C:\\Users\\Alice Smith',
+        isElevated: true,
+        isExecutableFile: async (p) => p === 'C:\\Users\\Alice Smith\\.opencode\\bin\\opencode.exe',
+      });
+      expect(winResolved.source).toBe('missing');
+
+      const winNonElev = await resolveOpenCodeCliAsync({
+        platform: 'win32',
+        env: { PATH: 'C:\\Windows\\System32' },
+        homeDir: 'C:\\Users\\Alice Smith',
+        isElevated: false,
+        isExecutableFile: async (p) => p === 'C:\\Users\\Alice Smith\\.opencode\\bin\\opencode.exe',
+      });
+      expect(winNonElev).toEqual({
+        executable: 'C:\\Users\\Alice Smith\\.opencode\\bin\\opencode.exe',
+        resolvedPath: 'C:\\Users\\Alice Smith\\.opencode\\bin\\opencode.exe',
+        source: 'home_bin',
+      });
+      void execFileSync;
+    } finally {
+      rmSync(tempHome, { recursive: true, force: true });
+      rmSync(pathBinDir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -3,27 +3,41 @@ import path from 'path';
 import { cwdPrefix, type AgentDriver, type LaunchOptions } from './base.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
+import { quoteShellBinary, resolveOpenCodeCliSync } from '../opencode-cli-path.js';
 
 export class OpenCodeDriver implements AgentDriver {
   readonly type = 'opencode' as const;
   readonly promptChar = '>';
   readonly spinnerChars = ['|', '/', '-', '\\'];
 
+  private resolveBinaryCommand(opts?: LaunchOptions): string {
+    const platform = opts?.platform ?? process.platform;
+    const resolved = resolveOpenCodeCliSync({
+      ...(opts?.env !== undefined ? { env: opts.env } : {}),
+      ...(opts?.homeDir !== undefined ? { homeDir: opts.homeDir } : {}),
+      platform,
+      ...(opts?.isElevated !== undefined ? { isElevated: opts.isElevated } : {}),
+    });
+    return quoteShellBinary(resolved.executable, platform);
+  }
+
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
+    const bin = this.resolveBinaryCommand(opts);
     if (opts?.opencodeSessionId && !opts?.fresh) {
-      return `${cwd}opencode -s ${JSON.stringify(opts.opencodeSessionId)}`;
+      return `${cwd}${bin} -s ${JSON.stringify(opts.opencodeSessionId)}`;
     }
-    return `${cwd}opencode`;
+    return `${cwd}${bin}`;
   }
 
   buildResumeCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
+    const bin = this.resolveBinaryCommand(opts);
     if (opts?.opencodeSessionId) {
-      return `${cwd}opencode -s ${JSON.stringify(opts.opencodeSessionId)}`;
+      return `${cwd}${bin} -s ${JSON.stringify(opts.opencodeSessionId)}`;
     }
     // Legacy fallback for pre-opencodeSessionId sessions.
-    return `${cwd}opencode -c || opencode`;
+    return `${cwd}${bin} -c || ${bin}`;
   }
 
   detectStatus(_lines: string[]): AgentStatus {

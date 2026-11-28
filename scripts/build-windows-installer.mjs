@@ -294,10 +294,12 @@ $UserStateDir = Join-Path $HomeDir '.imcodes'
 $ReleaseDir = Join-Path (Join-Path $RuntimeRoot 'releases') $Version
 $CurrentDir = Join-Path $RuntimeRoot 'current'
 
-foreach ($tp in @($RuntimeRoot, $NodeRoot, $SnapshotDir, $UserStateDir, $ReleaseDir)) {
+$containerTargets = if ($Mode -eq 'InstallOpenCode') { @($RuntimeRoot, $UserStateDir, $ReleaseDir) } else { @($RuntimeRoot, $NodeRoot, $SnapshotDir, $UserStateDir, $ReleaseDir) }
+foreach ($tp in $containerTargets) {
   Assert-SafeTargetPath $tp $RealProfile
 }
-foreach ($ep in @($CliWrapperPath, $AutostartPath, $StartMenuShortcutPath, $DesktopShortcutPath, $CurrentDir)) {
+$entryTargets = if ($Mode -eq 'InstallOpenCode') { @($CurrentDir) } else { @($CliWrapperPath, $AutostartPath, $StartMenuShortcutPath, $DesktopShortcutPath, $CurrentDir) }
+foreach ($ep in $entryTargets) {
   Assert-SafeTargetPath $ep $RealProfile -EntryMode
 }
 if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
@@ -1558,26 +1560,6 @@ if ($Mode -eq 'Rollback') {
   }
 }
 
-$plan = Invoke-PhaseAProbe
-if ($Mode -eq 'PreInstall') {
-  try {
-    Write-InstallerLog "Starting PreInstall version=$Version scenario=$($plan.scenario) nodeRoot=$NodeRoot runtimeRoot=$RuntimeRoot sqliteCount=$($plan.sqliteCount)"
-    $preServiceSnap = Get-WindowsServicesSnapshot
-    Save-RollbackSnapshot $plan $preServiceSnap
-    Write-InstallerLog "Saved rollback snapshot to $SnapshotDir"
-    [void](Assert-SingleInstanceLockAndStop $plan)
-    Stop-ControlledNodeAndSidecarsForInstall
-    Write-InstallerLog "Completed PreInstall"
-    $plan | Add-Member -NotePropertyName snapshotDir -NotePropertyValue $SnapshotDir -Force
-    $plan | ConvertTo-Json -Depth 6
-    exit 0
-  } catch {
-    Write-InstallerLog ("FATAL: " + $_.Exception.Message)
-    if ($_.ScriptStackTrace) { Write-InstallerLog ([string]$_.ScriptStackTrace) }
-    throw
-  }
-}
-
 function Add-UserPathEntry([string]$DirPath) {
   if ([string]::IsNullOrWhiteSpace($DirPath)) { return }
   $curPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -1717,6 +1699,26 @@ if ($Mode -eq 'InstallOpenCode') {
   } catch {
     Write-InstallerLog ("WARNING: InstallOpenCode failed (non-blocking): " + $_.Exception.Message)
     exit 0
+  }
+}
+
+$plan = Invoke-PhaseAProbe
+if ($Mode -eq 'PreInstall') {
+  try {
+    Write-InstallerLog "Starting PreInstall version=$Version scenario=$($plan.scenario) nodeRoot=$NodeRoot runtimeRoot=$RuntimeRoot sqliteCount=$($plan.sqliteCount)"
+    $preServiceSnap = Get-WindowsServicesSnapshot
+    Save-RollbackSnapshot $plan $preServiceSnap
+    Write-InstallerLog "Saved rollback snapshot to $SnapshotDir"
+    [void](Assert-SingleInstanceLockAndStop $plan)
+    Stop-ControlledNodeAndSidecarsForInstall
+    Write-InstallerLog "Completed PreInstall"
+    $plan | Add-Member -NotePropertyName snapshotDir -NotePropertyValue $SnapshotDir -Force
+    $plan | ConvertTo-Json -Depth 6
+    exit 0
+  } catch {
+    Write-InstallerLog ("FATAL: " + $_.Exception.Message)
+    if ($_.ScriptStackTrace) { Write-InstallerLog ([string]$_.ScriptStackTrace) }
+    throw
   }
 }
 

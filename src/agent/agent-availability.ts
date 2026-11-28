@@ -12,6 +12,7 @@ import { resolveCopilotExplicitBinaryPath, resolveCopilotRuntimePlatform } from 
 import { getProvider } from './provider-registry.js';
 import { DSH_BINARY_ENV, DSH_DEFAULT_BINARY } from './providers/deepseek-harness/runtime.js';
 import { GROK_CLI_BINARY, GROK_CLI_PATH_ENV } from './providers/grok-sdk.js';
+import { resolveOpenCodeCliAsync } from './opencode-cli-path.js';
 import { PI_BINARY_ENV, PI_DEFAULT_BINARY } from './providers/pi/runtime.js';
 import {
   getBundledClaudeBinaryCandidates,
@@ -417,8 +418,15 @@ async function probeOpenCode(deps: AgentAvailabilityProbeDeps, requireSdkPackage
     }
     return { installed: true };
   }
-  const trailingDirs = deps.homeDir ? [pathModuleFor(deps.platform).join(deps.homeDir, '.opencode', 'bin')] : [];
-  return probeBinary(deps, 'opencode', { includeWindowsGlobalNpmDirs: false, trailingDirs }, 'opencode CLI not found');
+  const resolved = await resolveOpenCodeCliAsync({
+    platform: deps.platform,
+    env: deps.env,
+    homeDir: deps.homeDir,
+    isExecutableFile: deps.isExecutableFile,
+  });
+  return resolved.source === 'missing'
+    ? { installed: false, reason: 'opencode CLI not found' }
+    : { installed: true };
 }
 
 async function probeGrokSdk(deps: AgentAvailabilityProbeDeps): Promise<AgentAvailabilityEntry> {
