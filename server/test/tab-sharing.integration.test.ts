@@ -14,7 +14,7 @@ import {
 import { tabSharingRoutes } from '../src/routes/tab-sharing.js';
 import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession } from '../src/routes/share-http-auth.js';
 import { resolveServerMembershipRole, resolveServerRole } from '../src/security/authorization.js';
-import { signJwt, verifyJwt } from '../src/security/crypto.js';
+import { sha256Hex, signJwt, verifyJwt } from '../src/security/crypto.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { WsBridge } from '../src/ws/bridge.js';
 
@@ -1168,5 +1168,69 @@ describe('tab sharing APIs', () => {
     expect(returnedIds).not.toContain(otherSubId);
     expect(returnedIds).not.toContain(mainCloneId);
     expect(returnedIds).not.toContain(nestedCloneId);
+  });
+
+  it('POST /shares/open for a server share merges live non-incognito daemon sessions while excluding incognito sessions', async () => {
+    const app = makeApp();
+    const { ownerId, recipientId, serverId, sessionName } = await seedShareTarget();
+
+    await createOrUpdateShare(db, {
+      id: id('share-server-live'),
+      target: { kind: 'server', serverId },
+      targetUserId: recipientId,
+      role: 'participant',
+      createdBy: ownerId,
+      now: 13_000,
+    });
+
+    const daemonToken = id('daemon-tok');
+    await db.execute('UPDATE servers SET token_hash = $1 WHERE id = $2', [sha256Hex(daemonToken), serverId]);
+
+    const bridge = WsBridge.get(serverId);
+    const handlers = new Map<string, (...args: unknown[]) => void>();
+    const fakeDaemon = {
+      readyState: 1,
+      on: (ev: string, fn: (...args: unknown[]) => void) => {
+        handlers.set(ev, fn);
+      },
+      send: () => {},
+      close: () => {},
+      ping: () => {},
+      terminate: () => {},
+    };
+    let resolveAuth!: () => void;
+    const authDone = new Promise<void>((resolve) => { resolveAuth = resolve; });
+    bridge.handleDaemonConnection(
+      fakeDaemon as never,
+      db,
+      { JWT_SIGNING_KEY: JWT_KEY } as never,
+      () => resolveAuth(),
+    );
+    handlers.get('message')?.(JSON.stringify({ type: 'auth', serverId, token: daemonToken }));
+    await authDone;
+    handlers.get('message')?.(JSON.stringify({
+      type: 'session_list',
+      sessions: [
+        { name: sessionName, project: 'Alpha', label: 'Live Alpha', state: 'running', agentType: 'claude-code' },
+        { name: 'deck_live_only_brain', project: 'LiveOnly', label: 'Control Center', state: 'idle', agentType: 'codex-sdk' },
+        { name: 'deck_incognito_brain', project: 'Hidden', label: 'Secret', state: 'running', agentType: 'claude-code-sdk', incognito: true },
+      ],
+    }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    const res = await app.request('/api/shares/open', {
+      method: 'POST',
+      headers: authHeaders(recipientId),
+      body: JSON.stringify({ target: { kind: 'server', serverId } }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      sessions: Array<{ sessionName: string; title: string; state: string }>;
+    };
+    expect(body.sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sessionName, title: 'Live Alpha', state: 'running' }),
+      expect.objectContaining({ sessionName: 'deck_live_only_brain', title: 'Control Center', state: 'idle' }),
+    ]));
+    expect(body.sessions.some((s) => s.sessionName === 'deck_incognito_brain')).toBe(false);
   });
 });

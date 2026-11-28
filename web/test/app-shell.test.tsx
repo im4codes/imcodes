@@ -16474,4 +16474,229 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 25_000);
+
+  it('requests session_list again when WebSocket reconnects with reason probe_recovered on a shared server', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-srv-probe');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const serverGrant = {
+      id: 'share-srv-probe',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Server',
+      target: { kind: 'server' as const, serverId: 'srv-shared' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([serverGrant]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: serverGrant.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-srv-probe'],
+        primaryShareId: 'share-srv-probe',
+        authorizedAt: Date.now(),
+      },
+      sessions: [
+        { sessionName: 'deck_beta_brain', title: 'Beta', state: 'running', agentType: 'codex-sdk' },
+      ],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await screen.findByTestId('session-pane-deck_beta_brain');
+    const sharedWs = await waitFor(() => {
+      const found = wsInstances.find((instance) => (instance.options?.shareTarget as { kind?: string } | undefined)?.kind === 'server');
+      if (!found) throw new Error('missing share ws');
+      return found;
+    });
+
+    sharedWs.requestSessionList.mockClear();
+    await act(async () => {
+      sharedWs.emit({ type: 'session.event', event: 'connected', reason: 'probe_recovered' });
+    });
+
+    expect(sharedWs.requestSessionList).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      sharedWs.emit({
+        type: 'session_list',
+        sessions: [
+          { name: 'deck_beta_brain', project: 'Beta', role: 'brain', state: 'running', agentType: 'codex-sdk' },
+          { name: 'deck_gamma_brain', project: 'Control Center', role: 'brain', state: 'idle', agentType: 'claude-code-sdk' },
+        ],
+      });
+    });
+
+    expect(await screen.findByText('tabs-select-deck_gamma_brain')).toBeTruthy();
+  }, 20_000);
+
+  it('upgrades a hash-fallback main share to the authoritative server share once discovery resolves', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-srv-upgrade');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+
+    const serverGrant = {
+      id: 'share-srv-upgrade',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Server',
+      target: { kind: 'server' as const, serverId: 'srv-shared' },
+    };
+
+    // First discovery is empty -> hash fallback initially opens kind: 'main'
+    discoverSharedEntriesMock.mockResolvedValueOnce([]);
+    discoverSharedEntriesMock.mockResolvedValue([serverGrant]);
+
+    openSharedEntryMock.mockImplementation(async (target: { kind: string; serverId: string; sessionName?: string }) => {
+      if (target.kind === 'main') {
+        return {
+          server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+          target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+          coverage: {
+            effectiveRole: 'participant',
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: ['share-srv-upgrade'],
+            primaryShareId: 'share-srv-upgrade',
+            authorizedAt: Date.now(),
+          },
+          sessions: [
+            { sessionName: 'deck_beta_brain', title: 'Beta', state: 'running', agentType: 'codex-sdk' },
+          ],
+          subSessions: [],
+        };
+      }
+      return {
+        server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+        target: serverGrant.target,
+        coverage: {
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-srv-upgrade'],
+          primaryShareId: 'share-srv-upgrade',
+          authorizedAt: Date.now(),
+        },
+        sessions: [
+          { sessionName: 'deck_beta_brain', title: 'Beta', state: 'running', agentType: 'codex-sdk' },
+          { sessionName: 'deck_gamma_brain', title: 'Control Center', state: 'idle', agentType: 'claude-code-sdk' },
+        ],
+        subSessions: [],
+      };
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith({
+      kind: 'main',
+      serverId: 'srv-shared',
+      sessionName: 'deck_beta_brain',
+    }));
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+
+    // Trigger foreground refresh (advance Date.now past 10s throttle so handleForeground invokes refreshSharedEntries)
+    const realDateNow = Date.now;
+    let fakeNow = realDateNow() + 20_000;
+    Date.now = () => fakeNow;
+    try {
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'));
+      });
+    } finally {
+      Date.now = realDateNow;
+    }
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith({
+      kind: 'server',
+      serverId: 'srv-shared',
+    }));
+    expect(await screen.findByText('tabs-select-deck_gamma_brain')).toBeTruthy();
+    expect(screen.getByText('tabs-select-deck_beta_brain')).toBeTruthy();
+  }, 20_000);
+
+  it('coalesces duplicate focus refreshes against an active cold-start discovery and retries transient cold-start failure without clearing rcc_server', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-shared');
+    const serverGrant = {
+      id: 'share-srv-cold',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Server',
+      target: { kind: 'server' as const, serverId: 'srv-shared' },
+    };
+
+    const signals: AbortSignal[] = [];
+    let attempt = 0;
+    let resolveFirstAttempt!: () => void;
+    const firstAttemptGate = new Promise<void>((resolve) => {
+      resolveFirstAttempt = resolve;
+    });
+    discoverSharedEntriesMock.mockImplementation(async (options?: { signal?: AbortSignal }) => {
+      attempt += 1;
+      if (options?.signal) signals.push(options.signal);
+      if (attempt === 1) {
+        await firstAttemptGate;
+        throw new Error('cold start network blip');
+      }
+      return [serverGrant];
+    });
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: serverGrant.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-srv-cold'],
+        primaryShareId: 'share-srv-cold',
+        authorizedAt: Date.now(),
+      },
+      sessions: [
+        { sessionName: 'deck_beta_brain', title: 'Beta', state: 'running', agentType: 'codex-sdk' },
+        { sessionName: 'deck_gamma_brain', title: 'Control Center', state: 'idle', agentType: 'claude-code-sdk' },
+      ],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(attempt).toBe(1));
+
+    // Focus while cold-start discovery is still in flight must NOT abort the active discovery
+    const realDateNow = Date.now;
+    let fakeNow = realDateNow() + 20_000;
+    Date.now = () => fakeNow;
+    try {
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'));
+      });
+    } finally {
+      Date.now = realDateNow;
+    }
+
+    expect(signals[0]?.aborted).toBe(false);
+    expect(attempt).toBe(1);
+
+    // Let first attempt fail; rcc_server must stay intact and bounded retry must recover cleanly
+    await act(async () => {
+      resolveFirstAttempt();
+    });
+
+    await waitFor(() => expect(attempt).toBeGreaterThanOrEqual(2), { timeout: 5_000 });
+    expect(localStorage.getItem('rcc_server')).toBe('srv-shared');
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith({
+      kind: 'server',
+      serverId: 'srv-shared',
+    }), { timeout: 5_000 });
+    expect(await screen.findByText('tabs-select-deck_gamma_brain')).toBeTruthy();
+  }, 20_000);
 });

@@ -323,13 +323,57 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
     }
     return subRows.filter((subSession) => includedIds.has(subSession.id));
   })();
-  const sessions = target.kind === 'server'
-    ? mainRows
-    : target.kind === 'main'
-      ? mainRows.filter((session) => session.name === target.sessionName)
-      : mainRows.filter((session) => subSessions.some((subSession) => subSession.parent_session === session.name));
   const bridge = WsBridge.get(target.serverId);
+  const publicMainRows = mainRows.filter((session) => !bridge.isIncognitoSessionName(session.name));
+  const sessions = target.kind === 'server'
+    ? publicMainRows
+    : target.kind === 'main'
+      ? publicMainRows.filter((session) => session.name === target.sessionName)
+      : publicMainRows.filter((session) => subSessions.some((subSession) => subSession.parent_session === session.name));
   const includeActiveDispatch = coverage.effectiveRole === 'participant';
+
+  const projectedSessions = (() => {
+    if (target.kind !== 'server' || !bridge.hasReceivedActiveMainSessionSnapshot()) {
+      return sessions.map((session) => ({
+        sessionName: session.name,
+        title: session.label?.trim() || session.project_name,
+        state: session.state,
+        agentType: session.agent_type,
+        [SUPERVISION_MODE_PROJECTION_KEY]: projectSharedSessionSupervisionMode(session.transport_config),
+        ...(includeActiveDispatch
+          ? { activeDispatchId: bridge.getActiveDispatchIdForSession(session.name) }
+          : {}),
+      }));
+    }
+    const dbByName = new Map(sessions.map((row) => [row.name, row]));
+    const liveByName = new Map(
+      bridge.getPublicActiveMainSessions()
+        .filter((row) => !row.name.startsWith('deck_sub_'))
+        .map((row) => [row.name, row]),
+    );
+    const orderedNames = [
+      ...sessions.map((row) => row.name),
+      ...Array.from(liveByName.keys()).filter((name) => !dbByName.has(name)),
+    ];
+    return orderedNames.map((name) => {
+      const dbRow = dbByName.get(name);
+      const liveRow = liveByName.get(name);
+      return {
+        sessionName: name,
+        title: liveRow?.label?.trim()
+          || dbRow?.label?.trim()
+          || liveRow?.project
+          || dbRow?.project_name
+          || name,
+        state: liveRow?.state ?? dbRow?.state ?? 'stopped',
+        agentType: liveRow?.agentType || dbRow?.agent_type || '',
+        [SUPERVISION_MODE_PROJECTION_KEY]: projectSharedSessionSupervisionMode(dbRow?.transport_config),
+        ...(includeActiveDispatch
+          ? { activeDispatchId: bridge.getActiveDispatchIdForSession(name) }
+          : {}),
+      };
+    });
+  })();
 
   return c.json({
     server: {
@@ -340,16 +384,7 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
     },
     target,
     coverage,
-    sessions: sessions.map((session) => ({
-      sessionName: session.name,
-      title: session.label?.trim() || session.project_name,
-      state: session.state,
-      agentType: session.agent_type,
-      [SUPERVISION_MODE_PROJECTION_KEY]: projectSharedSessionSupervisionMode(session.transport_config),
-      ...(includeActiveDispatch
-        ? { activeDispatchId: bridge.getActiveDispatchIdForSession(session.name) }
-        : {}),
-    })),
+    sessions: projectedSessions,
     subSessions: subSessions.map((subSession) => {
       const subState = bridge.getActiveSubSessionState(`deck_sub_${subSession.id}`);
       return {

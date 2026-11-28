@@ -11033,6 +11033,19 @@ export class WsBridge {
     return Array.from(this.activeMainSessions.values());
   }
 
+  /**
+   * Live main-session rows safe to project onto shared/public surfaces (excludes
+   * any session marked incognito in this bridge instance).
+   */
+  getPublicActiveMainSessions(): WatchActiveMainSessionRow[] {
+    return Array.from(this.activeMainSessions.values())
+      .filter((session) => !this.incognitoSessions.has(session.name));
+  }
+
+  isIncognitoSessionName(sessionName: string): boolean {
+    return this.incognitoSessions.has(sessionName);
+  }
+
   hasReceivedActiveMainSessionSnapshot(): boolean {
     return this.hasActiveMainSessionSnapshot;
   }
@@ -12321,7 +12334,16 @@ export class WsBridge {
     if (!state) return originalJson;
     if (!msg) return null;
     const filtered = filterShareDaemonMessage(msg, state);
-    return filtered ? JSON.stringify(filtered) : null;
+    if (!filtered) return null;
+    if (filtered.type === 'session_list' && Array.isArray(filtered.sessions) && this.incognitoSessions.size > 0) {
+      const publicSessions = filtered.sessions.filter((item) => {
+        if (!item || typeof item !== 'object') return false;
+        const name = (item as Record<string, unknown>).name;
+        return typeof name === 'string' && !this.incognitoSessions.has(name);
+      });
+      return JSON.stringify({ ...filtered, sessions: publicSessions });
+    }
+    return JSON.stringify(filtered);
   }
 
   // ── Ack reliability helpers ────────────────────────────────────────────

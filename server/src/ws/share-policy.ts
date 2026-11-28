@@ -13,6 +13,7 @@ import { P2P_CONFIG_MSG } from '../../../shared/p2p-config-events.js';
 import { isP2pSavedConfig, sanitizeP2pSavedConfig } from '../../../shared/p2p-modes.js';
 import { collectRoutedSessionNames } from '../../../shared/p2p-routing-fields.js';
 import { isShellLikeAgentType } from '../../../shared/agent-types.js';
+import { isIncognitoSession } from '../../../shared/session-incognito-types.js';
 import {
   PARTICIPANT_SHELL_FORBIDDEN_REASON,
   SHARE_BROWSER_COMMANDS,
@@ -223,6 +224,7 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
   { bridgeCommand: SESSION_IDENTITY_WS.RESOLVE_QUERY, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: 'get_sessions', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_LIST, policy: { kind: 'allow-covered-read', requireTarget: false } },
   { bridgeCommand: 'discussion.comment', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT, policy: { kind: 'allow-covered-read', requireTarget: false } },
   { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: 'fs.read', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'allow-covered-read', requireTarget: true } },
@@ -1488,6 +1490,7 @@ function redactSessionList(msg: Record<string, unknown>, state: ShareScopedSocke
   const sessions = rows
     .filter((item) => {
       if (!item || typeof item !== 'object') return false;
+      if (isIncognitoSession(item)) return false;
       if (serverScoped) return true;
       const name = (item as Record<string, unknown>).name;
       return typeof name === 'string' && shareStateCoversSession(state, name);

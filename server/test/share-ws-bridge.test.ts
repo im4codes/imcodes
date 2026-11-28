@@ -4093,4 +4093,65 @@ describe('WsBridge share-scoped sockets', () => {
       expect(sock.sentJson.some((m) => m.type === 'command.failed' && m.commandId === cmdId && m.reason === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN)).toBe(true);
     }
   });
+
+  it('forwards get_sessions from share sockets and delivers scoped session_list without leaking incognito sessions', async () => {
+    const now = 1_800_000_000_000;
+    const bridge = WsBridge.get(serverId);
+    const db = makeDb();
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-get-sessions-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+
+    const serverTarget: ShareTarget = { kind: 'server', serverId };
+    const mainTarget: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_app_brain' };
+    const serverParticipantCov = { ...coverage(serverTarget, 'participant', now), serverParticipantAuthority: true };
+    const mainViewerCov = coverage(mainTarget, 'viewer', now);
+
+    const serverSock = new MockWs();
+    bridge.handleShareBrowserConnection(serverSock as never, 'participant-get-sessions', db, {
+      ticketId: 'ticket-get-sessions-srv',
+      target: serverTarget,
+      snapshot: serverParticipantCov,
+    });
+    const mainSock = new MockWs();
+    bridge.handleShareBrowserConnection(mainSock as never, 'viewer-get-sessions', db, {
+      ticketId: 'ticket-get-sessions-main',
+      target: mainTarget,
+      snapshot: mainViewerCov,
+    });
+
+    daemon.sent.length = 0;
+    serverSock.sent.length = 0;
+    mainSock.sent.length = 0;
+
+    bridge.setShareCoverageResolverForTests(async () => serverParticipantCov);
+    serverSock.emit('message', JSON.stringify({ type: 'get_sessions' }));
+    await flushAsync();
+
+    bridge.setShareCoverageResolverForTests(async () => mainViewerCov);
+    mainSock.emit('message', JSON.stringify({ type: 'get_sessions' }));
+    await flushAsync();
+
+    const forwardedGetSessions = daemon.sentJson.filter((m) => m.type === 'get_sessions');
+    expect(forwardedGetSessions.length).toBe(2);
+    expect(serverSock.sentJson.some((m) => m.type === 'error')).toBe(false);
+    expect(mainSock.sentJson.some((m) => m.type === 'error')).toBe(false);
+
+    daemon.emit('message', JSON.stringify({
+      type: 'session_list',
+      sessions: [
+        { name: 'deck_app_brain', project: 'app', state: 'idle', agentType: 'claude-code' },
+        { name: 'deck_second_brain', project: 'second', state: 'running', agentType: 'codex-sdk' },
+        { name: 'deck_secret_brain', project: 'secret', state: 'running', agentType: 'claude-code-sdk', incognito: true },
+      ],
+    }));
+    await flushAsync();
+
+    const serverList = serverSock.sentJson.find((m) => m.type === 'session_list') as { sessions?: Array<{ name: string }> } | undefined;
+    expect(serverList?.sessions?.map((s) => s.name)).toEqual(['deck_app_brain', 'deck_second_brain']);
+
+    const mainList = mainSock.sentJson.find((m) => m.type === 'session_list') as { sessions?: Array<{ name: string }> } | undefined;
+    expect(mainList?.sessions?.map((s) => s.name)).toEqual(['deck_app_brain']);
+  });
 });

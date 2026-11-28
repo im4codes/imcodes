@@ -854,6 +854,8 @@ function isDefinitiveShareDenial(error: unknown): boolean {
   }
 }
 
+const SHARED_DISCOVERY_RETRY_DELAYS_MS = [1_500, 3_500, 7_000] as const;
+
 function sharedEntryFallbackFromHash(
   entryId: string | null,
   serverId: string | null,
@@ -1105,11 +1107,26 @@ function InternalMainApp() {
     };
   }, []);
   const sharedDiscoveryAbortRef = useRef<AbortController | null>(null);
+  const sharedDiscoveryInFlightRef = useRef<{
+    controller: AbortController;
+    promise: Promise<void>;
+    userId: string | null;
+    baseUrl: string | null;
+  } | null>(null);
+  const sharedDiscoveryRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sharedDiscoveryRetryCountRef = useRef(0);
+  const [sharedDiscoveryRetryPending, setSharedDiscoveryRetryPending] = useState(false);
   const sharedDiscoveryGenerationRef = useRef(0);
+  const downgradedFallbackShareRef = useRef<{ entryId: string; serverId: string } | null>(null);
   useEffect(() => {
     return () => {
       sharedDiscoveryAbortRef.current?.abort();
       sharedDiscoveryAbortRef.current = null;
+      sharedDiscoveryInFlightRef.current = null;
+      if (sharedDiscoveryRetryTimerRef.current) {
+        clearTimeout(sharedDiscoveryRetryTimerRef.current);
+        sharedDiscoveryRetryTimerRef.current = null;
+      }
     };
   }, []);
   const [daemonUpgradeRequests, setDaemonUpgradeRequests] = useState<Record<string, DaemonUpgradeRequestState>>({});
@@ -1748,7 +1765,7 @@ function InternalMainApp() {
 
   useEffect(() => {
     if (!serversSynced) return;
-    if (sharedHashRestorePending) return;
+    if (sharedHashRestorePending || sharedDiscoveryRetryPending) return;
     if (selectedShareTarget) return;
     if (!shouldResetSelectedServer(selectedServerId, servers, serversLoaded)) return;
     setSelectedServerId(null);
@@ -1759,7 +1776,7 @@ function InternalMainApp() {
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
     clearSharedTabRestoreMarker();
-  }, [selectedServerId, servers, serversLoaded, serversSynced, selectedShareTarget, sharedHashRestorePending]);
+  }, [selectedServerId, servers, serversLoaded, serversSynced, selectedShareTarget, sharedDiscoveryRetryPending, sharedHashRestorePending]);
 
   useEffect(() => {
     let cleanup = () => {};
@@ -2600,7 +2617,35 @@ function InternalMainApp() {
   // Periodically refresh server list so lastHeartbeatAt stays current
   const lastSharedAuthUserIdRef = useRef<string | null>(null);
 
-  const refreshSharedEntries = useCallback(async (options?: { silent?: boolean }) => {
+  const refreshSharedEntriesRef = useRef<((options?: { silent?: boolean; isRetry?: boolean; coalesceInFlight?: boolean }) => Promise<void>) | null>(null);
+
+  const refreshSharedEntries = useCallback(async (options?: { silent?: boolean; isRetry?: boolean; coalesceInFlight?: boolean }) => {
+    const currentUserId = authRef.current?.userId ?? null;
+    const currentBaseUrl = authRef.current?.baseUrl ?? null;
+
+    // Preserve an active same-auth discovery when foreground/focus fires while
+    // cold-start or manual discovery is already running; explicit refreshes and
+    // 30s interval polls still supersede stalled requests.
+    const inFlight = sharedDiscoveryInFlightRef.current;
+    if (
+      options?.coalesceInFlight &&
+      !options?.isRetry &&
+      currentUserId &&
+      inFlight &&
+      !inFlight.controller.signal.aborted &&
+      inFlight.userId === currentUserId &&
+      inFlight.baseUrl === currentBaseUrl
+    ) {
+      return inFlight.promise;
+    }
+
+    if (!options?.isRetry && sharedDiscoveryRetryTimerRef.current) {
+      clearTimeout(sharedDiscoveryRetryTimerRef.current);
+      sharedDiscoveryRetryTimerRef.current = null;
+      sharedDiscoveryRetryCountRef.current = 0;
+      setSharedDiscoveryRetryPending(false);
+    }
+
     // Abort any prior in-flight discovery
     sharedDiscoveryAbortRef.current?.abort();
     const abortController = new AbortController();
@@ -2608,10 +2653,15 @@ function InternalMainApp() {
 
     const currentDiscoveryGen = ++sharedDiscoveryGenerationRef.current;
     const currentAuthGen = authMutationGenerationRef.current;
-    const currentUserId = authRef.current?.userId ?? null;
-    const currentBaseUrl = authRef.current?.baseUrl ?? null;
 
     if (!authRef.current || !currentUserId) {
+      sharedDiscoveryInFlightRef.current = null;
+      if (sharedDiscoveryRetryTimerRef.current) {
+        clearTimeout(sharedDiscoveryRetryTimerRef.current);
+        sharedDiscoveryRetryTimerRef.current = null;
+      }
+      sharedDiscoveryRetryCountRef.current = 0;
+      setSharedDiscoveryRetryPending(false);
       lastSharedAuthUserIdRef.current = null;
       lastSharedEntryIdByServerRef.current.clear();
       visitedSharedSessionsByServerRef.current.clear();
@@ -2630,6 +2680,8 @@ function InternalMainApp() {
     // Account switch boundary: if switching users, immediately clear prior user's shared entries
     if (lastSharedAuthUserIdRef.current !== currentUserId) {
       lastSharedAuthUserIdRef.current = currentUserId;
+      sharedDiscoveryRetryCountRef.current = 0;
+      setSharedDiscoveryRetryPending(false);
       lastSharedEntryIdByServerRef.current.clear();
       visitedSharedSessionsByServerRef.current.clear();
       visitedSharedSubSessionsByServerRef.current.clear();
@@ -2667,71 +2719,109 @@ function InternalMainApp() {
       authRef.current?.baseUrl === currentBaseUrl
     );
 
-    try {
-      const entries = await discoverSharedEntries({ signal: abortController.signal });
+    const runDiscovery = (async () => {
+      try {
+        const entries = await discoverSharedEntries({ signal: abortController.signal });
 
-      if (!isCurrentValidRequest()) return;
+        if (!isCurrentValidRequest()) return;
 
-      const activeIds = new Set(entries.filter((entry) => entry.status === 'active').map((entry) => entry.serverId));
-      sharedNavigationServerIdsRef.current = activeIds;
-      for (const entry of entries) {
-        if (entry.status === 'active') {
-          observedActiveSharedEntryIdsRef.current.add(entry.id);
-          observedSharedEntriesByIdRef.current.set(entry.id, entry);
+        sharedDiscoveryRetryCountRef.current = 0;
+        if (sharedDiscoveryRetryTimerRef.current) {
+          clearTimeout(sharedDiscoveryRetryTimerRef.current);
+          sharedDiscoveryRetryTimerRef.current = null;
         }
-      }
-      setSharedEntries(entries);
+        setSharedDiscoveryRetryPending(false);
 
-      // Build mapping of freshest known heartbeat per serverId from active grants
-      const grantMap = new Map<string, SharedEntrySummary>();
-      for (const entry of entries) {
-        if (entry.status === 'active' && typeof entry.lastHeartbeatAt === 'number') {
-          const cur = grantMap.get(entry.serverId);
-          if (!cur || (typeof cur.lastHeartbeatAt === 'number' && entry.lastHeartbeatAt > cur.lastHeartbeatAt)) {
-            grantMap.set(entry.serverId, entry);
+        const activeIds = new Set(entries.filter((entry) => entry.status === 'active').map((entry) => entry.serverId));
+        sharedNavigationServerIdsRef.current = activeIds;
+        for (const entry of entries) {
+          if (entry.status === 'active') {
+            observedActiveSharedEntryIdsRef.current.add(entry.id);
+            observedSharedEntriesByIdRef.current.set(entry.id, entry);
           }
         }
-      }
+        setSharedEntries(entries);
 
-      // Update visited shared server heartbeat snapshots so leaving them >60s does not falsely grey them out
-      setServers((previous) => previous.map((server) => {
-        if (ownedServerIdsRef.current.has(server.id)) return server;
-        const grant = grantMap.get(server.id);
-        if (!grant || typeof grant.lastHeartbeatAt !== 'number') return server;
-        const grantObservedAt = grant.statusObservedAt ?? grant.lastHeartbeatAt;
-        const serverObservedAt = (server as any).statusObservedAt ?? server.lastHeartbeatAt ?? 0;
-        // If the server was explicitly marked offline, an old or same-heartbeat grant must not overwrite it
-        if (server.status === 'offline' && grantObservedAt <= serverObservedAt && grant.lastHeartbeatAt <= (server.lastHeartbeatAt ?? 0)) {
+        // Build mapping of freshest known heartbeat per serverId from active grants
+        const grantMap = new Map<string, SharedEntrySummary>();
+        for (const entry of entries) {
+          if (entry.status === 'active' && typeof entry.lastHeartbeatAt === 'number') {
+            const cur = grantMap.get(entry.serverId);
+            if (!cur || (typeof cur.lastHeartbeatAt === 'number' && entry.lastHeartbeatAt > cur.lastHeartbeatAt)) {
+              grantMap.set(entry.serverId, entry);
+            }
+          }
+        }
+
+        // Update visited shared server heartbeat snapshots so leaving them >60s does not falsely grey them out
+        setServers((previous) => previous.map((server) => {
+          if (ownedServerIdsRef.current.has(server.id)) return server;
+          const grant = grantMap.get(server.id);
+          if (!grant || typeof grant.lastHeartbeatAt !== 'number') return server;
+          const grantObservedAt = grant.statusObservedAt ?? grant.lastHeartbeatAt;
+          const serverObservedAt = (server as any).statusObservedAt ?? server.lastHeartbeatAt ?? 0;
+          // If the server was explicitly marked offline, an old or same-heartbeat grant must not overwrite it
+          if (server.status === 'offline' && grantObservedAt <= serverObservedAt && grant.lastHeartbeatAt <= (server.lastHeartbeatAt ?? 0)) {
+            return server;
+          }
+          if (!server.lastHeartbeatAt || grant.lastHeartbeatAt > server.lastHeartbeatAt || (grant.lastHeartbeatAt === server.lastHeartbeatAt && server.status !== 'offline')) {
+            return {
+              ...server,
+              status: grant.serverStatus ?? server.status,
+              lastHeartbeatAt: grant.lastHeartbeatAt,
+              statusObservedAt: grantObservedAt,
+            };
+          }
           return server;
+        }).filter((server) => ownedServerIdsRef.current.has(server.id) || activeIds.has(server.id)));
+      } catch (err) {
+        if (!isCurrentGeneration()) return;
+        // On network failure during refresh: preserve existing entries; do not clear to []
+        if (!options?.silent) {
+          setSharedEntriesError(formatSharedAccessError(err, transRef.current));
         }
-        if (!server.lastHeartbeatAt || grant.lastHeartbeatAt > server.lastHeartbeatAt || (grant.lastHeartbeatAt === server.lastHeartbeatAt && server.status !== 'offline')) {
-          return {
-            ...server,
-            status: grant.serverStatus ?? server.status,
-            lastHeartbeatAt: grant.lastHeartbeatAt,
-            statusObservedAt: grantObservedAt,
-          };
+        const attempt = sharedDiscoveryRetryCountRef.current;
+        if (
+          appMountedRef.current &&
+          sharedEntriesRef.current.length === 0 &&
+          attempt < SHARED_DISCOVERY_RETRY_DELAYS_MS.length &&
+          !sharedDiscoveryRetryTimerRef.current
+        ) {
+          const delayMs = SHARED_DISCOVERY_RETRY_DELAYS_MS[attempt]!;
+          sharedDiscoveryRetryCountRef.current = attempt + 1;
+          setSharedDiscoveryRetryPending(true);
+          sharedDiscoveryRetryTimerRef.current = setTimeout(() => {
+            sharedDiscoveryRetryTimerRef.current = null;
+            void refreshSharedEntriesRef.current?.({ silent: true, isRetry: true });
+          }, delayMs);
+        } else if (!sharedDiscoveryRetryTimerRef.current) {
+          setSharedDiscoveryRetryPending(false);
         }
-        return server;
-      }).filter((server) => ownedServerIdsRef.current.has(server.id) || activeIds.has(server.id)));
-    } catch (err) {
-      if (!isCurrentGeneration()) return;
-      // On network failure during refresh: preserve existing entries; do not clear to []
-      if (!options?.silent) {
-        setSharedEntriesError(formatSharedAccessError(err, transRef.current));
+      } finally {
+        clearTimeout(timeoutTimer);
+        if (sharedDiscoveryAbortRef.current === abortController) {
+          sharedDiscoveryAbortRef.current = null;
+        }
+        if (sharedDiscoveryInFlightRef.current?.controller === abortController) {
+          sharedDiscoveryInFlightRef.current = null;
+        }
+        if (isCurrentGeneration()) {
+          setSharedEntriesLoading(false);
+          setSharedEntriesLoaded(true);
+          setPresenceTick((t) => (t + 1) % 1_000_000);
+        }
       }
-    } finally {
-      clearTimeout(timeoutTimer);
-      if (sharedDiscoveryAbortRef.current === abortController) {
-        sharedDiscoveryAbortRef.current = null;
-      }
-      if (isCurrentGeneration()) {
-        setSharedEntriesLoading(false);
-        setSharedEntriesLoaded(true);
-        setPresenceTick((t) => (t + 1) % 1_000_000);
-      }
-    }
+    })();
+
+    sharedDiscoveryInFlightRef.current = {
+      controller: abortController,
+      promise: runDiscovery,
+      userId: currentUserId,
+      baseUrl: currentBaseUrl,
+    };
+    return runDiscovery;
   }, [auth]);
+  refreshSharedEntriesRef.current = refreshSharedEntries;
 
   useEffect(() => {
     if (!auth) return;
@@ -2745,7 +2835,7 @@ function InternalMainApp() {
       const now = Date.now();
       if (now - lastServerRefreshAtRef.current < 10_000) return;
       void loadServers();
-      void refreshSharedEntries({ silent: true });
+      void refreshSharedEntries({ silent: true, coalesceInFlight: true });
     };
 
     if (typeof document !== 'undefined') {
@@ -2767,8 +2857,9 @@ function InternalMainApp() {
   }, [auth, loadServers, refreshSharedEntries]);
 
   useEffect(() => {
+    if (initialAuthVerificationPending) return;
     void refreshSharedEntries();
-  }, [refreshSharedEntries]);
+  }, [initialAuthVerificationPending, refreshSharedEntries]);
 
   const managedSharesGenerationRef = useRef(0);
   const refreshManagedShares = useCallback(async () => {
@@ -5556,10 +5647,14 @@ function InternalMainApp() {
       openSubSessionId?: string;
       openSubSessionLayout?: 'normal' | 'maximized';
       isFallbackRecovery?: boolean;
+      isDowngradedFallback?: boolean;
       attemptedEntryIds?: ReadonlySet<string>;
       source?: 'ui' | 'external' | 'startup';
     },
   ): Promise<SharedOpenResultStatus> => {
+    if (!options?.isDowngradedFallback) {
+      downgradedFallbackShareRef.current = null;
+    }
     const preferredSession = options?.preferredSessionName
       ?? (entry.target.kind === 'main' ? entry.target.sessionName : null);
     const subSessionId = entry.target.kind === 'subsession' ? entry.target.subSessionId : undefined;
@@ -5920,7 +6015,6 @@ function InternalMainApp() {
     }
     if (!sharedEntriesLoaded) return;
 
-    sharedHashRestoreStartedRef.current = true;
     const discoveredEntry = urlSharedEntryId
       ? sharedEntries.find((candidate) => (
           candidate.status === 'active'
@@ -5930,6 +6024,10 @@ function InternalMainApp() {
       : remembered
         ? findRememberedSharedEntry(sharedEntries, remembered)
         : findSharedEntryForHash(sharedEntries, initial.serverId, initial.sessionName);
+    if (!discoveredEntry && !urlSharedEntryId && sharedDiscoveryRetryPending) {
+      return;
+    }
+    sharedHashRestoreStartedRef.current = true;
     // The shared inventory is navigation UI, not restore authority. It can be
     // temporarily empty during auth refresh/reconnect. For an explicit shared
     // URL, reconstruct the main/server target and let /api/shares/open perform
@@ -5945,9 +6043,15 @@ function InternalMainApp() {
       return;
     }
 
+    const isDowngradedFallback = !discoveredEntry && entry.target.kind !== 'server';
+    if (isDowngradedFallback) {
+      downgradedFallbackShareRef.current = { entryId: entry.id, serverId: entry.serverId };
+    }
+
     void handleOpenSharedEntry(entry, {
       restoreFromHash: true,
       preferredSessionName: initial.sessionName,
+      isDowngradedFallback,
       source: 'startup',
     }).then((result) => {
       if (result === 'opened' || !urlSharedEntryId) {
@@ -5962,9 +6066,45 @@ function InternalMainApp() {
     selectedShareTarget,
     servers,
     serversLoaded,
+    sharedDiscoveryRetryPending,
     sharedEntries,
     sharedEntriesLoaded,
     sharedHashRestorePending,
+  ]);
+
+  useEffect(() => {
+    const downgraded = downgradedFallbackShareRef.current;
+    if (!downgraded) return;
+    if (!selectedShareTarget) return;
+    if (selectedShareTarget.kind !== 'main' || selectedServerId !== downgraded.serverId) {
+      downgradedFallbackShareRef.current = null;
+      return;
+    }
+    const upgraded = sharedEntries.find((candidate) => (
+      candidate.status === 'active'
+      && candidate.serverId === downgraded.serverId
+      && candidate.target.kind === 'server'
+      && candidate.id === downgraded.entryId
+      && !deniedSharedEntryIds.has(candidate.id)
+    )) ?? sharedEntries.find((candidate) => (
+      candidate.status === 'active'
+      && candidate.serverId === downgraded.serverId
+      && candidate.target.kind === 'server'
+      && !deniedSharedEntryIds.has(candidate.id)
+    )) ?? null;
+    if (!upgraded) return;
+    downgradedFallbackShareRef.current = null;
+    void handleOpenSharedEntry(upgraded, {
+      restoreFromHash: true,
+      preferredSessionName: activeSessionRef.current ?? initialHashStateRef.current.sessionName,
+      source: 'startup',
+    });
+  }, [
+    deniedSharedEntryIds,
+    handleOpenSharedEntry,
+    selectedServerId,
+    selectedShareTarget,
+    sharedEntries,
   ]);
 
   const closeSubSessionAndClearMaximized = useCallback((id: string) => {
@@ -6720,11 +6860,10 @@ function InternalMainApp() {
           // `probe_recovered` only proves the socket is alive; control-plane
           // state (session list, P2P discussions/status) may still be stale
           // because we silently missed live events during the half-open window.
-          // Run the light refresh below, but skip the heavy timeline
-          // `requestActiveTimelineRefresh({resetCooldowns:true})` reset — the
-          // active-refresh listener in `useTimeline` already bare-dispatches on
-          // probe_recovered (governed by the 15s success-only cooldown).
-          if (!isProbeRecovered) ws.requestSessionList();
+          // Always re-request the authoritative session list on recovery so
+          // shared participants/owners catch any missed session_list updates,
+          // while skipping heavy timeline/metadata fan-out handled elsewhere.
+          ws.requestSessionList();
           // Migrate to scoped p2p list. The active session is captured via the
           // ref to survive useEffect closure; the daemon will fail-closed and
           // return [] if it cannot resolve a project scope from this session,
@@ -8793,13 +8932,14 @@ function InternalMainApp() {
       // Not an owned server. The only way this may render is if the existing
       // share-open path authorizes it; the inventory is navigation UI, so a
       // hash-only target is reconstructed and left for the server to judge.
-      const entry = (route.sharedEntryId
+      const discovered = route.sharedEntryId
         ? sharedEntries.find((candidate) => (
             candidate.status === 'active'
             && candidate.id === route.sharedEntryId
             && candidate.serverId === route.serverId
           )) ?? null
-        : findSharedEntryForHash(sharedEntries, route.serverId, route.sessionName))
+        : findSharedEntryForHash(sharedEntries, route.serverId, route.sessionName);
+      const entry = discovered
         ?? sharedEntryFallbackFromHash(route.sharedEntryId, route.serverId, route.sessionName);
 
       if (!entry) {
@@ -8810,7 +8950,12 @@ function InternalMainApp() {
         return;
       }
 
-      void handleOpenSharedEntry(entry, { preferredSessionName: route.sessionName, source: 'external' })
+      const isDowngradedFallback = !discovered && entry.target.kind !== 'server';
+      if (isDowngradedFallback) {
+        downgradedFallbackShareRef.current = { entryId: entry.id, serverId: entry.serverId };
+      }
+
+      void handleOpenSharedEntry(entry, { preferredSessionName: route.sessionName, isDowngradedFallback, source: 'external' })
         .then((result) => {
           if (externalRouteInFlightKeyRef.current === routeKey) externalRouteInFlightKeyRef.current = null;
           if (generation !== externalRouteGenerationRef.current) return;

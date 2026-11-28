@@ -11,7 +11,7 @@
  * when the entry's own redact re-scopes it (`session_list` does; nothing else).
  */
 import { describe, expect, it } from 'vitest';
-import { filterShareDaemonMessage } from '../src/ws/share-policy.js';
+import { evaluateShareCommand, filterShareDaemonMessage } from '../src/ws/share-policy.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import type { EffectiveCoverage, ShareTarget } from '../../shared/tab-sharing.js';
 
@@ -233,5 +233,42 @@ describe('original audit-card timeline delivery', () => {
         event,
       });
     }
+  });
+});
+
+describe('get_sessions command and incognito exclusion in session_list', () => {
+  it.each([
+    ['server viewer', serverScoped, 'viewer'],
+    ['server participant', serverScoped, 'participant'],
+    ['tab viewer', tabScoped, 'viewer'],
+    ['tab participant', tabScoped, 'participant'],
+  ] as const)('allows get_sessions read for %s', (_label, target, role) => {
+    const decision = evaluateShareCommand({
+      msg: { type: 'get_sessions' },
+      state: socket(target, role),
+      now,
+      runtimeType: 'unknown',
+      activeDispatchId: null,
+    });
+    expect(decision).toEqual({ allowed: true });
+  });
+
+  it.each([
+    ['server viewer', serverScoped, 'viewer'],
+    ['server participant', serverScoped, 'participant'],
+  ] as const)('excludes incognito sessions from session_list even for %s', (_label, target, role) => {
+    const delivered = filterShareDaemonMessage(
+      {
+        type: 'session_list',
+        serverId,
+        sessions: [
+          { name: 'deck_proj_brain', state: 'idle' },
+          { name: 'deck_secret_brain', state: 'running', incognito: true },
+        ],
+      },
+      socket(target, role),
+    );
+    const names = (delivered?.sessions as Array<{ name: string }> | undefined)?.map((row) => row.name);
+    expect(names).toEqual(['deck_proj_brain']);
   });
 });
