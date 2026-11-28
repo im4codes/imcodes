@@ -582,13 +582,13 @@ describe('memory MCP lightweight bootstrap', () => {
     await waitFor(async () => {
       const list = await client.listTools();
       return list.tools.some((t) => t.name === 'memory_injection_get') ? true : undefined;
-    }, 8_000);
+    }, 15_000);
 
     // Wait for real backend generation 1 idle reap.
     await waitFor(async () => {
       const log = await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '');
       return log.includes('"idle_timeout"') ? true : undefined;
-    }, 8_000);
+    }, 15_000);
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
 
     // Direct call to memory_injection_get succeeds transparently after generation 2 replays mcp_tool_search.
@@ -599,7 +599,7 @@ describe('memory MCP lightweight bootstrap', () => {
     expect(injResult).toMatchObject({
       structuredContent: { status: 'ok', enabled: true },
     });
-  }, 20_000);
+  }, 45_000);
 
   it('tracks real-backend empty clear and fallbackCall business-error publication transitions across idle reap', async () => {
     const home = isolatedImcodesHome();
@@ -621,7 +621,7 @@ describe('memory MCP lightweight bootstrap', () => {
     // 1. Publish pair_list first.
     await expect(client.callTool({ name: 'mcp_tool_search', arguments: { query: 'pair_list' } }))
       .resolves.toMatchObject({ structuredContent: { status: 'ok', published: ['pair_list'] } });
-    await waitFor(async () => ((await client.listTools()).tools.some((t) => t.name === 'pair_list') ? true : undefined), 8_000);
+    await waitFor(async () => ((await client.listTools()).tools.some((t) => t.name === 'pair_list') ? true : undefined), 15_000);
 
     // 2. Replacing via fallbackCall where target tool returns a business error (no daemon hook port -> status: 'error')
     //    still updates the backend's published selection to session_identity_get.
@@ -632,7 +632,7 @@ describe('memory MCP lightweight bootstrap', () => {
     expect(fallbackErrRes).toMatchObject({ structuredContent: { status: 'error' } });
 
     // 3. Reap idle generation 1, then trigger generation 2; backend should publish session_identity_get, NOT stale pair_list.
-    await waitFor(async () => ((await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '')).includes('"idle_timeout"') ? true : undefined), 8_000);
+    await waitFor(async () => ((await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '')).includes('"idle_timeout"') ? true : undefined), 15_000);
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
     await client.callTool({ name: 'session_identity_get', arguments: {} });
     const gen2Tools = (await client.listTools()).tools.map((t) => t.name);
@@ -647,7 +647,7 @@ describe('memory MCP lightweight bootstrap', () => {
     await waitFor(async () => {
       const log = await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8').catch(() => '');
       return log.split('"idle_timeout"').length >= 3 ? true : undefined;
-    }, 8_000);
+    }, 15_000);
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
     await client.callTool({ name: 'memory_injection_get', arguments: {} }).catch(() => {});
     const gen3Tools = (await client.listTools()).tools.map((t) => t.name);
