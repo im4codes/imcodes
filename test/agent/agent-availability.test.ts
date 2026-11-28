@@ -700,4 +700,47 @@ describe('detectInstalledAgents()', () => {
     });
     expect(winNonElevated.opencode?.installed).toBe(true);
   });
+
+  it('discovers ~/.codex/bin/codex on Unix/Windows and ~/.local/bin/claude + %LOCALAPPDATA%\\agy\\bin\\agy.exe on Windows under sparse PATH', async () => {
+    tempRoot = await mkdtemp(path.join(tmpdir(), 'imcodes-codex-avail-'));
+    const codexBinDir = path.join(tempRoot, '.codex', 'bin');
+    await mkdir(codexBinDir, { recursive: true });
+    const codexBin = path.join(codexBinDir, 'codex');
+    await writeFile(codexBin, '#!/bin/sh\necho 0.172.0\n', 'utf8');
+    await chmod(codexBin, 0o755);
+
+    const unixDetected = await detectInstalledAgents({
+      deps: {
+        platform: 'linux',
+        homeDir: tempRoot,
+        imcodesHomeDir: path.join(tempRoot, '.imcodes'),
+        env: { PATH: '/usr/bin' },
+        isProviderConnected: () => false,
+      },
+    });
+    expect(unixDetected['codex-sdk']?.installed).toBe(true);
+    expect(unixDetected.codex?.installed).toBe(true);
+
+    const winHome = 'C:\\Users\\alice';
+    const winLocal = 'C:\\Users\\alice\\AppData\\Local';
+    const winExes = new Set([
+      'c:\\users\\alice\\.codex\\bin\\codex.exe',
+      'c:\\users\\alice\\.local\\bin\\claude.exe',
+      'c:\\users\\alice\\appdata\\local\\agy\\bin\\agy.exe',
+    ]);
+    const winDetected = await detectInstalledAgents({
+      deps: {
+        platform: 'win32',
+        homeDir: winHome,
+        imcodesHomeDir: 'C:\\Users\\alice\\.imcodes',
+        env: { PATH: 'C:\\Windows\\System32', LOCALAPPDATA: winLocal },
+        isExecutableFile: async (p) => winExes.has(p.toLowerCase()),
+        isProviderConnected: () => false,
+      },
+    });
+    expect(winDetected['codex-sdk']?.installed).toBe(true);
+    expect(winDetected.codex?.installed).toBe(true);
+    expect(winDetected['claude-code-sdk']?.installed).toBe(true);
+    expect(winDetected[AGY_SDK_PROVIDER_ID]?.installed).toBe(true);
+  });
 });

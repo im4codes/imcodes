@@ -81,7 +81,7 @@ import {
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, normalizeSupportedEffortLevels, type TransportEffortLevel } from '../../../shared/effort-levels.js';
-import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import { normalizeTransportCwd, resolveCodexPathForSdk, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 import { buildGeneratedImageReportingPrompt } from '../../../shared/transport-runtime-prompts.js';
 import { composeProviderSystemText, getProviderSystemTextParts, composeProviderSystemTextSpanned, getProviderSessionSystemTextSpanned } from '../provider-context-routing.js';
@@ -8529,7 +8529,8 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private resolveBinaryPath(config: ProviderConfig | null): string {
-    return typeof config?.binaryPath === 'string' && config.binaryPath.trim() ? config.binaryPath : CODEX_BIN;
+    const configured = typeof config?.binaryPath === 'string' && config.binaryPath.trim() ? config.binaryPath.trim() : CODEX_BIN;
+    return resolveCodexPathForSdk(configured);
   }
 
   private normalizeError(err: unknown, details?: unknown): ProviderError {

@@ -8,6 +8,7 @@ import {
   parseNpmCmdShim,
   resolveExecutableForSpawn,
   resolveClaudeCodePathForSdk,
+  resolveCodexPathForSdk,
   resolveAgyPathForSdk,
   resolveGrokPathForSdk,
   resolveCursorPathForSdk,
@@ -694,6 +695,39 @@ describe('resolveExecutableForSpawn', () => {
     } finally {
       Object.defineProperty(process, 'platform', { value: origPlatform });
       process.env.PATH = origPath;
+    }
+  });
+});
+
+describe('resolveCodexPathForSdk', () => {
+  it('resolves ~/.codex/bin/codex under sparse PATH while preserving PATH priority and explicit paths', () => {
+    const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'codex-path-test-'));
+    const origHome = process.env.HOME;
+    const origPath = process.env.PATH;
+    try {
+      const codexHomeBin = path.join(tmpDir, '.codex', 'bin');
+      const pathBin = path.join(tmpDir, 'path-bin');
+      fs.mkdirSync(codexHomeBin, { recursive: true });
+      fs.mkdirSync(pathBin, { recursive: true });
+      const homeCodex = path.join(codexHomeBin, 'codex');
+      fs.writeFileSync(homeCodex, '#!/bin/sh\necho 0.172.0\n', { mode: 0o755 });
+
+      process.env.HOME = tmpDir;
+      process.env.PATH = '/nonexistent-sparse-dir';
+      expect(resolveCodexPathForSdk('codex')).toBe(homeCodex);
+
+      // When PATH contains an executable `codex`, PATH takes precedence
+      const pathCodex = path.join(pathBin, 'codex');
+      fs.writeFileSync(pathCodex, '#!/bin/sh\necho 0.172.0\n', { mode: 0o755 });
+      process.env.PATH = pathBin;
+      expect(resolveCodexPathForSdk('codex')).toBe('codex');
+
+      // Explicit custom paths are preserved verbatim
+      expect(resolveCodexPathForSdk('/custom/bin/codex')).toBe('/custom/bin/codex');
+    } finally {
+      if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
+      if (origPath === undefined) delete process.env.PATH; else process.env.PATH = origPath;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

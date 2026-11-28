@@ -3261,4 +3261,149 @@ New-Item -ItemType Directory -Force -Path $b | Out-Null
       }
     },
   );
+
+  it('wires default agent CLIs (codex, claude, agy) into POSIX and Windows installer templates cleanly', () => {
+    for (const os of ['linux', 'darwin'] as const) {
+      const root = makeTempDir(`imcodes-default-clis-${os}-`);
+      const rtDir = createFakeRuntimeDir(root, os, '0.9.5');
+      mkdirSync(join(rtDir, 'package', 'dist', 'src', 'node'), { recursive: true });
+      writeFileSync(join(rtDir, 'package', 'dist', 'src', 'node', 'install-opencode-cli.js'), '// stub\n', 'utf8');
+      writeFileSync(join(rtDir, 'package', 'dist', 'src', 'node', 'install-default-agent-clis.js'), '// stub\n', 'utf8');
+
+      const runnerPath = join(root, `phase-a-${os}.sh`);
+      const scriptText = renderPosixPhaseARunnerScript({
+        platform: os,
+        version: '0.9.5',
+        cliWrapperContent: '#!/bin/sh\necho ok\n',
+      });
+      writeFileSync(runnerPath, scriptText, { mode: 0o755 });
+
+      expect(scriptText).toContain('install_default_agent_clis_best_effort()');
+      expect(scriptText).toContain('install-default-agent-clis.js" --home "$EFF_HOME" --skip-opencode');
+      expect(scriptText).toContain('IMCODES_SKIP_AGENT_CLIS');
+
+      const traceFile = join(root, 'default-clis-trace.log');
+      const defaultHook = join(root, 'default-clis-hook.sh');
+      writeFileSync(
+        defaultHook,
+        `#!/bin/sh
+echo "DEFAULT_CLIS_HOOK args=$*" >> "${traceFile}"
+home_arg=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --home) home_arg="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$home_arg/.codex/bin" "$home_arg/.local/bin"
+printf '#!/bin/sh\necho 0.172.0\n' > "$home_arg/.codex/bin/codex"
+printf '#!/bin/sh\necho 2.1.332\n' > "$home_arg/.local/bin/claude"
+chmod 755 "$home_arg/.codex/bin/codex" "$home_arg/.local/bin/claude"
+`,
+        { mode: 0o755 },
+      );
+
+      // Hook runs non-blockingly and populates .codex/bin/codex + .local/bin/claude even when IMCODES_SKIP_OPENCODE=1
+      const isoRun = join(root, 'iso-run');
+      const homeRun = join(root, 'home-run');
+      mkdirSync(join(isoRun, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoRun, 'daemon-runtime', 'releases', '0.9.5')]);
+      const outRun = execFileSync(
+        runnerPath,
+        ['--isolated-root', isoRun, '--home', homeRun, '--confirm-fda-switch', '--no-service-control'],
+        {
+          env: {
+            ...process.env,
+            IMCODES_SKIP_OPENCODE: '1',
+            IMCODES_DEFAULT_CLIS_INSTALL_HOOK: defaultHook,
+          },
+          encoding: 'utf8',
+        },
+      );
+      expect(outRun).toContain('INSTALL_OK');
+      expect(existsSync(join(homeRun, '.opencode', 'bin', 'opencode'))).toBe(false);
+      expect(existsSync(join(homeRun, '.codex', 'bin', 'codex'))).toBe(true);
+      expect(existsSync(join(homeRun, '.local', 'bin', 'claude'))).toBe(true);
+      expect(readFileSync(traceFile, 'utf8')).toContain('--skip-opencode');
+
+      // IMCODES_SKIP_AGENT_CLIS=1 skips all CLI installs cleanly
+      const isoSkipAll = join(root, 'iso-skip-all');
+      const homeSkipAll = join(root, 'home-skip-all');
+      mkdirSync(join(isoSkipAll, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoSkipAll, 'daemon-runtime', 'releases', '0.9.5')]);
+      execFileSync(
+        runnerPath,
+        ['--isolated-root', isoSkipAll, '--home', homeSkipAll, '--confirm-fda-switch', '--no-service-control'],
+        {
+          env: {
+            ...process.env,
+            IMCODES_SKIP_AGENT_CLIS: '1',
+            IMCODES_DEFAULT_CLIS_INSTALL_HOOK: defaultHook,
+          },
+          encoding: 'utf8',
+        },
+      );
+      expect(existsSync(join(homeSkipAll, '.codex'))).toBe(false);
+      expect(existsSync(join(homeSkipAll, '.local', 'bin', 'claude'))).toBe(false);
+      expect(existsSync(join(homeSkipAll, '.local', 'bin', 'agy'))).toBe(false);
+
+      // Compiled install-default-agent-clis.js wires --home "$EFF_HOME" --skip-opencode --registry ... --no-fallback --isolated-test
+      const isoNode = join(root, 'iso-default-node');
+      const homeNode = join(root, 'home-default-node');
+      mkdirSync(join(isoNode, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoNode, 'daemon-runtime', 'releases', '0.9.5')]);
+      const nodeTrace = join(root, `default-node-${os}.log`);
+      writeFileSync(
+        join(isoNode, 'daemon-runtime', 'releases', '0.9.5', 'bin', 'node'),
+        `#!/bin/sh\necho "NODE_CALL args=$*" >> "${nodeTrace}"\nexit 0\n`,
+        { mode: 0o755 },
+      );
+      const outNode = execFileSync(
+        runnerPath,
+        ['--isolated-root', isoNode, '--home', homeNode, '--confirm-fda-switch', '--no-service-control'],
+        {
+          env: {
+            ...process.env,
+            IMCODES_SKIP_OPENCODE: '1',
+            IMCODES_DEFAULT_CLIS_INSTALL_HOOK: '',
+            IMCODES_NPM_REGISTRY: 'http://127.0.0.1:9',
+            IMCODES_AGY_MANIFEST_BASE_URL: 'http://127.0.0.1:9',
+          },
+          encoding: 'utf8',
+        },
+      );
+      expect(outNode).toContain('INSTALL_OK');
+      const nodeTraceText = readFileSync(nodeTrace, 'utf8');
+      expect(nodeTraceText).toContain('install-default-agent-clis.js');
+      expect(nodeTraceText).toContain('--skip-opencode');
+      expect(nodeTraceText).toContain('--isolated-test');
+      expect(nodeTraceText).toContain('--no-fallback');
+
+      // Symlinked .codex target refuses installation cleanly without failing installer
+      const isoSym = join(root, 'iso-sym');
+      const homeSym = join(root, 'home-sym');
+      mkdirSync(join(isoSym, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+      mkdirSync(homeSym, { recursive: true });
+      const decoy = join(root, 'decoy');
+      mkdirSync(decoy, { recursive: true });
+      symlinkSync(decoy, join(homeSym, '.codex'));
+      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoSym, 'daemon-runtime', 'releases', '0.9.5')]);
+      const symRes = spawnSync(
+        runnerPath,
+        ['--isolated-root', isoSym, '--home', homeSym, '--confirm-fda-switch', '--no-service-control'],
+        { env: { ...process.env, IMCODES_DEFAULT_CLIS_INSTALL_HOOK: defaultHook }, encoding: 'utf8' },
+      );
+      expect(symRes.status).toBe(0);
+      expect(symRes.stderr).toContain('refusing symlinked agent CLI target path');
+      expect(existsSync(join(decoy, 'bin', 'codex'))).toBe(false);
+    }
+
+    const ps1 = renderWindowsPhaseAInstallerPs1({ version: '2026.11.7132-dev.7022', cliWrapperContent: '@echo off\r\n' });
+    expect(ps1).toContain('function Install-DefaultAgentClisBestEffort');
+    expect(ps1).toContain('install-default-agent-clis.js');
+    expect(ps1).toContain('DefaultAgentClisInstallHook');
+    expect(ps1).toContain('IMCODES_SKIP_AGENT_CLIS');
+    expect(ps1).toContain("$codexBinDir = Join-Path $codexBaseDir 'bin'");
+    expect(ps1).toContain("$localBinDir = Join-Path $localBaseDir 'bin'");
+  });
 });

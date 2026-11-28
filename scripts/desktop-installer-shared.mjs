@@ -849,42 +849,106 @@ run_as_target_unix_user() {
   return 2
 }
 
-install_opencode_cli_best_effort() {
-  case "\${IMCODES_SKIP_OPENCODE:-}" in
+install_default_agent_clis_best_effort() {
+  case "\${IMCODES_SKIP_AGENT_CLIS:-}" in
     1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss])
       return 0
       ;;
   esac
-  if [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ] && [ -z "\${IMCODES_OPENCODE_REGISTRY:-}" ]; then
+  if [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_DEFAULT_CLIS_INSTALL_HOOK:-}" ] && [ -z "\${IMCODES_NPM_REGISTRY:-}" ] && [ -z "\${IMCODES_CODEX_REGISTRY:-}" ] && [ -z "\${IMCODES_CLAUDE_REGISTRY:-}" ] && [ -z "\${IMCODES_AGY_MANIFEST_BASE_URL:-}" ] && [ -z "\${IMCODES_OPENCODE_REGISTRY:-}" ]; then
     return 0
   fi
-  if [ -L "$EFF_HOME/.opencode" ] || [ -L "$EFF_HOME/.opencode/bin" ] || [ -L "$EFF_HOME/.opencode/bin/opencode" ]; then
-    echo "WARNING: refusing symlinked OpenCode target path in $EFF_HOME; skipping OpenCode CLI install (non-blocking)" >&2
+  if [ -L "$EFF_HOME/.codex" ] || [ -L "$EFF_HOME/.codex/bin" ] || [ -L "$EFF_HOME/.codex/bin/codex" ] \
+    || [ -L "$EFF_HOME/.local" ] || [ -L "$EFF_HOME/.local/bin" ] || [ -L "$EFF_HOME/.local/bin/claude" ] || [ -L "$EFF_HOME/.local/bin/agy" ]; then
+    echo "WARNING: refusing symlinked agent CLI target path in $EFF_HOME; skipping default agent CLI install (non-blocking)" >&2
     return 0
   fi
   if [ -n "$ISOLATED_ROOT" ]; then
+    if ! (
+      assert_safe_isolated_target "$EFF_HOME/.codex" entry
+      assert_safe_isolated_target "$EFF_HOME/.codex/bin" entry
+      assert_safe_isolated_target "$EFF_HOME/.codex/bin/codex" entry
+      assert_safe_isolated_target "$EFF_HOME/.local" entry
+      assert_safe_isolated_target "$EFF_HOME/.local/bin" entry
+      assert_safe_isolated_target "$EFF_HOME/.local/bin/claude" entry
+      assert_safe_isolated_target "$EFF_HOME/.local/bin/agy" entry
+    ); then
+      echo "WARNING: unsafe agent CLI target path in isolated mode; skipping default agent CLI install (non-blocking)" >&2
+      return 0
+    fi
+  fi
+  if [ -n "\${IMCODES_DEFAULT_CLIS_INSTALL_HOOK:-}" ]; then
+    if ! run_as_target_unix_user "$IMCODES_DEFAULT_CLIS_INSTALL_HOOK" --home "$EFF_HOME" --skip-opencode; then
+      echo "WARNING: default agent CLI install hook failed (non-blocking)" >&2
+    fi
+  elif [ -x "$CURRENT_LINK/bin/node" ] && [ -f "$CURRENT_LINK/package/dist/src/node/install-default-agent-clis.js" ]; then
+    set -- "$CURRENT_LINK/bin/node" "$CURRENT_LINK/package/dist/src/node/install-default-agent-clis.js" --home "$EFF_HOME" --skip-opencode
+    if [ -n "$ISOLATED_ROOT" ]; then
+      iso_reg="\${IMCODES_NPM_REGISTRY:-\${IMCODES_CODEX_REGISTRY:-\${IMCODES_CLAUDE_REGISTRY:-\${IMCODES_OPENCODE_REGISTRY:-}}}}"
+      if [ -n "$iso_reg" ]; then
+        set -- "$@" --registry "$iso_reg"
+      fi
+      if [ -n "\${IMCODES_AGY_MANIFEST_BASE_URL:-}" ]; then
+        set -- "$@" --agy-manifest-base-url "\${IMCODES_AGY_MANIFEST_BASE_URL}"
+      fi
+      set -- "$@" --no-fallback --isolated-test
+    fi
+    if ! run_as_target_unix_user "$@"; then
+      echo "WARNING: default agent CLI install failed (non-blocking)" >&2
+    fi
+  fi
+  return 0
+}
+
+install_opencode_cli_best_effort() {
+  case "\${IMCODES_SKIP_AGENT_CLIS:-}" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss])
+      return 0
+      ;;
+  esac
+  oc_skip=0
+  case "\${IMCODES_SKIP_OPENCODE:-}" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss])
+      oc_skip=1
+      ;;
+  esac
+  if [ "$oc_skip" -eq 0 ]; then
+    if [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ] && [ -z "\${IMCODES_OPENCODE_REGISTRY:-}" ]; then
+      oc_skip=1
+    fi
+  fi
+  if [ "$oc_skip" -eq 0 ]; then
+    if [ -L "$EFF_HOME/.opencode" ] || [ -L "$EFF_HOME/.opencode/bin" ] || [ -L "$EFF_HOME/.opencode/bin/opencode" ]; then
+      echo "WARNING: refusing symlinked OpenCode target path in $EFF_HOME; skipping OpenCode CLI install (non-blocking)" >&2
+      oc_skip=1
+    fi
+  fi
+  if [ "$oc_skip" -eq 0 ] && [ -n "$ISOLATED_ROOT" ]; then
     if ! (
       assert_safe_isolated_target "$EFF_HOME/.opencode" entry
       assert_safe_isolated_target "$EFF_HOME/.opencode/bin" entry
       assert_safe_isolated_target "$EFF_HOME/.opencode/bin/opencode" entry
     ); then
       echo "WARNING: unsafe OpenCode target path in isolated mode; skipping OpenCode CLI install (non-blocking)" >&2
-      return 0
+      oc_skip=1
     fi
   fi
-  if [ -n "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ]; then
-    if ! run_as_target_unix_user "$IMCODES_OPENCODE_INSTALL_HOOK" --home "$EFF_HOME"; then
-      echo "WARNING: OpenCode CLI install hook failed (non-blocking)" >&2
-    fi
-  elif [ -x "$CURRENT_LINK/bin/node" ] && [ -f "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" ]; then
-    set -- "$CURRENT_LINK/bin/node" "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" --home "$EFF_HOME" --strict
-    if [ -n "$ISOLATED_ROOT" ]; then
-      set -- "$@" --registry "\${IMCODES_OPENCODE_REGISTRY:-}" --no-fallback --isolated-test
-    fi
-    if ! run_as_target_unix_user "$@"; then
-      echo "WARNING: OpenCode CLI install failed (non-blocking)" >&2
+  if [ "$oc_skip" -eq 0 ]; then
+    if [ -n "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ]; then
+      if ! run_as_target_unix_user "$IMCODES_OPENCODE_INSTALL_HOOK" --home "$EFF_HOME"; then
+        echo "WARNING: OpenCode CLI install hook failed (non-blocking)" >&2
+      fi
+    elif [ -x "$CURRENT_LINK/bin/node" ] && [ -f "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" ]; then
+      set -- "$CURRENT_LINK/bin/node" "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" --home "$EFF_HOME" --strict
+      if [ -n "$ISOLATED_ROOT" ]; then
+        set -- "$@" --registry "\${IMCODES_OPENCODE_REGISTRY:-}" --no-fallback --isolated-test
+      fi
+      if ! run_as_target_unix_user "$@"; then
+        echo "WARNING: OpenCode CLI install failed (non-blocking)" >&2
+      fi
     fi
   fi
+  install_default_agent_clis_best_effort
   return 0
 }
 

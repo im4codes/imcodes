@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { accessSync, constants as fsConstants, existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import type { ChildProcess } from 'node:child_process';
 
@@ -86,6 +87,7 @@ function getWindowsClaudeInstallCandidates(name: string): string[] {
   const fileNames = hasExt ? [basename] : [basename, `${basename}.exe`, `${basename}.cmd`, `${basename}.bat`];
   const dirs = uniqueNonEmpty([
     ...getWindowsGlobalCliDirs(),
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.local', 'bin') : undefined,
     process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Claude') : undefined,
     process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Claude Code') : undefined,
     process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'Claude') : undefined,
@@ -370,6 +372,7 @@ function getWindowsAgyInstallCandidates(name: string): string[] {
   const fileNames = hasExt ? [basename] : [basename, `${basename}.exe`, `${basename}.cmd`, `${basename}.bat`];
   const dirs = uniqueNonEmpty([
     ...getWindowsGlobalCliDirs(),
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'agy', 'bin') : undefined,
     process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'antigravity', 'bin') : undefined,
     process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'antigravity-cli', 'bin') : undefined,
     process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'bin') : undefined,
@@ -417,6 +420,43 @@ export function resolveAgyPathForSdk(name = 'agy'): string {
     if (existsSync(candidate)) return candidate;
   }
   return name;
+}
+
+export function resolveCodexPathForSdk(name = 'codex'): string {
+  const trimmed = name.trim();
+  if (!trimmed || trimmed !== 'codex') {
+    return name;
+  }
+  if (process.platform === 'win32') {
+    const resolvedOnPath = resolveBinaryOnWindows(trimmed);
+    if (resolvedOnPath !== trimmed) {
+      if (/\.(cmd|bat)$/i.test(resolvedOnPath)) {
+        return parseNpmCmdShim(resolvedOnPath) ?? resolvedOnPath;
+      }
+      return resolvedOnPath;
+    }
+    const home = process.env.USERPROFILE || process.env.HOME || homedir();
+    if (home) {
+      const homeBin = path.win32.join(home, '.codex', 'bin', 'codex.exe');
+      if (isBundledClaudeBinaryFileSync(homeBin, 'win32')) return homeBin;
+    }
+    return trimmed;
+  }
+  const pathDirs = (process.env.PATH ?? '').split(':').map((d) => d.trim()).filter(Boolean);
+  for (const dir of pathDirs) {
+    const candidate = path.join(dir, 'codex');
+    if (isBundledClaudeBinaryFileSync(candidate, process.platform)) {
+      return trimmed;
+    }
+  }
+  const home = process.env.HOME || homedir();
+  if (home) {
+    const homeBin = path.join(home, '.codex', 'bin', 'codex');
+    if (isBundledClaudeBinaryFileSync(homeBin, process.platform)) {
+      return homeBin;
+    }
+  }
+  return trimmed;
 }
 
 function getUnixMuseCodeInstallCandidates(): string[] {

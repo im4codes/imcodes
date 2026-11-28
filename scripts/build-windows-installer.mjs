@@ -54,6 +54,7 @@ export function renderWindowsPhaseAInstallerPs1({ version, cliWrapperContent, mi
   [string]$SchtasksExe = '',
   [string]$ProcessProbeScript = '',
   [string]$OpenCodeInstallHook = '',
+  [string]$DefaultAgentClisInstallHook = '',
   [string]$LogPath = '',
   [int]$TempMaxAgeHours = 24,
   [switch]$ForceTakeover,
@@ -1604,45 +1605,49 @@ function Format-OpenCodeLogDetail([string]$RawOutput) {
   return $clean
 }
 
-function Install-OpenCodeCliBestEffort {
+function Install-DefaultAgentClisBestEffort {
   try {
-    if ($SkipOpenCode) {
-      Write-InstallerLog 'Skipping OpenCode CLI install (-SkipOpenCode)'
+    $skipAllRaw = [string]$env:IMCODES_SKIP_AGENT_CLIS
+    if ($skipAllRaw -and ($skipAllRaw.Trim() -imatch '^(1|true|yes)$')) {
+      Write-InstallerLog 'Skipping default agent CLI installs (IMCODES_SKIP_AGENT_CLIS)'
       return
     }
-    $skipRaw = [string]$env:IMCODES_SKIP_OPENCODE
-    if ($skipRaw -and ($skipRaw.Trim() -imatch '^(1|true|yes)$')) {
-      Write-InstallerLog 'Skipping OpenCode CLI install (IMCODES_SKIP_OPENCODE)'
+    $hookPath = if (-not [string]::IsNullOrWhiteSpace($DefaultAgentClisInstallHook)) { $DefaultAgentClisInstallHook } else { [string]$env:IMCODES_DEFAULT_CLIS_INSTALL_HOOK }
+    $hasIsoOverride = (-not [string]::IsNullOrWhiteSpace($hookPath)) -or (-not [string]::IsNullOrWhiteSpace([string]$env:IMCODES_NPM_REGISTRY)) -or (-not [string]::IsNullOrWhiteSpace([string]$env:IMCODES_CODEX_REGISTRY)) -or (-not [string]::IsNullOrWhiteSpace([string]$env:IMCODES_CLAUDE_REGISTRY)) -or (-not [string]::IsNullOrWhiteSpace([string]$env:IMCODES_AGY_MANIFEST_BASE_URL))
+    if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot) -and -not $hasIsoOverride) {
+      Write-InstallerLog 'Skipping default agent CLI installs in isolated test mode'
       return
     }
-    $hookPath = if (-not [string]::IsNullOrWhiteSpace($OpenCodeInstallHook)) { $OpenCodeInstallHook } else { [string]$env:IMCODES_OPENCODE_INSTALL_HOOK }
-    if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot) -and [string]::IsNullOrWhiteSpace($hookPath) -and [string]::IsNullOrWhiteSpace($env:IMCODES_OPENCODE_REGISTRY)) {
-      Write-InstallerLog 'Skipping OpenCode CLI install in isolated test mode'
-      return
-    }
-    $ocBaseDir = Join-Path $HomeDir '.opencode'
-    $ocBinDir = Join-Path $ocBaseDir 'bin'
-    $ocExePath = Join-Path $ocBinDir 'opencode.exe'
-    foreach ($ocCheckPath in @($ocBaseDir, $ocBinDir, $ocExePath)) {
-      if (Test-PathHasReparsePoint $ocCheckPath) {
-        Write-InstallerLog ("WARNING: refusing symlink/reparse OpenCode target $ocCheckPath; skipping OpenCode CLI install (non-blocking)")
+    $codexBaseDir = Join-Path $HomeDir '.codex'
+    $codexBinDir = Join-Path $codexBaseDir 'bin'
+    $codexExePath = Join-Path $codexBinDir 'codex.exe'
+    $localBaseDir = Join-Path $HomeDir '.local'
+    $localBinDir = Join-Path $localBaseDir 'bin'
+    $claudeExePath = Join-Path $localBinDir 'claude.exe'
+    $agyExePath = Join-Path $localBinDir 'agy.exe'
+    foreach ($agentCheckPath in @($codexBaseDir, $codexBinDir, $codexExePath, $localBaseDir, $localBinDir, $claudeExePath, $agyExePath)) {
+      if (Test-PathHasReparsePoint $agentCheckPath) {
+        Write-InstallerLog ("WARNING: refusing symlink/reparse agent CLI target $agentCheckPath; skipping default agent CLI install (non-blocking)")
         return
       }
     }
     if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
-      Assert-SafeTargetPath $ocBaseDir $RealProfile -EntryMode
-      Assert-SafeTargetPath $ocBinDir $RealProfile -EntryMode
-      Assert-SafeTargetPath $ocExePath $RealProfile -EntryMode
+      Assert-SafeTargetPath $codexBaseDir $RealProfile -EntryMode
+      Assert-SafeTargetPath $codexBinDir $RealProfile -EntryMode
+      Assert-SafeTargetPath $codexExePath $RealProfile -EntryMode
+      Assert-SafeTargetPath $localBaseDir $RealProfile -EntryMode
+      Assert-SafeTargetPath $localBinDir $RealProfile -EntryMode
+      Assert-SafeTargetPath $claudeExePath $RealProfile -EntryMode
+      Assert-SafeTargetPath $agyExePath $RealProfile -EntryMode
     }
-
     if (Test-IsElevatedOrSystemProcess) {
-      Write-InstallerLog 'WARNING: unable to confirm non-elevated target user context; skipping OpenCode CLI install (non-blocking)'
+      Write-InstallerLog 'WARNING: unable to confirm non-elevated target user context; skipping default agent CLI install (non-blocking)'
       return
     }
 
     $runtimeBinBase = if (Test-Path -LiteralPath (Join-Path $ReleaseDir 'node.exe') -PathType Leaf) { $ReleaseDir } else { $CurrentDir }
     $nodeExe = Join-Path $runtimeBinBase 'node.exe'
-    $ocInstallerJs = Join-Path $runtimeBinBase 'package\\dist\\src\\node\\install-opencode-cli.js'
+    $agentClisJs = Join-Path $runtimeBinBase 'package\\dist\\src\\node\\install-default-agent-clis.js'
 
     $execExe = ''
     $execArgs = @()
@@ -1652,11 +1657,21 @@ function Install-OpenCodeCliBestEffort {
       $isHookRun = $true
       $execExe = $hookPath
       $execArgs = @('-HomeDir', $HomeDir)
-    } elseif ((Test-Path -LiteralPath $nodeExe -PathType Leaf) -and (Test-Path -LiteralPath $ocInstallerJs -PathType Leaf)) {
+    } elseif ((Test-Path -LiteralPath $nodeExe -PathType Leaf) -and (Test-Path -LiteralPath $agentClisJs -PathType Leaf)) {
       $execExe = $nodeExe
-      $execArgs = @($ocInstallerJs, '--home', $HomeDir, '--strict')
+      $execArgs = @($agentClisJs, '--home', $HomeDir, '--skip-opencode')
       if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
-        $execArgs += @('--registry', [string]$env:IMCODES_OPENCODE_REGISTRY, '--no-fallback', '--isolated-test')
+        $isoReg = [string]$env:IMCODES_NPM_REGISTRY
+        if ([string]::IsNullOrWhiteSpace($isoReg)) { $isoReg = [string]$env:IMCODES_CODEX_REGISTRY }
+        if ([string]::IsNullOrWhiteSpace($isoReg)) { $isoReg = [string]$env:IMCODES_CLAUDE_REGISTRY }
+        if (-not [string]::IsNullOrWhiteSpace($isoReg)) {
+          $execArgs += @('--registry', $isoReg)
+        }
+        $isoAgyBase = [string]$env:IMCODES_AGY_MANIFEST_BASE_URL
+        if (-not [string]::IsNullOrWhiteSpace($isoAgyBase)) {
+          $execArgs += @('--agy-manifest-base-url', $isoAgyBase)
+        }
+        $execArgs += @('--no-fallback', '--isolated-test')
       }
     } else {
       return
@@ -1673,18 +1688,124 @@ function Install-OpenCodeCliBestEffort {
 
     $detail = Format-OpenCodeLogDetail $rawOut
     if ($exitCode -ne 0) {
-      $label = if ($isHookRun) { 'OpenCode CLI install hook' } else { 'OpenCode CLI install' }
+      $label = if ($isHookRun) { 'Default agent CLI install hook' } else { 'Default agent CLI install' }
       $suffix = if (-not [string]::IsNullOrWhiteSpace($detail)) { ': ' + $detail } else { '' }
       Write-InstallerLog ("WARNING: $label failed exit=$exitCode (non-blocking)" + $suffix)
     } elseif (-not [string]::IsNullOrWhiteSpace($detail)) {
-      Write-InstallerLog ("OpenCode CLI: " + $detail)
+      Write-InstallerLog ("Default agent CLIs: " + $detail)
     }
 
     if ($AllowSystemRoot -and [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
-      if (Test-Path -LiteralPath $ocExePath -PathType Leaf) {
-        try { Add-UserPathEntry $ocBinDir } catch { Write-InstallerLog ("WARNING: Failed to add $ocBinDir to User PATH: " + $_.Exception.Message) }
+      if (Test-Path -LiteralPath $codexExePath -PathType Leaf) {
+        try { Add-UserPathEntry $codexBinDir } catch { Write-InstallerLog ("WARNING: Failed to add $codexBinDir to User PATH: " + $_.Exception.Message) }
+      }
+      if ((Test-Path -LiteralPath $claudeExePath -PathType Leaf) -or (Test-Path -LiteralPath $agyExePath -PathType Leaf)) {
+        try { Add-UserPathEntry $localBinDir } catch { Write-InstallerLog ("WARNING: Failed to add $localBinDir to User PATH: " + $_.Exception.Message) }
       }
     }
+  } catch {
+    Write-InstallerLog ("WARNING: Default agent CLI install failed (non-blocking): " + $_.Exception.Message)
+  }
+}
+
+function Install-OpenCodeCliBestEffort {
+  try {
+    if ($SkipOpenCode) {
+      Write-InstallerLog 'Skipping OpenCode CLI install (-SkipOpenCode)'
+      return
+    }
+    $skipAllRaw = [string]$env:IMCODES_SKIP_AGENT_CLIS
+    if ($skipAllRaw -and ($skipAllRaw.Trim() -imatch '^(1|true|yes)$')) {
+      Write-InstallerLog 'Skipping OpenCode CLI install (IMCODES_SKIP_AGENT_CLIS)'
+      return
+    }
+    $runOpenCode = $true
+    $skipRaw = [string]$env:IMCODES_SKIP_OPENCODE
+    if ($skipRaw -and ($skipRaw.Trim() -imatch '^(1|true|yes)$')) {
+      Write-InstallerLog 'Skipping OpenCode CLI install (IMCODES_SKIP_OPENCODE)'
+      $runOpenCode = $false
+    }
+    $hookPath = if (-not [string]::IsNullOrWhiteSpace($OpenCodeInstallHook)) { $OpenCodeInstallHook } else { [string]$env:IMCODES_OPENCODE_INSTALL_HOOK }
+    if ($runOpenCode -and (-not [string]::IsNullOrWhiteSpace($IsolatedRoot)) -and [string]::IsNullOrWhiteSpace($hookPath) -and [string]::IsNullOrWhiteSpace($env:IMCODES_OPENCODE_REGISTRY)) {
+      Write-InstallerLog 'Skipping OpenCode CLI install in isolated test mode'
+      $runOpenCode = $false
+    }
+    if ($runOpenCode) {
+      $ocBaseDir = Join-Path $HomeDir '.opencode'
+      $ocBinDir = Join-Path $ocBaseDir 'bin'
+      $ocExePath = Join-Path $ocBinDir 'opencode.exe'
+      foreach ($ocCheckPath in @($ocBaseDir, $ocBinDir, $ocExePath)) {
+        if (Test-PathHasReparsePoint $ocCheckPath) {
+          Write-InstallerLog ("WARNING: refusing symlink/reparse OpenCode target $ocCheckPath; skipping OpenCode CLI install (non-blocking)")
+          $runOpenCode = $false
+          break
+        }
+      }
+    }
+    if ($runOpenCode) {
+      if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
+        Assert-SafeTargetPath $ocBaseDir $RealProfile -EntryMode
+        Assert-SafeTargetPath $ocBinDir $RealProfile -EntryMode
+        Assert-SafeTargetPath $ocExePath $RealProfile -EntryMode
+      }
+
+      if (Test-IsElevatedOrSystemProcess) {
+        Write-InstallerLog 'WARNING: unable to confirm non-elevated target user context; skipping OpenCode CLI install (non-blocking)'
+        $runOpenCode = $false
+      }
+    }
+
+    $runtimeBinBase = if (Test-Path -LiteralPath (Join-Path $ReleaseDir 'node.exe') -PathType Leaf) { $ReleaseDir } else { $CurrentDir }
+    $nodeExe = Join-Path $runtimeBinBase 'node.exe'
+    $ocInstallerJs = Join-Path $runtimeBinBase 'package\\dist\\src\\node\\install-opencode-cli.js'
+
+    $execExe = ''
+    $execArgs = @()
+    $isHookRun = $false
+
+    if ($runOpenCode) {
+      if (-not [string]::IsNullOrWhiteSpace($hookPath) -and (Test-Path -LiteralPath $hookPath -PathType Leaf)) {
+        $isHookRun = $true
+        $execExe = $hookPath
+        $execArgs = @('-HomeDir', $HomeDir)
+      } elseif ((Test-Path -LiteralPath $nodeExe -PathType Leaf) -and (Test-Path -LiteralPath $ocInstallerJs -PathType Leaf)) {
+        $execExe = $nodeExe
+        $execArgs = @($ocInstallerJs, '--home', $HomeDir, '--strict')
+        if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
+          $execArgs += @('--registry', [string]$env:IMCODES_OPENCODE_REGISTRY, '--no-fallback', '--isolated-test')
+        }
+      } else {
+        $runOpenCode = $false
+      }
+    }
+
+    if ($runOpenCode) {
+      $prevEap = $ErrorActionPreference
+      $ErrorActionPreference = 'Continue'
+      try {
+        $rawOut = (& $execExe @execArgs 2>&1 | Out-String)
+        $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+      } finally {
+        $ErrorActionPreference = $prevEap
+      }
+
+      $detail = Format-OpenCodeLogDetail $rawOut
+      if ($exitCode -ne 0) {
+        $label = if ($isHookRun) { 'OpenCode CLI install hook' } else { 'OpenCode CLI install' }
+        $suffix = if (-not [string]::IsNullOrWhiteSpace($detail)) { ': ' + $detail } else { '' }
+        Write-InstallerLog ("WARNING: $label failed exit=$exitCode (non-blocking)" + $suffix)
+      } elseif (-not [string]::IsNullOrWhiteSpace($detail)) {
+        Write-InstallerLog ("OpenCode CLI: " + $detail)
+      }
+
+      if ($AllowSystemRoot -and [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
+        if (Test-Path -LiteralPath $ocExePath -PathType Leaf) {
+          try { Add-UserPathEntry $ocBinDir } catch { Write-InstallerLog ("WARNING: Failed to add $ocBinDir to User PATH: " + $_.Exception.Message) }
+        }
+      }
+    }
+
+    Install-DefaultAgentClisBestEffort
   } catch {
     Write-InstallerLog ("WARNING: OpenCode CLI install failed (non-blocking): " + $_.Exception.Message)
   }

@@ -216,6 +216,7 @@ function getWindowsClaudeDirs(deps: AgentAvailabilityProbeDeps): string[] {
   const p = pathModuleFor(deps.platform);
   return uniqueNonEmpty([
     ...getWindowsGlobalCliDirs(deps),
+    deps.homeDir ? p.join(deps.homeDir, '.local', 'bin') : undefined,
     deps.env.LOCALAPPDATA ? p.join(deps.env.LOCALAPPDATA, 'Programs', 'Claude') : undefined,
     deps.env.LOCALAPPDATA ? p.join(deps.env.LOCALAPPDATA, 'Programs', 'Claude Code') : undefined,
     deps.env.ProgramFiles ? p.join(deps.env.ProgramFiles, 'Claude') : undefined,
@@ -281,6 +282,7 @@ async function probeAgy(deps: AgentAvailabilityProbeDeps): Promise<AgentAvailabi
   const platformDirs = deps.platform === 'win32'
     ? uniqueNonEmpty([
         ...getWindowsGlobalCliDirs(deps),
+        deps.env.LOCALAPPDATA ? p.join(deps.env.LOCALAPPDATA, 'agy', 'bin') : undefined,
         deps.env.LOCALAPPDATA ? p.join(deps.env.LOCALAPPDATA, 'Programs', 'antigravity', 'bin') : undefined,
         deps.env.LOCALAPPDATA ? p.join(deps.env.LOCALAPPDATA, 'antigravity-cli', 'bin') : undefined,
         deps.env.LOCALAPPDATA ? p.join(deps.env.LOCALAPPDATA, 'bin') : undefined,
@@ -557,9 +559,25 @@ async function probeAgentType(agentType: SessionAgentType, deps: AgentAvailabili
     case 'claude-code':
       return probeClaudeCli(deps);
     case 'codex-sdk':
-      return probeBinary(deps, 'codex', { includeWindowsGlobalNpmDirs: true }, 'codex CLI not found');
+      return probeBinary(
+        deps,
+        'codex',
+        {
+          trailingDirs: deps.homeDir ? [pathModuleFor(deps.platform).join(deps.homeDir, '.codex', 'bin')] : [],
+          includeWindowsGlobalNpmDirs: true,
+        },
+        'codex CLI not found',
+      );
     case 'codex':
-      return probeBinary(deps, 'codex', { includeWindowsGlobalNpmDirs: false }, 'codex CLI not found');
+      return probeBinary(
+        deps,
+        'codex',
+        {
+          trailingDirs: deps.homeDir ? [pathModuleFor(deps.platform).join(deps.homeDir, '.codex', 'bin')] : [],
+          includeWindowsGlobalNpmDirs: false,
+        },
+        'codex CLI not found',
+      );
     case 'qoder-sdk':
       return probeQoderSdk(deps);
     case 'copilot-sdk':
