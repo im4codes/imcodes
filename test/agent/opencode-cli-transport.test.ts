@@ -864,6 +864,76 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     expect(permissionRepliesV1[0]).toMatchObject({ path: { requestID: 'perm-sync-v1' }, body: { reply: 'reject' } });
     await provider.disconnect();
 
+    // Counterexample: trailing shadowing rules (`task:explore ask` or `*:explore ask`) must NOT hit fast-path []
+    const seenUpdatesV1: Array<Record<string, unknown>> = [];
+    let restoredPermRules: Array<{ permission: string; pattern: string; action: 'allow' | 'deny' | 'ask' }> = [];
+    openCodeV1RuntimeHooks.start = vi.fn(async (opts) => {
+      const q = createAsyncQueue<Record<string, any>>();
+      opts.signal.addEventListener('abort', q.close, { once: true });
+      return {
+        client: {
+          session: {
+            create: vi.fn(async () => ({ data: { id: 'ses-v1-shadow' } })),
+            get: vi.fn(async () => ({ data: { id: 'ses-v1-shadow', permission: restoredPermRules } })),
+            update: vi.fn(async (arg: Record<string, unknown>) => {
+              seenUpdatesV1.push(arg);
+              const patched = ((arg.body as any)?.permission ?? []) as typeof restoredPermRules;
+              restoredPermRules = [...restoredPermRules, ...patched];
+              return { data: { id: 'ses-v1-shadow', permission: restoredPermRules } };
+            }),
+            list: vi.fn(async () => ({ data: [] })),
+            message: vi.fn(async () => ({ data: null })),
+            messages: vi.fn(async () => ({ data: [] })),
+            prompt: vi.fn(async () => ({ data: {} })),
+            promptAsync: vi.fn(async () => ({ data: undefined })),
+            abort: vi.fn(async () => ({ data: true })),
+          },
+          provider: { list: vi.fn(async () => ({ data: { connected: [], all: [], default: {} } })) },
+          event: { subscribe: vi.fn(async () => ({ stream: q.stream })) },
+          postSessionIdPermissionsPermissionId: vi.fn(async () => ({ data: true })),
+        } as any,
+        server: { url: 'http://127.0.0.1:42007', close: vi.fn(async () => { q.close(); }) },
+      };
+    });
+    const pShadow = new OpenCodeSdkProvider();
+    pShadow.setNativeAgentFenceResolver(() => true);
+    pShadow.setToolExecutionGuard(async () => ({ allow: false }));
+    await pShadow.connect({ binaryPath: v1Bin } as any);
+
+    // Case 1: `task:explore ask` after `task:* deny`
+    restoredPermRules = [
+      { permission: '*', pattern: '*', action: 'ask' },
+      { permission: 'task', pattern: '*', action: 'deny' },
+      { permission: 'task', pattern: 'explore', action: 'ask' },
+      { permission: 'subagent', pattern: '*', action: 'deny' },
+    ];
+    await pShadow.createSession({ sessionKey: 'r-shadow-1', cwd: root, skipCreate: true, resumeId: 'ses-v1-shadow' });
+    expect(seenUpdatesV1).toHaveLength(1);
+    expect((seenUpdatesV1[0] as any).body.permission).toEqual([
+      { permission: 'task', pattern: '*', action: 'deny' },
+      { permission: 'subagent', pattern: '*', action: 'deny' },
+    ]);
+    // Repeated restore with trailing native deny suffix MUST be idempotent (no duplicate append)
+    await pShadow.createSession({ sessionKey: 'r-shadow-2', cwd: root, skipCreate: true, resumeId: 'ses-v1-shadow' });
+    expect(seenUpdatesV1).toHaveLength(1);
+
+    // Case 2: wildcard-permission pattern-specific `*:explore ask` after `task:* deny` + `subagent:* deny`
+    restoredPermRules = [
+      { permission: '*', pattern: '*', action: 'ask' },
+      { permission: 'task', pattern: '*', action: 'deny' },
+      { permission: 'subagent', pattern: '*', action: 'deny' },
+      { permission: '*', pattern: 'explore', action: 'ask' },
+    ];
+    await pShadow.createSession({ sessionKey: 'r-shadow-3', cwd: root, skipCreate: true, resumeId: 'ses-v1-shadow' });
+    expect(seenUpdatesV1).toHaveLength(2);
+    expect((seenUpdatesV1[1] as any).body.permission).toEqual([
+      { permission: 'task', pattern: '*', action: 'deny' },
+      { permission: 'subagent', pattern: '*', action: 'deny' },
+    ]);
+    await pShadow.createSession({ sessionKey: 'r-shadow-4', cwd: root, skipCreate: true, resumeId: 'ses-v1-shadow' });
+    expect(seenUpdatesV1).toHaveLength(2);
+    await pShadow.disconnect();
+
     // Same synchronous guard throw counterexample on v2 path (opencode-sdk.ts)
     const v2Queue = createAsyncQueue<Record<string, any>>();
     const v2PermReplies: any[] = [];
@@ -1052,6 +1122,102 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     }
     expect(promptAsyncCalls).toEqual(['client-3']);
     await pInflight.disconnect();
+
+    // Counterexample B2/B3/B4: hung `session.abort` HTTP promise never deadlocks handoff or endSession,
+    // aborts its real request AbortSignal, reclaims exclusive child, and rejects safely when child cannot stop
+    const hungAbortSignals: AbortSignal[] = [];
+    const closedServers: string[] = [];
+    const hungPromptCalls: string[] = [];
+    let hangAbortMode = true;
+    let closeRejectMode = false;
+    let hungSeq = 0;
+    openCodeV1RuntimeHooks.start = vi.fn(async (opts) => {
+      const idx = ++hungSeq;
+      const tag = `hung-${idx}`;
+      const q = createAsyncQueue<Record<string, any>>();
+      opts.signal.addEventListener('abort', q.close, { once: true });
+      return {
+        client: {
+          session: {
+            create: vi.fn(async () => ({ data: { id: 'shared-hung-abort-ses' } })),
+            get: vi.fn(async () => ({ data: { id: 'shared-hung-abort-ses' } })),
+            list: vi.fn(async () => ({ data: [] })),
+            message: vi.fn(async () => ({ data: null })),
+            messages: vi.fn(async () => ({ data: [] })),
+            prompt: vi.fn(async () => ({ data: {} })),
+            promptAsync: vi.fn(async () => {
+              hungPromptCalls.push(tag);
+              return { data: undefined };
+            }),
+            abort: vi.fn(async (_opts: any, reqOpts?: { signal?: AbortSignal }) => {
+              if (reqOpts?.signal) hungAbortSignals.push(reqOpts.signal);
+              if (hangAbortMode) {
+                return await new Promise<never>(() => {});
+              }
+              return { data: true };
+            }),
+          },
+          provider: { list: vi.fn(async () => ({ data: { connected: [], all: [], default: {} } })) },
+          event: { subscribe: vi.fn(async () => ({ stream: q.stream })) },
+          postSessionIdPermissionsPermissionId: vi.fn(async () => ({ data: true })),
+        } as any,
+        server: {
+          url: `http://127.0.0.1:${42100 + idx}`,
+          close: vi.fn(async () => {
+            closedServers.push(tag);
+            if (closeRejectMode && idx === 3) {
+              throw new Error('child close failed');
+            }
+            q.close();
+          }),
+        },
+      };
+    });
+    const pHungAbort = new OpenCodeSdkProvider();
+    await pHungAbort.connect({ binaryPath: v1Bin } as any);
+    const hungA = await pHungAbort.createSession({ sessionKey: 'v1-hung-a', cwd: root });
+    await pHungAbort.send(hungA, 'busy turn A');
+    const hungTakeoverT0 = Date.now();
+    const hungB = await pHungAbort.createSession({
+      sessionKey: 'v1-hung-b',
+      cwd: root,
+      skipCreate: true,
+      resumeId: 'shared-hung-abort-ses',
+    });
+    expect(Date.now() - hungTakeoverT0).toBeLessThan(300);
+    expect(hungB).toBe('v1-hung-b');
+    expect(hungAbortSignals.length).toBeGreaterThanOrEqual(1);
+    expect(hungAbortSignals[0]!.aborted).toBe(true);
+    // Exclusive old route `hung-2` was stopped, closed, and reclaimed before publishing `hungB`
+    expect(closedServers).toContain('hung-2');
+    await expect(pHungAbort.send(hungA, 'after reclaim')).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND });
+    await pHungAbort.send(hungB, 'turn B succeeds');
+    expect(hungPromptCalls).toEqual(['hung-2', 'hung-3']);
+
+    // B4: When abort times out AND old child cannot be confirmed stopped, takeover returns retryable error,
+    // closes newly started child (`hung-4`), and keeps clear ownership on `hungB` (`hung-3`)!
+    closeRejectMode = true;
+    await expect(pHungAbort.createSession({
+      sessionKey: 'v1-unsafe-c',
+      cwd: root,
+      skipCreate: true,
+      resumeId: 'shared-hung-abort-ses',
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONNECTION_LOST, recoverable: true });
+    expect(closedServers).toContain('hung-4');
+    // `hungB` remains unambiguous busy owner (`already busy`), NOT lost!
+    await expect(pHungAbort.send(hungB, 'still busy owner')).rejects.toMatchObject({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: expect.stringContaining('already busy'),
+    });
+
+    // B3: `endSession` on busy route with hung `session.abort` finishes promptly AND still runs child close!
+    closeRejectMode = false;
+    const endT0 = Date.now();
+    await pHungAbort.endSession(hungB);
+    expect(Date.now() - endT0).toBeLessThan(300);
+    expect(closedServers.filter((s) => s === 'hung-3').length).toBeGreaterThanOrEqual(2);
+    hangAbortMode = false;
+    await pHungAbort.disconnect();
 
     // Counterexample C: v2 split-host sourceClient verification blocks late clientA frames after clientB owns resumeId
     let v2ClientSeq = 0;
@@ -1382,6 +1548,14 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
             res.end('{}');
             return;
           }
+          if (pathname === '/api/experimental/session/import' && req.method === 'POST') {
+            const parsed = JSON.parse(body || '{}');
+            const importedId = parsed?.info?.id ?? 'ses-imported-v1';
+            appendFileSync(logFile, JSON.stringify({ op: 'import', id: importedId }) + '\\n');
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ data: { id: importedId, location: parsed?.location } }));
+            return;
+          }
           if (pathname.startsWith('/api/experimental/mcp/')) {
             res.statusCode = 204;
             res.end();
@@ -1443,6 +1617,85 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     expect(v2UpgradeOwners.find((x) => x.sid === 'v2-fresh-new')?.owner).toBe('v2-cli');
     expect(v2GetCalls.length + v2PromptCalls.length).toBe(0);
     expect(readFileSync(v2F6Log, 'utf8')).toContain('"op":"create"');
+
+    // (e) v1-cli owner + V2_CLI mode + missing v1 DB source MUST fail BEFORE touching colliding v2 item or updating owner!
+    writeFileSync(v2F6Log, '', 'utf8');
+    const ownerCountBeforeG = v2UpgradeOwners.length;
+    await expect(pV2Upgrade.createSession({
+      sessionKey: 'v2-missing-v1-src',
+      cwd: root,
+      skipCreate: true,
+      resumeId: oldSessionId,
+      openCodeStorageOwner: 'v1-cli',
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
+    expect(readFileSync(v2F6Log, 'utf8')).toBe('');
+    expect(v2UpgradeOwners.length).toBe(ownerCountBeforeG);
+
+    // (f) v1-cli owner + V2_CLI mode + confirmed v1 DB source migrates via import (even with colliding v2 GET) and THEN sets owner='v2-cli'
+    const v1DataDir = join(xdgData, 'opencode');
+    mkdirSync(v1DataDir, { recursive: true });
+    const v1SourceDb = new DatabaseSync(join(v1DataDir, 'opencode.db'));
+    v1SourceDb.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER);
+      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+      CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+    `);
+    v1SourceDb.prepare('INSERT INTO session (id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run(oldSessionId, root, 'v1-owned', 1000, 2000);
+    v1SourceDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run('v1-m1', oldSessionId, 1100, 1100, JSON.stringify({ role: 'user', agent: 'build' }));
+    v1SourceDb.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run('v1-p1', 'v1-m1', oldSessionId, 1100, 1100, JSON.stringify({ type: 'text', text: 'from v1' }));
+    v1SourceDb.close();
+    const migRoute = await pV2Upgrade.createSession({
+      sessionKey: 'v2-confirmed-v1-mig',
+      cwd: root,
+      skipCreate: true,
+      resumeId: oldSessionId,
+      openCodeStorageOwner: 'v1-cli',
+    });
+    expect(migRoute).toBe('v2-confirmed-v1-mig');
+    expect(readFileSync(v2F6Log, 'utf8')).toContain(`"op":"import","id":"${oldSessionId}"`);
+    expect(v2UpgradeOwners.at(-1)?.owner).toBe('v2-cli');
+
+    // (g) v2-cli owner + EMBEDDED mode + colliding embedded copy MUST reject without DB write or owner overwrite,
+    //     and unavailable v1-cli owner + EMBEDDED mode also rejects; new session fallback still works!
+    rmSync(join(v1DataDir, 'opencode.db'), { force: true });
+    const embSnapDb = new DatabaseSync(embeddedDbFile);
+    const snapBefore = embSnapDb.prepare('SELECT time_updated FROM session_v2 WHERE id = ?').get(oldSessionId) as { time_updated: number };
+    const cntBefore = Number((embSnapDb.prepare('SELECT COUNT(*) AS cnt FROM session_message WHERE session_id = ?').get(oldSessionId) as any).cnt);
+    embSnapDb.close();
+
+    const pEmbOnly = new OpenCodeSdkProvider();
+    const embOnlyOwners: Array<{ sid: string; owner: string | undefined }> = [];
+    pEmbOnly.onSessionInfo((sid, info) => embOnlyOwners.push({ sid, owner: info.openCodeStorageOwner }));
+    await pEmbOnly.connect({ embedded: true, databasePath: embeddedDbFile, cwd: root } as any);
+
+    await expect(pEmbOnly.createSession({
+      sessionKey: 'emb-rejects-v2',
+      cwd: root,
+      skipCreate: true,
+      resumeId: oldSessionId,
+      openCodeStorageOwner: 'v2-cli',
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
+    await expect(pEmbOnly.createSession({
+      sessionKey: 'emb-rejects-missing-v1',
+      cwd: root,
+      skipCreate: true,
+      resumeId: oldSessionId,
+      openCodeStorageOwner: 'v1-cli',
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
+    expect(embOnlyOwners).toEqual([]);
+
+    const embAfterDb = new DatabaseSync(embeddedDbFile);
+    const snapAfter = embAfterDb.prepare('SELECT time_updated FROM session_v2 WHERE id = ?').get(oldSessionId) as { time_updated: number };
+    const cntAfter = Number((embAfterDb.prepare('SELECT COUNT(*) AS cnt FROM session_message WHERE session_id = ?').get(oldSessionId) as any).cnt);
+    embAfterDb.close();
+    expect(snapAfter.time_updated).toBe(snapBefore.time_updated);
+    expect(cntAfter).toBe(cntBefore);
+
+    const embFreshRoute = await pEmbOnly.createSession({ sessionKey: 'emb-fresh-ok', cwd: root });
+    expect(embFreshRoute).toBe('emb-fresh-ok');
+    expect(embOnlyOwners.find((x) => x.sid === 'emb-fresh-ok')?.owner).toBe('embedded');
+    await pEmbOnly.disconnect();
+
     delete process.env.V2_F6_LOG;
     await pV2Upgrade.disconnect();
     await pUpgraded.disconnect();

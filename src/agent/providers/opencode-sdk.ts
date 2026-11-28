@@ -99,6 +99,8 @@ const CONTEXT_WINDOW_REFRESH_MIN_INTERVAL_MS = 3_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
 const PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS = [0, 100, 250, 500, 1_000] as const;
 const MISSING_FINAL_RECOVERY_TIMEOUT_MS = 15_000;
+const INTERRUPT_RPC_TIMEOUT_MS = 150;
+const CHILD_CLOSE_TIMEOUT_MS = 2_000;
 const MISSING_FINAL_RECOVERY_RECHECK_DELAYS_MS = [250, 1_000] as const;
 const RETRY_TERMINAL_RECONCILE_DELAYS_MS = [0, 25, 75, 200, 500] as const;
 const IMCODES_SYSTEM_INSTRUCTION_KEY = 'imcodes-system';
@@ -1001,8 +1003,8 @@ interface OpenCodeSessionState {
 }
 
 class OpenCodeRequestTimeoutError extends Error {
-  constructor(operation: string) {
-    super(`OpenCode ${operation} timed out after ${MISSING_FINAL_RECOVERY_TIMEOUT_MS}ms`);
+  constructor(operation: string, timeoutMs = MISSING_FINAL_RECOVERY_TIMEOUT_MS) {
+    super(`OpenCode ${operation} timed out after ${timeoutMs}ms`);
     this.name = 'OpenCodeRequestTimeoutError';
   }
 }
@@ -1019,6 +1021,7 @@ function withOpenCodeRequestTimeout<T>(
   promise: Promise<T>,
   operation: string,
   abortController?: AbortController,
+  timeoutMs = MISSING_FINAL_RECOVERY_TIMEOUT_MS,
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let settled = false;
@@ -1039,8 +1042,8 @@ function withOpenCodeRequestTimeout<T>(
       settled = true;
       abortController?.signal.removeEventListener('abort', onAbort);
       abortController?.abort();
-      reject(new OpenCodeRequestTimeoutError(operation));
-    }, MISSING_FINAL_RECOVERY_TIMEOUT_MS);
+      reject(new OpenCodeRequestTimeoutError(operation, timeoutMs));
+    }, timeoutMs);
     timer.unref?.();
 
     if (abortController) {
@@ -1541,11 +1544,14 @@ function resolveOpenCodeEmbeddedDbCandidates(databasePath: string | undefined): 
   return candidates.filter((candidate) => existsSync(candidate));
 }
 
-function resolveOpenCodeLegacyDbCandidates(databasePath: string | undefined): string[] {
-  const candidates: string[] = [];
+function resolveOpenCodeV1DbCandidates(): string[] {
   const xdgDataHome = safeString(process.env.XDG_DATA_HOME) ?? join(homedir(), '.local', 'share');
   const defaultLegacyDb = resolve(xdgDataHome, 'opencode', 'opencode.db');
-  candidates.push(defaultLegacyDb);
+  return existsSync(defaultLegacyDb) ? [defaultLegacyDb] : [];
+}
+
+function resolveOpenCodeLegacyDbCandidates(databasePath: string | undefined): string[] {
+  const candidates: string[] = [...resolveOpenCodeV1DbCandidates()];
   for (const embeddedCandidate of resolveOpenCodeEmbeddedDbCandidates(databasePath)) {
     if (!candidates.includes(embeddedCandidate)) candidates.push(embeddedCandidate);
   }
@@ -2021,23 +2027,27 @@ async function readLegacySessionImportPayload(
   directoryHint: string | undefined,
   preferredOwner?: SessionConfig['openCodeStorageOwner'],
 ): Promise<{ payload: Record<string, unknown>; sourceDbPath: string } | null> {
-  const rawCandidates = resolveOpenCodeLegacyDbCandidates(databasePath);
-  if (rawCandidates.length === 0) return null;
-
-  let orderedCandidates = rawCandidates;
+  let orderedCandidates: string[];
   if (preferredOwner === 'embedded') {
-    const embeddedFirst = resolveOpenCodeEmbeddedDbCandidates(databasePath);
-    orderedCandidates = [...embeddedFirst, ...rawCandidates.filter((c) => !embeddedFirst.includes(c))];
+    orderedCandidates = resolveOpenCodeEmbeddedDbCandidates(databasePath);
   } else if (preferredOwner === 'v1-cli') {
-    orderedCandidates = rawCandidates;
-  } else if (rawCandidates.length > 1) {
-    const snapshots = await inspectOpenCodeSqliteSessions(sessionId, rawCandidates);
-    if (snapshots.length > 1) {
-      snapshots.sort((a, b) => compareOpenCodeSessionSnapshots(b, a));
-      const ranked = snapshots.map((s) => s.dbPath);
-      orderedCandidates = [...ranked, ...rawCandidates.filter((c) => !ranked.includes(c))];
+    orderedCandidates = resolveOpenCodeV1DbCandidates();
+  } else {
+    const rawCandidates = resolveOpenCodeLegacyDbCandidates(databasePath);
+    if (rawCandidates.length > 1) {
+      const snapshots = await inspectOpenCodeSqliteSessions(sessionId, rawCandidates);
+      if (snapshots.length > 1) {
+        snapshots.sort((a, b) => compareOpenCodeSessionSnapshots(b, a));
+        const ranked = snapshots.map((s) => s.dbPath);
+        orderedCandidates = [...ranked, ...rawCandidates.filter((c) => !ranked.includes(c))];
+      } else {
+        orderedCandidates = rawCandidates;
+      }
+    } else {
+      orderedCandidates = rawCandidates;
     }
   }
+  if (orderedCandidates.length === 0) return null;
   const candidates = orderedCandidates;
 
   let DatabaseSyncCtor: typeof import('node:sqlite')['DatabaseSync'];
@@ -2588,32 +2598,63 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       await this.embeddedFallbackDelegate?.endSession(routeId).catch(() => {});
     }
 
-    // Deterministic storage-owner routing BEFORE touching v1Delegate or v2-cli session runtimes:
-    // known embedded-owned sessions stay on embedded DB even if v2-cli / v1-cli holds a stale copy of the same ID.
-    if (
-      config.skipCreate
-      && resumeId
-      && this.transportResolution?.mode !== OPENCODE_TRANSPORT_MODES.EMBEDDED
-      && (this.embeddedFallbackRoutes.has(routeId) || config.openCodeStorageOwner === 'embedded')
-    ) {
-      const fallback = await this.ensureEmbeddedFallbackDelegate();
-      const restoredRoute = await fallback.createSession(config);
-      this.embeddedFallbackRoutes.add(restoredRoute);
-      return restoredRoute;
+    const activeMode = this.transportResolution?.mode ?? OPENCODE_TRANSPORT_MODES.EMBEDDED;
+    const recordedOwner = config.openCodeStorageOwner;
+    let confirmedV1Migration: { payload: Record<string, unknown>; sourceDbPath: string } | null = null;
+
+    // Centralized storage-owner validation for resumes BEFORE touching any incompatible runtime/store:
+    // - compatible stores read directly from that store
+    // - embedded owner under CLI mode reuses embeddedFallbackDelegate
+    // - v1-cli owner under v2-cli/embedded verifies the v1 source DB first and only updates owner after confirmed migration
+    // - v2-cli owner under v1-cli or embedded fails explicitly with CLI recovery guidance without touching embedded DB
+    if (config.skipCreate && resumeId) {
+      if (
+        activeMode !== OPENCODE_TRANSPORT_MODES.EMBEDDED
+        && (this.embeddedFallbackRoutes.has(routeId) || recordedOwner === 'embedded')
+      ) {
+        const fallback = await this.ensureEmbeddedFallbackDelegate();
+        const restoredRoute = await fallback.createSession(config);
+        this.embeddedFallbackRoutes.add(restoredRoute);
+        return restoredRoute;
+      }
+
+      if (recordedOwner === 'v2-cli' && activeMode !== OPENCODE_TRANSPORT_MODES.V2_CLI) {
+        const recoveryHint = activeMode === OPENCODE_TRANSPORT_MODES.V1_CLI
+          ? 'OpenCode session belongs to v2 CLI storage and cannot be restored under OpenCode v1 CLI. Upgrade OpenCode CLI to v2 (`opencode upgrade --major`, or set `OPENCODE_BIN` / `binaryPath`) to resume this session.'
+          : 'OpenCode session belongs to v2 CLI storage and cannot be restored in embedded OpenCode mode. Install or restore OpenCode CLI >= 2.0 (or configure `OPENCODE_BIN` / `binaryPath`) to resume this session.';
+        throw providerError(PROVIDER_ERROR_CODES.CONFIG_ERROR, `${recoveryHint} (session: ${resumeId})`, false);
+      }
+
+      if (recordedOwner === 'v1-cli' && activeMode !== OPENCODE_TRANSPORT_MODES.V1_CLI) {
+        try {
+          confirmedV1Migration = await readLegacySessionImportPayload(
+            resumeId,
+            this.databasePath,
+            config.cwd,
+            'v1-cli',
+          );
+        } catch (migrationReadErr) {
+          throw providerError(
+            PROVIDER_ERROR_CODES.CONFIG_ERROR,
+            `OpenCode session "${resumeId}" belongs to v1 CLI storage and failed migration preflight: ${errorMessage(migrationReadErr)}. Install or restore OpenCode v1 CLI (or configure \`OPENCODE_BIN\` / \`binaryPath\`, or export via \`opencode export ${resumeId}\`) to resume this session.`,
+            false,
+          );
+        }
+        if (!confirmedV1Migration) {
+          throw providerError(
+            PROVIDER_ERROR_CODES.CONFIG_ERROR,
+            `OpenCode session "${resumeId}" belongs to v1 CLI storage, and its v1 source database could not be verified for migration. Install or restore OpenCode v1 CLI (or configure \`OPENCODE_BIN\` / \`binaryPath\`, or export via \`opencode export ${resumeId}\`) to resume this session.`,
+            false,
+          );
+        }
+      }
     }
 
     if (this.v1Delegate) {
       if (config.skipCreate && resumeId) {
-        if (config.openCodeStorageOwner === 'v2-cli') {
-          throw providerError(
-            PROVIDER_ERROR_CODES.CONFIG_ERROR,
-            `OpenCode session "${resumeId}" belongs to v2 CLI storage and cannot be restored under OpenCode v1 CLI. Upgrade OpenCode CLI to v2 (\`opencode upgrade --major\`).`,
-            false,
-          );
-        }
         const resolvedOwner = await this.resolveV1VsEmbeddedOwner(resumeId, {
           cwd: config.cwd,
-          openCodeStorageOwner: config.openCodeStorageOwner,
+          openCodeStorageOwner: recordedOwner,
         });
         if (resolvedOwner === 'missing') {
           throw providerError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `OpenCode session was not found during restore: ${resumeId}`, false);
@@ -2648,22 +2689,30 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     let info: OpenCodeSessionInfoLike;
     if (config.skipCreate && resumeId) {
       try {
-        info = await this.ensureSessionPresentOrImportLegacy(
-          sessionRuntime.client,
-          resumeId,
-          cwd,
-          config.openCodeStorageOwner,
-        );
-        if (
-          this.transportResolution?.mode === OPENCODE_TRANSPORT_MODES.V2_CLI
-          && !config.openCodeStorageOwner
-          && await this.isEmbeddedCopyMoreCompleteThanV2(sessionRuntime.client, info, resumeId)
-        ) {
-          await this.closeStartedRuntime(sessionRuntime);
-          const fallback = await this.ensureEmbeddedFallbackDelegate();
-          const restoredRoute = await fallback.createSession(config);
-          this.embeddedFallbackRoutes.add(restoredRoute);
-          return restoredRoute;
+        if (confirmedV1Migration) {
+          info = await this.importConfirmedV1SessionIntoRuntime(
+            sessionRuntime.client,
+            resumeId,
+            confirmedV1Migration,
+          );
+        } else if (recordedOwner === 'v2-cli' || recordedOwner === 'embedded') {
+          info = await sessionRuntime.client.sessions.get({ sessionID: resumeId });
+        } else {
+          info = await this.ensureSessionPresentOrImportLegacy(
+            sessionRuntime.client,
+            resumeId,
+            cwd,
+          );
+          if (
+            activeMode === OPENCODE_TRANSPORT_MODES.V2_CLI
+            && await this.isEmbeddedCopyMoreCompleteThanV2(sessionRuntime.client, info, resumeId)
+          ) {
+            await this.closeStartedRuntime(sessionRuntime);
+            const fallback = await this.ensureEmbeddedFallbackDelegate();
+            const restoredRoute = await fallback.createSession(config);
+            this.embeddedFallbackRoutes.add(restoredRoute);
+            return restoredRoute;
+          }
         }
         if ((nativeAgentsFenced || guardTools) && typeof sessionRuntime.client.session?.update === 'function') {
           await sessionRuntime.client.session.update({
@@ -2766,17 +2815,32 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         previousOwner.syncedMcpSignature = null;
         previousOwner.pendingAdmissionAbort?.abort();
         if (previousOwner.busy || preLockOwnerWasBusy) {
-          previousOwner.cancelled = true;
-          previousOwner.generation += 1;
-          await previousOwner.client.session.interrupt({ sessionID: providerSessionId }).catch(() => {});
-          this.failOnce(
-            previousOwner,
-            providerError(
-              PROVIDER_ERROR_CODES.CANCELLED,
-              `OpenCode route "${previousOwner.routeId}" turn cancelled because ownership transferred to "${routeId}"`,
-              true,
-            ),
-          );
+          const interruptResult = await this.interruptRouteWithDeadline(previousOwner, 'ownership transfer interrupt');
+          if (interruptResult.ok) {
+            previousOwner.cancelled = true;
+            previousOwner.generation += 1;
+            this.failOnce(
+              previousOwner,
+              providerError(
+                PROVIDER_ERROR_CODES.CANCELLED,
+                `OpenCode route "${previousOwner.routeId}" turn cancelled because ownership transferred to "${routeId}"`,
+                true,
+              ),
+            );
+          } else {
+            const reclaimed = await this.stopAndReclaimExclusiveRoute(
+              previousOwner,
+              sessionRuntime.server,
+              sessionRuntime.client,
+            );
+            if (!reclaimed) {
+              throw providerError(
+                PROVIDER_ERROR_CODES.CONNECTION_LOST,
+                `Timed out interrupting active OpenCode route "${previousOwner.routeId}" before ownership transfer`,
+                true,
+              );
+            }
+          }
         }
       }
       // Suspend previous owner executability before binding replacement MCP so no suspended send can clobber MCP during handoff.
@@ -2803,11 +2867,137 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         await this.syncSessionModelAndEffort(state).catch(() => {});
       }
     }).catch(async (error) => {
+      if (this.sessions.get(routeId) === state) this.sessions.delete(routeId);
       await this.closeSessionState(state, !this.providerToRoute.has(providerSessionId));
       throw error;
     });
     this.emitSessionInfo(state);
     return routeId;
+  }
+
+  private isExclusiveRuntimeChild(
+    targetState: OpenCodeSessionState,
+    incomingServer?: OpenCodeServerLike,
+    incomingClient?: OpenCodeClientLike,
+  ): boolean {
+    if (targetState.server === this.server) return false;
+    if (incomingServer && targetState.server === incomingServer) return false;
+    if (incomingClient && targetState.client === incomingClient) return false;
+    const checkUrlSharing = this.transportResolution?.mode === OPENCODE_TRANSPORT_MODES.V2_CLI;
+    if (checkUrlSharing && incomingServer && targetState.server.url === incomingServer.url) {
+      return false;
+    }
+    for (const other of this.sessions.values()) {
+      if (other === targetState) continue;
+      if (
+        other.server === targetState.server
+        || other.client === targetState.client
+        || (checkUrlSharing && other.server.url === targetState.server.url)
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async interruptRouteWithDeadline(
+    state: OpenCodeSessionState,
+    operation: string,
+  ): Promise<{ ok: true } | { ok: false; timedOut: boolean; error: unknown }> {
+    const controller = new AbortController();
+    try {
+      await withOpenCodeRequestTimeout(
+        invokeWithOptionalSignal(
+          state.client.session.interrupt.bind(state.client.session),
+          { sessionID: state.providerSessionId },
+          controller.signal,
+        ),
+        operation,
+        controller,
+        INTERRUPT_RPC_TIMEOUT_MS,
+      );
+      return { ok: true };
+    } catch (error) {
+      if (isNotFoundError(error)) return { ok: true };
+      const timedOut = error instanceof OpenCodeRequestTimeoutError || (error instanceof Error && error.name === 'AbortError');
+      return { ok: false, timedOut, error };
+    }
+  }
+
+  private async stopAndReclaimExclusiveRoute(
+    previousOwner: OpenCodeSessionState,
+    incomingServer: OpenCodeServerLike,
+    incomingClient: OpenCodeClientLike,
+  ): Promise<boolean> {
+    if (!this.isExclusiveRuntimeChild(previousOwner, incomingServer, incomingClient)) {
+      return false;
+    }
+    const prevCancelled = previousOwner.cancelled;
+    previousOwner.cancelled = true;
+    previousOwner.generation += 1;
+    try {
+      await withOpenCodeRequestTimeout(
+        this.closeSessionState(previousOwner, false, false),
+        'exclusive route close',
+        undefined,
+        CHILD_CLOSE_TIMEOUT_MS,
+      );
+    } catch (error) {
+      previousOwner.cancelled = prevCancelled;
+      logger.warn(
+        { provider: this.id, routeId: previousOwner.routeId, providerSessionId: previousOwner.providerSessionId, error },
+        'Failed to stop exclusive OpenCode child after interrupt timeout',
+      );
+      return false;
+    }
+    if (this.sessions.get(previousOwner.routeId) === previousOwner) {
+      this.sessions.delete(previousOwner.routeId);
+    }
+    const remaining = (this.providerRouteOrder.get(previousOwner.providerSessionId) ?? [])
+      .filter((id) => id !== previousOwner.routeId && this.sessions.get(id)?.providerSessionId === previousOwner.providerSessionId);
+    if (remaining.length > 0) this.providerRouteOrder.set(previousOwner.providerSessionId, remaining);
+    else this.providerRouteOrder.delete(previousOwner.providerSessionId);
+    if (this.providerToRoute.get(previousOwner.providerSessionId) === previousOwner.routeId) {
+      this.providerToRoute.delete(previousOwner.providerSessionId);
+    }
+    this.failOnce(
+      previousOwner,
+      providerError(
+        PROVIDER_ERROR_CODES.CANCELLED,
+        `OpenCode route "${previousOwner.routeId}" stopped and reclaimed after interrupt timeout`,
+        true,
+      ),
+    );
+    return true;
+  }
+
+  private async importConfirmedV1SessionIntoRuntime(
+    client: OpenCodeClientLike,
+    sessionId: string,
+    legacy: { payload: Record<string, unknown>; sourceDbPath: string },
+  ): Promise<OpenCodeSessionInfoLike> {
+    if (typeof client.experimental?.session?.import !== 'function') {
+      throw providerError(
+        PROVIDER_ERROR_CODES.CONFIG_ERROR,
+        `OpenCode session "${sessionId}" belongs to v1 CLI storage and cannot be migrated automatically in this runtime. Install or restore OpenCode v1 CLI (or configure \`OPENCODE_BIN\` / \`binaryPath\`, or export via \`opencode export ${sessionId}\`) to resume this session.`,
+        false,
+      );
+    }
+    try {
+      const imported = await client.experimental.session.import(legacy.payload);
+      logger.info(
+        { provider: this.id, sessionId, sourceDbPath: legacy.sourceDbPath },
+        'Migrated v1-cli OpenCode session from confirmed v1 source before owner update',
+      );
+      if (safeString(imported?.id) === sessionId) return imported;
+      return await client.sessions.get({ sessionID: sessionId });
+    } catch (importErr) {
+      throw providerError(
+        PROVIDER_ERROR_CODES.CONFIG_ERROR,
+        `Failed to migrate v1-cli OpenCode session "${sessionId}" from ${legacy.sourceDbPath}: ${errorMessage(importErr)}. Install or restore OpenCode v1 CLI (or configure \`OPENCODE_BIN\` / \`binaryPath\`, or export via \`opencode export ${sessionId}\`) without modifying target storage.`,
+        false,
+      );
+    }
   }
 
   private async closeOrDetachRoute(sessionId: string, interruptBusyOwner: boolean): Promise<void> {
@@ -2835,7 +3025,13 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
 
       removedSoleProviderRoute = wasOwner && remainingRoutes.length === 0;
       if (interruptBusyOwner && (state.busy || preLockWasBusy) && removedSoleProviderRoute) {
-        await state.client.session.interrupt({ sessionID: state.providerSessionId }).catch(() => {});
+        const res = await this.interruptRouteWithDeadline(state, 'session close interrupt');
+        if (!res.ok) {
+          logger.warn(
+            { provider: this.id, sessionId: state.routeId, providerSessionId: state.providerSessionId, error: res.error },
+            'OpenCode session interrupt failed/timed out during close; proceeding to child close',
+          );
+        }
       }
       if (wasOwner) {
         // Withdraw ownership BEFORE restoring fallback MCP so fallback route cannot send with stale MCP binding.
@@ -3524,7 +3720,17 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     state.activeTurnParams = null;
     state.generation += 1;
     try {
-      await state.client.session.interrupt({ sessionID: state.providerSessionId });
+      const interruptResult = await this.interruptRouteWithDeadline(state, 'session cancel');
+      if (!interruptResult.ok) {
+        if (interruptResult.timedOut) {
+          logger.warn(
+            { provider: this.id, sessionId: state.routeId, providerSessionId: state.providerSessionId, error: interruptResult.error },
+            'OpenCode session interrupt timed out during cancel',
+          );
+        } else {
+          throw interruptResult.error;
+        }
+      }
     } finally {
       this.failOnce(state, providerError(
         PROVIDER_ERROR_CODES.CANCELLED,
@@ -3960,7 +4166,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     await Promise.resolve(runtime.server.close()).catch(() => {});
   }
 
-  private async closeSessionState(state: OpenCodeSessionState, unbindMcp = false): Promise<void> {
+  private async closeSessionState(state: OpenCodeSessionState, unbindMcp = false, swallowCloseError = true): Promise<void> {
     this.clearPendingQuestion(state, true);
     for (const timer of state.pendingPermissions.values()) clearTimeout(timer);
     state.pendingPermissions.clear();
@@ -3970,7 +4176,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     }
     await state.releaseEvents().catch(() => {});
     state.abort.abort();
-    await Promise.resolve(state.server.close()).catch(() => {});
+    if (swallowCloseError) {
+      await Promise.resolve(state.server.close()).catch(() => {});
+    } else {
+      await Promise.resolve(state.server.close());
+    }
   }
 
   private releaseProviderRoute(state: OpenCodeSessionState): boolean {

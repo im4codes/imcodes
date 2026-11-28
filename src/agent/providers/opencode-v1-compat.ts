@@ -87,6 +87,8 @@ const CONTEXT_WINDOW_REFRESH_MIN_INTERVAL_MS = 3_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
 const PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS = [0, 100, 250, 500, 1_000] as const;
 const MISSING_FINAL_RECOVERY_TIMEOUT_MS = 15_000;
+const INTERRUPT_RPC_TIMEOUT_MS = 150;
+const CHILD_CLOSE_TIMEOUT_MS = 2_000;
 const MISSING_FINAL_RECOVERY_RECHECK_DELAYS_MS = [250, 1_000] as const;
 const OPENCODE_SERVER_USERNAME = 'opencode';
 
@@ -451,8 +453,8 @@ function invokeWithOptionalAbort<TArgs extends Record<string, unknown>, TResult>
 }
 
 class OpenCodeRequestTimeoutError extends Error {
-  constructor(operation: string) {
-    super(`OpenCode ${operation} timed out after ${MISSING_FINAL_RECOVERY_TIMEOUT_MS}ms`);
+  constructor(operation: string, timeoutMs = MISSING_FINAL_RECOVERY_TIMEOUT_MS) {
+    super(`OpenCode ${operation} timed out after ${timeoutMs}ms`);
     this.name = 'OpenCodeRequestTimeoutError';
   }
 }
@@ -460,8 +462,13 @@ class OpenCodeRequestTimeoutError extends Error {
 function withOpenCodeRequestTimeout<T>(
   promise: Promise<T>,
   operation: string,
-  signal?: AbortSignal,
+  signalOrController?: AbortSignal | AbortController,
+  timeoutMs = MISSING_FINAL_RECOVERY_TIMEOUT_MS,
 ): Promise<T> {
+  const controller = signalOrController && 'abort' in signalOrController ? signalOrController : undefined;
+  const signal: AbortSignal | undefined = controller
+    ? controller.signal
+    : (signalOrController as AbortSignal | undefined);
   if (signal?.aborted) {
     const abortErr = new Error(`OpenCode ${operation} aborted`);
     abortErr.name = 'AbortError';
@@ -488,8 +495,9 @@ function withOpenCodeRequestTimeout<T>(
       if (settled) return;
       settled = true;
       cleanup();
-      rejectTimeout(new OpenCodeRequestTimeoutError(operation));
-    }, MISSING_FINAL_RECOVERY_TIMEOUT_MS);
+      controller?.abort();
+      rejectTimeout(new OpenCodeRequestTimeoutError(operation, timeoutMs));
+    }, timeoutMs);
     timer.unref?.();
     promise.then(
       (value) => {
@@ -971,21 +979,32 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
       if (previousOwner && previousOwner !== state) {
         previousOwner.pendingAdmissionAbort?.abort();
         if (previousOwner.busy || preLockOwnerWasBusy) {
-          previousOwner.cancelled = true;
-          previousOwner.generation += 1;
-          await previousOwner.client.session.abort({
-            path: { id: providerSessionId },
-            query: { directory: previousOwner.cwd },
-            throwOnError: true,
-          }).catch(() => {});
-          this.failOnce(
-            previousOwner,
-            providerError(
-              PROVIDER_ERROR_CODES.CANCELLED,
-              `OpenCode route "${previousOwner.routeId}" turn cancelled because ownership transferred to "${routeId}"`,
-              true,
-            ),
-          );
+          const interruptResult = await this.interruptRouteWithDeadline(previousOwner, 'ownership transfer abort');
+          if (interruptResult.ok) {
+            previousOwner.cancelled = true;
+            previousOwner.generation += 1;
+            this.failOnce(
+              previousOwner,
+              providerError(
+                PROVIDER_ERROR_CODES.CANCELLED,
+                `OpenCode route "${previousOwner.routeId}" turn cancelled because ownership transferred to "${routeId}"`,
+                true,
+              ),
+            );
+          } else {
+            const reclaimed = await this.stopAndReclaimExclusiveRoute(
+              previousOwner,
+              sessionRuntime.server,
+              sessionRuntime.client,
+            );
+            if (!reclaimed) {
+              throw providerError(
+                PROVIDER_ERROR_CODES.CONNECTION_LOST,
+                `Timed out interrupting active OpenCode route "${previousOwner.routeId}" before ownership transfer`,
+                true,
+              );
+            }
+          }
         }
       }
       this.registerProviderRoute(providerSessionId, routeId);
@@ -1032,6 +1051,98 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     );
   }
 
+  private isExclusiveRuntimeChild(
+    targetState: OpenCodeSessionState,
+    incomingServer?: OpenCodeV1ServerLike,
+    incomingClient?: OpenCodeV1ClientLike,
+  ): boolean {
+    if (targetState.server === this.server) return false;
+    if (incomingServer && targetState.server === incomingServer) return false;
+    if (incomingClient && targetState.client === incomingClient) return false;
+    for (const other of this.sessions.values()) {
+      if (other === targetState) continue;
+      if (other.server === targetState.server || other.client === targetState.client) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async interruptRouteWithDeadline(
+    state: OpenCodeSessionState,
+    operation: string,
+  ): Promise<{ ok: true } | { ok: false; timedOut: boolean; error: unknown }> {
+    const controller = new AbortController();
+    try {
+      await withOpenCodeRequestTimeout(
+        invokeWithOptionalAbort(
+          state.client.session.abort.bind(state.client.session),
+          {
+            path: { id: state.providerSessionId },
+            query: { directory: state.cwd },
+            throwOnError: true,
+          },
+          controller.signal,
+        ),
+        operation,
+        controller,
+        INTERRUPT_RPC_TIMEOUT_MS,
+      );
+      return { ok: true };
+    } catch (error) {
+      if (isNotFoundError(error)) return { ok: true };
+      const timedOut = error instanceof OpenCodeRequestTimeoutError || (error instanceof Error && error.name === 'AbortError');
+      return { ok: false, timedOut, error };
+    }
+  }
+
+  private async stopAndReclaimExclusiveRoute(
+    previousOwner: OpenCodeSessionState,
+    incomingServer: OpenCodeV1ServerLike,
+    incomingClient: OpenCodeV1ClientLike,
+  ): Promise<boolean> {
+    if (!this.isExclusiveRuntimeChild(previousOwner, incomingServer, incomingClient)) {
+      return false;
+    }
+    const prevCancelled = previousOwner.cancelled;
+    previousOwner.cancelled = true;
+    previousOwner.generation += 1;
+    try {
+      await withOpenCodeRequestTimeout(
+        this.closeSessionState(previousOwner, false),
+        'exclusive route close',
+        undefined,
+        CHILD_CLOSE_TIMEOUT_MS,
+      );
+    } catch (error) {
+      previousOwner.cancelled = prevCancelled;
+      logger.warn(
+        { provider: this.id, routeId: previousOwner.routeId, providerSessionId: previousOwner.providerSessionId, error },
+        'Failed to stop exclusive OpenCode v1 child after interrupt timeout',
+      );
+      return false;
+    }
+    if (this.sessions.get(previousOwner.routeId) === previousOwner) {
+      this.sessions.delete(previousOwner.routeId);
+    }
+    const remaining = (this.providerRouteOrder.get(previousOwner.providerSessionId) ?? [])
+      .filter((id) => id !== previousOwner.routeId && this.sessions.get(id)?.providerSessionId === previousOwner.providerSessionId);
+    if (remaining.length > 0) this.providerRouteOrder.set(previousOwner.providerSessionId, remaining);
+    else this.providerRouteOrder.delete(previousOwner.providerSessionId);
+    if (this.providerToRoute.get(previousOwner.providerSessionId) === previousOwner.routeId) {
+      this.providerToRoute.delete(previousOwner.providerSessionId);
+    }
+    this.failOnce(
+      previousOwner,
+      providerError(
+        PROVIDER_ERROR_CODES.CANCELLED,
+        `OpenCode route "${previousOwner.routeId}" stopped and reclaimed after interrupt timeout`,
+        true,
+      ),
+    );
+    return true;
+  }
+
   private async closeOrDetachRoute(sessionId: string, interruptBusyOwner: boolean): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
@@ -1044,11 +1155,13 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
       this.sessions.delete(state.routeId);
       const removedSoleProviderRoute = this.releaseProviderRoute(state);
       if (interruptBusyOwner && (state.busy || preLockWasBusy) && removedSoleProviderRoute) {
-        await state.client.session.abort({
-          path: { id: state.providerSessionId },
-          query: { directory: state.cwd },
-          throwOnError: true,
-        }).catch(() => {});
+        const res = await this.interruptRouteWithDeadline(state, 'session close abort');
+        if (!res.ok) {
+          logger.warn(
+            { provider: this.id, sessionId: state.routeId, providerSessionId: state.providerSessionId, error: res.error },
+            'OpenCode v1 session abort failed/timed out during close; proceeding to child close',
+          );
+        }
       }
     });
     await this.closeSessionState(state);
@@ -1495,11 +1608,17 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     state.compacting = false;
     state.generation += 1;
     try {
-      await state.client.session.abort({
-        path: { id: state.providerSessionId },
-        query: { directory: state.cwd },
-        throwOnError: true,
-      });
+      const interruptResult = await this.interruptRouteWithDeadline(state, 'session cancel');
+      if (!interruptResult.ok) {
+        if (interruptResult.timedOut) {
+          logger.warn(
+            { provider: this.id, sessionId: state.routeId, providerSessionId: state.providerSessionId, error: interruptResult.error },
+            'OpenCode v1 session abort timed out during cancel',
+          );
+        } else {
+          throw interruptResult.error;
+        }
+      }
     } finally {
       this.failOnce(state, providerError(
         PROVIDER_ERROR_CODES.CANCELLED,
@@ -1738,15 +1857,21 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
       catchAllIdx >= 0
       && !existing.slice(catchAllIdx + 1).some((r) => r.action === 'allow')
     );
-    const fencedToolsSatisfied = !nativeAgentsFenced || OPENCODE_V1_NATIVE_AGENT_TOOLS.every((tool) => {
-      for (let i = existing.length - 1; i >= 0; i--) {
-        const r = existing[i]!;
-        if (r.pattern === '*' && (r.permission === tool || r.permission === '*')) {
-          return r.action === 'deny';
-        }
+    const fencedSet = new Set<string>(OPENCODE_V1_NATIVE_AGENT_TOOLS);
+    const tailDeniedTools = new Set<string>();
+    let tailHasCatchAllDeny = false;
+    for (let i = existing.length - 1; i >= 0; i--) {
+      const r = existing[i]!;
+      if (r.pattern === '*' && r.action === 'deny' && (fencedSet.has(r.permission) || r.permission === '*')) {
+        if (r.permission === '*') tailHasCatchAllDeny = true;
+        else tailDeniedTools.add(r.permission);
+        continue;
       }
-      return false;
-    });
+      break;
+    }
+    const fencedToolsSatisfied = !nativeAgentsFenced
+      || tailHasCatchAllDeny
+      || OPENCODE_V1_NATIVE_AGENT_TOOLS.every((tool) => tailDeniedTools.has(tool));
     if (guardSatisfied && fencedToolsSatisfied) return [];
 
     // Guard already satisfied (e.g. session has `*/* deny`), only missing native-agent deny rules:
@@ -1762,7 +1887,6 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     // Replay existing rules in exact relative order after a catch-all `*/* ask`, turning
     // executable `allow` rules into `ask` while preserving every `deny` (including `*/* deny`
     // and `* /secret/* deny`), then enforce native-agent `deny` last.
-    const fencedSet = new Set<string>(OPENCODE_V1_NATIVE_AGENT_TOOLS);
     const patch: Array<{ permission: string; pattern: string; action: 'allow' | 'deny' | 'ask' }> = [];
     if (guardTools) {
       patch.push({ permission: '*', pattern: '*', action: 'ask' });
@@ -1843,13 +1967,17 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     await Promise.resolve(runtime.server.close()).catch(() => {});
   }
 
-  private async closeSessionState(state: OpenCodeSessionState): Promise<void> {
+  private async closeSessionState(state: OpenCodeSessionState, swallowCloseError = true): Promise<void> {
     this.clearPendingQuestion(state, true);
     for (const pending of state.pendingPermissions.values()) clearTimeout(pending.timer);
     state.pendingPermissions.clear();
     state.surfacedQuestionCallIds.clear();
     state.abort.abort();
-    await Promise.resolve(state.server.close()).catch(() => {});
+    if (swallowCloseError) {
+      await Promise.resolve(state.server.close()).catch(() => {});
+    } else {
+      await Promise.resolve(state.server.close());
+    }
     await state.eventLoop.catch(() => {});
   }
 
