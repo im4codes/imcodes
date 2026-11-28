@@ -646,6 +646,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _description: string | undefined;
   private _systemPrompt: string | undefined;
   private _identityPrompt: string | undefined;
+  private _modelIntentRevision = 0;
+  private _pendingModelConfirmPromise: Promise<void> | null = null;
   /**
    * Session-stable IM.codes identity (exact session name + display label).
    * Injected at assembly-time into `sessionSystemText`, peer-level with
@@ -1524,7 +1526,25 @@ export class TransportSessionRuntime implements SessionRuntime {
       return undefined;
     }
   }
+  get modelIntentRevision(): number { return this._modelIntentRevision; }
+
+  setPendingModelConfirmPromise(promise: Promise<void>): void {
+    const tracked = promise.catch(() => {}).finally(() => {
+      if (this._pendingModelConfirmPromise === tracked) {
+        this._pendingModelConfirmPromise = null;
+      }
+    });
+    this._pendingModelConfirmPromise = tracked;
+  }
+
+  async awaitPendingModelConfirmation(): Promise<string | undefined> {
+    const pending = this._pendingModelConfirmPromise;
+    if (pending) await pending;
+    return this._systemPrompt;
+  }
+
   setAgentId(agentId: string): void {
+    this._modelIntentRevision += 1;
     const changed = this._agentId !== agentId;
     this._agentId = agentId;
     if (changed) this.reinjectAfterCompaction();
@@ -1535,6 +1555,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   get supportsConfirmedModelSelection(): boolean { return typeof this.provider.applySessionModel === 'function'; }
 
   async applyAgentId(agentId: string): Promise<import('../../shared/session-model-control.js').SessionModelApplied> {
+    this._modelIntentRevision += 1;
     const sid = this._providerSessionId;
     if (!sid || !this.provider.applySessionModel) {
       this.setAgentId(agentId);

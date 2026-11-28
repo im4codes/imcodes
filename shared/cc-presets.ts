@@ -1,4 +1,5 @@
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from './agent-types.js';
+import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 
 export const CC_PRESET_MSG = {
   LIST: 'cc.presets.list',
@@ -26,6 +27,7 @@ export const CUSTOM_PROVIDER_SDK_AGENT_TYPES: ReadonlySet<string> = new Set([
   'deepseek-harness',
   'pi',
   'kimi-sdk',
+  HERMES_AGENT_PROVIDER_ID,
   'codex-sdk',
   'codex',
 ]);

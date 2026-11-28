@@ -27,6 +27,7 @@ import {
   type CcPresetTransportMode,
 } from '../../shared/cc-presets.js';
 import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
+import { buildHermesRuntimeFactsPrompt, type HermesPresetConfig } from '../../shared/hermes-agent.js';
 import type { PiLlmConfig } from '../../shared/pi-agent.js';
 import logger from '../util/logger.js';
 
@@ -721,6 +722,74 @@ export async function getKimiPresetTransportConfig(presetName: string, requested
   return {
     env: model ? (isOpenAi ? { OPENAI_MODEL: model } : { ANTHROPIC_MODEL: model }) : {},
     ...(kimiLlm ? { kimiLlm } : {}),
+    ...(model ? { model } : {}),
+    ...(availableModels.length ? { availableModels } : {}),
+    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+  };
+}
+
+export function normalizeHermesPresetSlug(presetName: string): string {
+  const normalized = normalizeCcPresetName(presetName);
+  const clean = normalized.replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'preset';
+  const suffix = createHash('sha256').update(normalized).digest('hex').slice(0, 6);
+  return `${clean.slice(0, 40)}-${suffix}`;
+}
+
+export async function getHermesPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
+  env: Record<string, string>;
+  hermesPreset?: HermesPresetConfig;
+  model?: string;
+  availableModels?: string[];
+  systemPrompt?: string;
+  contextWindow?: number;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return { env: {} };
+
+  const availableModels = getPresetAvailableModelIds(preset);
+  const model = selectPresetModel(preset, requestedModel);
+  const authType: CcPresetAuthType = inferCcPresetAuthType(preset);
+  const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
+  const baseUrl = authType === 'openai'
+    ? (preset.env['OPENAI_BASE_URL']?.trim() || resolvedEnv['OPENAI_BASE_URL']?.trim() || preset.env['ANTHROPIC_BASE_URL']?.trim() || resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined)
+    : (preset.env['ANTHROPIC_BASE_URL']?.trim() || resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || preset.env['OPENAI_BASE_URL']?.trim() || resolvedEnv['OPENAI_BASE_URL']?.trim() || undefined);
+  const apiKey = authType === 'openai'
+    ? (preset.env['OPENAI_API_KEY']?.trim() || resolvedEnv['OPENAI_API_KEY']?.trim() || resolvedEnv['ANTHROPIC_API_KEY']?.trim() || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim() || undefined)
+    : (preset.env['ANTHROPIC_API_KEY']?.trim() || preset.env['ANTHROPIC_AUTH_TOKEN']?.trim() || resolvedEnv['ANTHROPIC_API_KEY']?.trim() || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim() || resolvedEnv['OPENAI_API_KEY']?.trim() || undefined);
+
+  // Hermes receives its API key strictly via in-memory HermesPresetConfig ->
+  // child env (IMCODES_HERMES_API_KEY), never via config.yaml or generic env.
+  const env: Record<string, string> = {
+    IMCODES_CC_PRESET: preset.name,
+  };
+  if (model) env['HERMES_MODEL'] = model;
+  if (resolvedEnv['IMCODES_CONTEXT_WINDOW']) {
+    env['IMCODES_CONTEXT_WINDOW'] = resolvedEnv['IMCODES_CONTEXT_WINDOW'];
+  }
+
+  const hermesPreset: HermesPresetConfig | undefined = (model || baseUrl || apiKey)
+    ? {
+        presetSlug: normalizeHermesPresetSlug(preset.name),
+        presetName: preset.name,
+        authType,
+        ...(baseUrl ? { baseUrl } : {}),
+        ...(model ? { model } : {}),
+        ...(availableModels.length ? { availableModels } : {}),
+        ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+        ...(apiKey ? { apiKey } : {}),
+      }
+    : undefined;
+
+  const runtimeFacts = buildHermesRuntimeFactsPrompt({
+    presetName: preset.name,
+    baseUrl,
+    model,
+  });
+
+  return {
+    env,
+    ...(hermesPreset ? { hermesPreset } : {}),
     ...(model ? { model } : {}),
     ...(availableModels.length ? { availableModels } : {}),
     ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),

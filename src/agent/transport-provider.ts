@@ -24,6 +24,7 @@ import type { TransportAttachment } from '../../shared/transport-attachments.js'
 import type { LocalAuthContext } from './local-auth-context.js';
 import type { MemoryMcpProviderStatusView } from '../../shared/memory-ws.js';
 import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
+import type { HermesPresetConfig, HermesPresetRouteSnapshot } from '../../shared/hermes-agent.js';
 import type { PiLlmConfig } from '../../shared/pi-agent.js';
 import type { KimiLlmConfig } from '../../shared/cc-presets.js';
 import type {
@@ -381,6 +382,8 @@ export interface SessionConfig extends SessionIncognitoConfig {
   piLlm?: PiLlmConfig;
   /** Kimi CLI ACP custom provider route, materialized into an isolated 0600 share config. */
   kimiLlm?: KimiLlmConfig;
+  /** Hermes Agent CC Preset route, materialized without secrets into a scoped HERMES_HOME. */
+  hermesPreset?: HermesPresetConfig;
   /** Parent session key for sub-sessions. */
   parentSessionKey?: string;
   /** If binding to an already-existing remote session, use this key directly. */
@@ -497,6 +500,8 @@ export interface SessionInfoUpdate extends SessionContextBootstrapState {
   openCodeStorageOwner?: 'v1-cli' | 'v2-cli' | 'embedded';
   /** Human-readable active model identifier, if known. */
   model?: string;
+  /** Non-secret route snapshot from the running Hermes delegate confirming the model switch. */
+  hermesRouteSnapshot?: HermesPresetRouteSnapshot;
   /** Human-readable plan label, if known. */
   planLabel?: string;
   /** Human-readable quota summary label, if known. */

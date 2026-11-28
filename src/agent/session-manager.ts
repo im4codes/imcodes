@@ -16,6 +16,13 @@ import { ShellDriver } from './drivers/shell.js';
 import type { AgentDriver } from './drivers/base.js';
 import type { AgentType } from './detect.js';
 import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
+import {
+  buildHermesRuntimeFactsPrompt,
+  HERMES_AGENT_PROVIDER_ID,
+  normalizeHermesPresetBaseUrl,
+  type HermesPresetConfig,
+  type HermesPresetRouteSnapshot,
+} from '../../shared/hermes-agent.js';
 import type { PiLlmConfig } from '../../shared/pi-agent.js';
 import { isTransportAgent } from './detect.js';
 import {
@@ -114,6 +121,7 @@ import {
 import { resolveLaunchContextBootstrap } from './launch-context-bootstrap.js';
 import { readBoundedTimeoutMs } from './transport-context-budget.js';
 import { withTimeoutOutcome } from '../util/timeout-outcome.js';
+import { resolveContextWindow } from '../util/model-context.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
@@ -2116,7 +2124,7 @@ async function recoverTransportRuntimeAfterError(
       requestedModel: record.requestedModel,
       effort: record.effort,
       transportConfig: record.transportConfig,
-      ccPreset: (isClaudeCodeSdkAgentType(record.agentType) || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi' || record.agentType === 'kimi-sdk' || record.agentType === 'codex-sdk') ? record.ccPreset : undefined,
+      ccPreset: (isClaudeCodeSdkAgentType(record.agentType) || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi' || record.agentType === 'kimi-sdk' || record.agentType === 'hermes-acp' || record.agentType === 'codex-sdk') ? record.ccPreset : undefined,
       // Qwen-compatible API providers can reject a resumed conversation when
       // their persisted tool-call chain is invalid (e.g. "tool call result
       // does not follow tool call"). Auto-recovery must rotate the provider
@@ -2765,6 +2773,128 @@ function agyNativeStartBarrier(runtime: TransportSessionRuntime, sessionName: st
   };
 }
 
+function withoutHermesPendingModelSwitch(
+  transportConfig: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!transportConfig || !('hermesPendingModelSwitch' in transportConfig)) return transportConfig;
+  const next = { ...transportConfig };
+  delete next.hermesPendingModelSwitch;
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+function resolveHermesProfileOwnerKey(opts: {
+  existing?: SessionRecord;
+  fresh?: boolean;
+  agentType: string;
+}): string {
+  if (!opts.fresh && opts.existing && (opts.existing.providerId ?? opts.existing.agentType) === HERMES_AGENT_PROVIDER_ID) {
+    const stored = typeof opts.existing.transportConfig?.hermesProfileOwnerKey === 'string'
+      ? opts.existing.transportConfig.hermesProfileOwnerKey.trim()
+      : '';
+    if (stored) return stored;
+    const legacySid = opts.existing.providerSessionId?.trim();
+    if (legacySid) return legacySid;
+  }
+  return randomUUID();
+}
+
+async function finalizeConfirmedHermesModelSwitch(
+  sessionName: string,
+  runtime: TransportSessionRuntime,
+  confirmedModel: string,
+  expectedRecord: SessionRecord,
+  expectedIntentRevision: number,
+  passedRouteSnapshot?: HermesPresetRouteSnapshot,
+  persistence?: {
+    canPersist(record: SessionRecord): boolean;
+    onPersisted?(record: SessionRecord): void;
+  },
+): Promise<void> {
+  const presetName = expectedRecord.ccPreset;
+  if (!presetName) return;
+  try {
+    const hermesProvider = getProvider(HERMES_AGENT_PROVIDER_ID) as {
+      getRoutePresetSnapshot?: (routeId: string) => HermesPresetRouteSnapshot | undefined;
+    } | undefined;
+    const routeSnapshot = passedRouteSnapshot
+      ?? (expectedRecord.providerSessionId
+        ? hermesProvider?.getRoutePresetSnapshot?.(expectedRecord.providerSessionId)
+        : undefined);
+    let resolvedSystemPrompt: string | undefined;
+    let resolvedContextWindow: number | undefined;
+    if (routeSnapshot) {
+      // Yield a microtask so any concurrent superseding intent update settles before atomic commit.
+      await Promise.resolve();
+      resolvedSystemPrompt = buildHermesRuntimeFactsPrompt({
+        presetName: routeSnapshot.presetName,
+        baseUrl: routeSnapshot.baseUrl,
+        model: confirmedModel,
+      });
+      resolvedContextWindow = routeSnapshot.contextWindow;
+    } else {
+      const { getHermesPresetTransportConfig } = await import('../daemon/cc-presets.js');
+      const presetConfig = await getHermesPresetTransportConfig(presetName, confirmedModel);
+      resolvedSystemPrompt = presetConfig.systemPrompt;
+      resolvedContextWindow = presetConfig.contextWindow;
+    }
+    const current = getSession(sessionName);
+    if (
+      !current
+      || (persistence && !persistence.canPersist(current))
+      || current.agentType !== HERMES_AGENT_PROVIDER_ID
+      || current.ccPreset !== presetName
+      || current.sessionInstanceId !== expectedRecord.sessionInstanceId
+      || current.runtimeEpoch !== expectedRecord.runtimeEpoch
+      || current.providerSessionId !== expectedRecord.providerSessionId
+      || getTransportRuntime(sessionName) !== runtime
+      || runtime.modelIntentRevision !== expectedIntentRevision
+      || current.requestedModel !== confirmedModel
+    ) {
+      return;
+    }
+    const nextTransportConfig = withoutHermesPendingModelSwitch(current.transportConfig);
+    const presetContextWindow = resolvedContextWindow ?? current.presetContextWindow;
+    const updated: SessionRecord = {
+      ...current,
+      activeModel: confirmedModel,
+      modelDisplay: confirmedModel,
+      ...(nextTransportConfig ? { transportConfig: nextTransportConfig } : {}),
+      ...(presetContextWindow ? { presetContextWindow } : {}),
+      updatedAt: Date.now(),
+    };
+    if (!nextTransportConfig && 'transportConfig' in updated) {
+      delete updated.transportConfig;
+    }
+    if (resolvedSystemPrompt) {
+      runtime.setSystemPrompt(resolvedSystemPrompt);
+    }
+    upsertSession(updated);
+    const persisted = getSession(sessionName) ?? updated;
+    persistence?.onPersisted?.(persisted);
+    emitSessionPersist(persisted, sessionName);
+    _onSessionInfoModelSync?.(sessionName);
+    const contextWindow = resolveContextWindow(presetContextWindow, confirmedModel);
+    timelineEmitter.emit(
+      sessionName,
+      'usage.update',
+      { model: confirmedModel, contextWindow },
+      { source: 'daemon', confidence: 'high' },
+    );
+    timelineEmitter.emit(sessionName, 'assistant.text', {
+      ...attachDaemonUserNotice(
+        DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED,
+        `Switched model to ${confirmedModel}`,
+        { model: confirmedModel },
+      ),
+      streaming: false,
+      automation: true,
+      memoryExcluded: true,
+    }, { source: 'daemon', confidence: 'high' });
+  } catch (err) {
+    logger.warn({ err, sessionName, confirmedModel }, 'Failed to finalize confirmed Hermes preset model switch');
+  }
+}
+
 function wireTransportSessionInfo(
   runtime: TransportSessionRuntime,
   sessionName: string,
@@ -2824,16 +2954,31 @@ function wireTransportSessionInfo(
       && !!next.ccPreset
       && !!next.requestedModel;
     let modelChanged = false;
+    let confirmedPendingHermesModel: string | undefined;
     if (typeof info.model === 'string' && info.model && !presetSelectedModelIsAuthoritative) {
-      if (next.activeModel !== info.model) {
-        next.activeModel = info.model;
-        changed = true;
-        modelChanged = true;
-      }
-      if (next.modelDisplay !== info.model) {
-        next.modelDisplay = info.model;
-        changed = true;
-        modelChanged = true;
+      const pendingHermesSwitch = agentType === HERMES_AGENT_PROVIDER_ID && next.ccPreset
+        && typeof next.transportConfig?.hermesPendingModelSwitch === 'string'
+        ? next.transportConfig.hermesPendingModelSwitch
+        : undefined;
+      if (pendingHermesSwitch && pendingHermesSwitch === info.model) {
+        // Bind pending confirmation strictly to current intent & model; finalize atomically in async commit.
+        confirmedPendingHermesModel = info.model;
+      } else {
+        if (pendingHermesSwitch) {
+          next.transportConfig = withoutHermesPendingModelSwitch(next.transportConfig);
+          if (!next.transportConfig) delete next.transportConfig;
+          changed = true;
+        }
+        if (next.activeModel !== info.model) {
+          next.activeModel = info.model;
+          changed = true;
+          modelChanged = true;
+        }
+        if (next.modelDisplay !== info.model) {
+          next.modelDisplay = info.model;
+          changed = true;
+          modelChanged = true;
+        }
       }
     }
 
@@ -2924,13 +3069,31 @@ function wireTransportSessionInfo(
 
     changed = mergeSessionContextBootstrap(next, info) || changed;
 
-    if (!changed) return;
-    upsertSession(next);
-    const persisted = getSession(sessionName) ?? next;
-    persistence?.onPersisted?.(persisted);
-    emitSessionPersist(persisted, sessionName);
-    if (modelChanged) {
-      _onSessionInfoModelSync?.(sessionName);
+    if (!changed && !confirmedPendingHermesModel) return;
+    if (changed) {
+      upsertSession(next);
+      const persisted = getSession(sessionName) ?? next;
+      persistence?.onPersisted?.(persisted);
+      emitSessionPersist(persisted, sessionName);
+      if (modelChanged) {
+        _onSessionInfoModelSync?.(sessionName);
+      }
+    }
+    if (confirmedPendingHermesModel) {
+      const expectedRecord = getSession(sessionName) ?? next;
+      const expectedRevision = runtime.modelIntentRevision;
+      if (expectedRecord.requestedModel === confirmedPendingHermesModel) {
+        const confirmPromise = finalizeConfirmedHermesModelSwitch(
+          sessionName,
+          runtime,
+          confirmedPendingHermesModel,
+          expectedRecord,
+          expectedRevision,
+          info.hermesRouteSnapshot,
+          persistence,
+        );
+        runtime.setPendingModelConfirmPromise(confirmPromise);
+      }
     }
   };
   return () => latestInfo ? { ...latestInfo } : undefined;
@@ -3641,6 +3804,7 @@ export async function restoreTransportSessions(
       let dshLlmConfig: DshLlmConfig | undefined;
       let piLlmConfig: PiLlmConfig | undefined;
       let kimiLlmConfig: KimiLlmConfig | undefined;
+      let hermesPresetConfig: HermesPresetConfig | undefined;
       const boundServerId = await loadBoundServerIdForManagedMcp();
       const capabilityOwnerId = boundServerId ? getAuthenticatedCapabilityOwner(boundServerId) : undefined;
       const resolveRuntimeContextBootstrap = (onNamespaceResolved?: (stage: TransportContextNamespaceStage) => void) => resolveTransportContextBootstrap({
@@ -3727,6 +3891,34 @@ export async function restoreTransportSessions(
         if (presetConfig.model) effectiveRequestedModel = presetConfig.model;
         restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
         if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
+      } else if (s.providerId === HERMES_AGENT_PROVIDER_ID && s.ccPreset) {
+        const { getHermesPresetTransportConfig } = await import('../daemon/cc-presets.js');
+        const presetConfig = await getHermesPresetTransportConfig(s.ccPreset, effectiveRequestedModel);
+        extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
+        const ownerKey = (typeof s.transportConfig?.hermesProfileOwnerKey === 'string' && s.transportConfig.hermesProfileOwnerKey.trim())
+          || s.providerSessionId;
+        if (presetConfig.hermesPreset) {
+          hermesPresetConfig = {
+            ...presetConfig.hermesPreset,
+            profileOwnerKey: ownerKey,
+          };
+        }
+        if (presetConfig.model) effectiveRequestedModel = presetConfig.model;
+        const pendingHermesModel = typeof s.transportConfig?.hermesPendingModelSwitch === 'string'
+          ? s.transportConfig.hermesPendingModelSwitch
+          : undefined;
+        const awaitingSwitchConfirm = Boolean(
+          pendingHermesModel
+          || (s.activeModel !== undefined && effectiveRequestedModel !== undefined && s.activeModel !== effectiveRequestedModel),
+        );
+        if (!awaitingSwitchConfirm) {
+          restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
+          if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
+        } else if (s.activeModel) {
+          const activeConfig = await getHermesPresetTransportConfig(s.ccPreset, s.activeModel);
+          restoredPresetContextWindow = activeConfig.contextWindow ?? restoredPresetContextWindow;
+          if (activeConfig.systemPrompt) systemPrompt = activeConfig.systemPrompt;
+        }
       }
       if (s.providerId === 'qwen'
         && !s.ccPreset
@@ -3753,6 +3945,12 @@ export async function restoreTransportSessions(
       const restoredHookCredential = restoreIdentity.hookCredential?.trim() || mintHookCredential();
       const restoredRuntimeEpoch = s.providerId === AGY_SDK_PROVIDER_ID
         ? randomUUID() : restoreIdentity.runtimeEpoch?.trim();
+      const restoreBindKey = freshOnRestore ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId);
+      const restoreRouteId = restoreBindKey ?? effectiveSessionKey;
+      if (s.providerId === HERMES_AGENT_PROVIDER_ID && hermesPresetConfig) {
+        (provider as { setRouteModelConfirmAwaiter?: (routeId: string, fn: (() => Promise<string | undefined>) | undefined) => void })
+          .setRouteModelConfirmAwaiter?.(restoreRouteId, () => runtime.awaitPendingModelConfirmation());
+      }
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
         sessionName: s.name,
@@ -3795,6 +3993,7 @@ export async function restoreTransportSessions(
         ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
         ...(piLlmConfig ? { piLlm: piLlmConfig } : {}),
         ...(kimiLlmConfig ? { kimiLlm: kimiLlmConfig } : {}),
+        ...(hermesPresetConfig ? { hermesPreset: hermesPresetConfig } : {}),
         resumeId,
         ...(!freshOnRestore && typeof s.transportConfig?.openCodeStorageOwner === 'string'
           ? { openCodeStorageOwner: s.transportConfig.openCodeStorageOwner as 'v1-cli' | 'v2-cli' | 'embedded' }
@@ -3847,11 +4046,18 @@ export async function restoreTransportSessions(
         ...(!freshQoderRestore && usesProviderResumeId(s.providerId) && latestSessionInfo?.resumeId
           ? { providerResumeId: latestSessionInfo.resumeId }
           : {}),
-        ...(!freshOnRestore && typeof latestSessionInfo?.openCodeStorageOwner === 'string'
+        ...((!freshOnRestore && typeof latestSessionInfo?.openCodeStorageOwner === 'string')
+          || (s.providerId === HERMES_AGENT_PROVIDER_ID && hermesPresetConfig?.profileOwnerKey
+            && currentForFinalize.transportConfig?.hermesProfileOwnerKey !== hermesPresetConfig.profileOwnerKey)
           ? {
             transportConfig: {
               ...(currentForFinalize.transportConfig ?? {}),
-              openCodeStorageOwner: latestSessionInfo.openCodeStorageOwner,
+              ...(!freshOnRestore && typeof latestSessionInfo?.openCodeStorageOwner === 'string'
+                ? { openCodeStorageOwner: latestSessionInfo.openCodeStorageOwner }
+                : {}),
+              ...(s.providerId === HERMES_AGENT_PROVIDER_ID && hermesPresetConfig?.profileOwnerKey
+                ? { hermesProfileOwnerKey: hermesPresetConfig.profileOwnerKey }
+                : {}),
             },
           }
           : {}),
@@ -3865,8 +4071,12 @@ export async function restoreTransportSessions(
         contextRetryExhausted: contextBootstrap.retryExhausted,
         contextSharedPolicyOverride: contextBootstrap.sharedPolicyOverride,
         requestedModel: effectiveRequestedModel ?? currentForFinalize.requestedModel,
-        activeModel: effectiveRequestedModel ?? currentForFinalize.activeModel ?? currentForFinalize.modelDisplay,
-        modelDisplay: effectiveRequestedModel ?? currentForFinalize.modelDisplay,
+        activeModel: s.providerId === HERMES_AGENT_PROVIDER_ID && currentForFinalize.ccPreset
+          ? (latestSessionInfo?.model ?? currentForFinalize.activeModel)
+          : (effectiveRequestedModel ?? currentForFinalize.activeModel ?? currentForFinalize.modelDisplay),
+        modelDisplay: s.providerId === HERMES_AGENT_PROVIDER_ID && currentForFinalize.ccPreset
+          ? (latestSessionInfo?.model ?? currentForFinalize.modelDisplay ?? currentForFinalize.activeModel)
+          : (effectiveRequestedModel ?? currentForFinalize.modelDisplay),
         // Preserve transportConfig exactly via ...currentForFinalize spread —
         // never force `{}` which
         // would wipe user-set supervision settings on every daemon restart.
@@ -4228,6 +4438,8 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
   let dshLlmConfig: DshLlmConfig | undefined;
   let piLlmConfig: PiLlmConfig | undefined;
   let kimiLlmConfig: KimiLlmConfig | undefined;
+  let hermesPresetConfig: HermesPresetConfig | undefined;
+  let hermesProfileOwnerKey: string | undefined;
   if (agentType === AGY_SDK_PROVIDER_ID && existing?.agentType === AGY_SDK_PROVIDER_ID
     && !opts.fresh && !opts.providerResumeId && !existing.providerResumeId
     && existing.agyNativeSessionState !== AGY_NATIVE_SESSION_STATE.UNSTARTED) {
@@ -4465,6 +4677,47 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     effectiveBindExistingKey = undefined;
     transportResumeId = opts.incognito ? undefined : (opts.providerResumeId ?? storedProviderResumeId);
     effectiveSkipCreate = !!transportResumeId;
+  } else if (agentType === 'hermes-acp') {
+    if (effectiveCcPreset) {
+      const { getHermesPresetTransportConfig } = await import('../daemon/cc-presets.js');
+      const presetConfig = await getHermesPresetTransportConfig(effectiveCcPreset, requestedTransportModel);
+      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
+      hermesProfileOwnerKey = resolveHermesProfileOwnerKey({
+        existing,
+        fresh: !!opts.fresh,
+        agentType,
+      });
+      if (presetConfig.hermesPreset) {
+        hermesPresetConfig = {
+          ...presetConfig.hermesPreset,
+          profileOwnerKey: hermesProfileOwnerKey,
+        };
+      }
+      if (presetConfig.model) requestedTransportModel = presetConfig.model;
+      const pendingHermesModel = !opts.fresh && typeof existing?.transportConfig?.hermesPendingModelSwitch === 'string'
+        ? existing.transportConfig.hermesPendingModelSwitch
+        : undefined;
+      const awaitingSwitchConfirm = !opts.fresh && Boolean(
+        pendingHermesModel
+        || (existing?.activeModel !== undefined && requestedTransportModel !== undefined && existing.activeModel !== requestedTransportModel),
+      );
+      if (!awaitingSwitchConfirm) {
+        presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
+        if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
+      } else if (existing?.activeModel) {
+        const activeConfig = await getHermesPresetTransportConfig(effectiveCcPreset, existing.activeModel);
+        presetContextWindow = activeConfig.contextWindow ?? presetContextWindow;
+        if (activeConfig.systemPrompt) transportSystemPrompt = activeConfig.systemPrompt;
+      }
+    }
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
+    transportResumeId = opts.incognito ? undefined : (opts.providerResumeId ?? storedProviderResumeId);
+    effectiveSkipCreate = !!transportResumeId;
+    if (hermesPresetConfig) {
+      (provider as { setRouteModelConfirmAwaiter?: (routeId: string, fn: (() => Promise<string | undefined>) | undefined) => void })
+        .setRouteModelConfirmAwaiter?.(effectiveBindExistingKey ?? effectiveSessionKey, () => runtime.awaitPendingModelConfirmation());
+    }
   } else if (usesProviderResumeId(agentType)) {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
@@ -4548,6 +4801,7 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
     ...(piLlmConfig ? { piLlm: piLlmConfig } : {}),
     ...(kimiLlmConfig ? { kimiLlm: kimiLlmConfig } : {}),
+    ...(hermesPresetConfig ? { hermesPreset: hermesPresetConfig } : {}),
     contextNamespace: contextBootstrap.namespace,
     contextNamespaceDiagnostics: contextBootstrap.diagnostics,
     contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,
@@ -4619,18 +4873,23 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
         contextRetryExhausted: contextBootstrap.retryExhausted,
         contextSharedPolicyOverride: contextBootstrap.sharedPolicyOverride,
         requestedModel: requestedTransportModel,
-        activeModel: requestedTransportModel,
-        modelDisplay: requestedTransportModel,
+        activeModel: agentType === HERMES_AGENT_PROVIDER_ID && effectiveCcPreset
+          ? (latestSessionInfo?.model ?? (!opts.fresh ? existing?.activeModel : undefined))
+          : requestedTransportModel,
+        modelDisplay: agentType === HERMES_AGENT_PROVIDER_ID && effectiveCcPreset
+          ? (latestSessionInfo?.model ?? (!opts.fresh ? (existing?.modelDisplay ?? existing?.activeModel) : undefined))
+          : requestedTransportModel,
         // Only write transportConfig when we actually have one — avoid writing `{}`
         // which would clobber a concurrently-set supervision config on the next
         // load cycle. The existing config is already carried via effectiveTransportConfig.
-        ...(effectiveTransportConfig || (!opts.incognito && latestSessionInfo?.openCodeStorageOwner)
+        ...(effectiveTransportConfig || (!opts.incognito && latestSessionInfo?.openCodeStorageOwner) || hermesProfileOwnerKey
           ? {
             transportConfig: {
-              ...(effectiveTransportConfig ?? {}),
+              ...((opts.fresh ? withoutHermesPendingModelSwitch(effectiveTransportConfig) : effectiveTransportConfig) ?? {}),
               ...(!opts.incognito && latestSessionInfo?.openCodeStorageOwner
                 ? { openCodeStorageOwner: latestSessionInfo.openCodeStorageOwner }
                 : {}),
+              ...(hermesProfileOwnerKey ? { hermesProfileOwnerKey } : {}),
             },
           }
           : {}),

@@ -1044,4 +1044,100 @@ describe('cc presets', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  describe('Hermes preset transport config', () => {
+    it('builds Anthropic-compatible Hermes preset transport config without leaking keys into env', async () => {
+      const { getHermesPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+      const result = await getHermesPresetTransportConfig('MiniMax');
+      expect(result.model).toBe('MiniMax-M2.7');
+      expect(result.contextWindow).toBe(200_000);
+      expect(result.env).toEqual({
+        IMCODES_CC_PRESET: 'minimax',
+        HERMES_MODEL: 'MiniMax-M2.7',
+        IMCODES_CONTEXT_WINDOW: '200000',
+      });
+      expect(result.env).not.toHaveProperty('ANTHROPIC_API_KEY');
+      expect(result.env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN');
+      expect(result.env).not.toHaveProperty('OPENAI_API_KEY');
+      expect(result.env).not.toHaveProperty('IMCODES_HERMES_API_KEY');
+      expect(result.hermesPreset).toMatchObject({
+        presetName: 'minimax',
+        authType: 'anthropic',
+        baseUrl: 'https://api.minimax.io/anthropic',
+        apiKey: 'test-token',
+        model: 'MiniMax-M2.7',
+        contextWindow: 200_000,
+      });
+      expect(result.hermesPreset?.presetSlug).toMatch(/^minimax-[a-f0-9]{6}$/);
+      expect(result.systemPrompt).toContain('MiniMax-M2.7');
+    });
+
+    it('builds OpenAI-compatible Hermes preset transport config and supports deliberate model override', async () => {
+      const { savePresets, getHermesPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+      await savePresets([
+        {
+          name: 'openai-compat',
+          authType: 'openai',
+          contextWindow: 128_000,
+          env: {
+            OPENAI_BASE_URL: 'https://api.example.com/v1',
+            OPENAI_API_KEY: 'sk-openai-secret',
+            OPENAI_MODEL: 'gpt-compat-1',
+          },
+          defaultModel: 'gpt-compat-1',
+          availableModels: [
+            { id: 'gpt-compat-1' },
+            { id: 'gpt-compat-2' },
+          ],
+        },
+      ]);
+
+      const result = await getHermesPresetTransportConfig('openai-compat', 'gpt-compat-2');
+      expect(result.model).toBe('gpt-compat-2');
+      expect(result.availableModels).toEqual(['gpt-compat-1', 'gpt-compat-2']);
+      expect(result.env).toEqual({
+        IMCODES_CC_PRESET: 'openai-compat',
+        HERMES_MODEL: 'gpt-compat-2',
+        IMCODES_CONTEXT_WINDOW: '128000',
+      });
+      expect(JSON.stringify(result.env)).not.toContain('sk-openai-secret');
+      expect(result.hermesPreset).toMatchObject({
+        presetName: 'openai-compat',
+        authType: 'openai',
+        baseUrl: 'https://api.example.com/v1',
+        apiKey: 'sk-openai-secret',
+        model: 'gpt-compat-2',
+        availableModels: ['gpt-compat-1', 'gpt-compat-2'],
+        contextWindow: 128_000,
+      });
+    });
+
+    it('infers openai authType from legacy OpenAI-only presets lacking explicit authType', async () => {
+      const { savePresets, getHermesPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+      await savePresets([
+        {
+          name: 'legacy-openai',
+          env: {
+            OPENAI_BASE_URL: 'https://legacy-openai.example.com/v1',
+            OPENAI_API_KEY: 'sk-legacy-openai',
+            OPENAI_MODEL: 'gpt-legacy-1',
+          },
+        },
+      ]);
+
+      const result = await getHermesPresetTransportConfig('legacy-openai');
+      expect(result.model).toBe('gpt-legacy-1');
+      expect(result.hermesPreset).toMatchObject({
+        presetName: 'legacy-openai',
+        authType: 'openai',
+        baseUrl: 'https://legacy-openai.example.com/v1',
+        apiKey: 'sk-legacy-openai',
+        model: 'gpt-legacy-1',
+      });
+      expect(JSON.stringify(result.env)).not.toContain('sk-legacy-openai');
+    });
+  });
 });

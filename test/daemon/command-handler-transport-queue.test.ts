@@ -106,6 +106,7 @@ const {
   ensureProviderConnectedMock,
   getPresetModelCatalogMock,
   getPresetMock,
+  getHermesPresetTransportConfigMock,
   loadPresetsMock,
   lookupAttachmentMock,
   buildSessionListMock,
@@ -163,6 +164,7 @@ const {
   ensureProviderConnectedMock: vi.fn(),
   getPresetModelCatalogMock: vi.fn(),
   getPresetMock: vi.fn().mockResolvedValue(undefined),
+  getHermesPresetTransportConfigMock: vi.fn().mockResolvedValue({ env: {} }),
   getCodexRuntimeConfigMock: vi.fn().mockResolvedValue({}),
   loadPresetsMock: vi.fn().mockResolvedValue([]),
   lookupAttachmentMock: vi.fn(() => undefined),
@@ -306,7 +308,9 @@ vi.mock('../../src/daemon/cc-presets.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../src/daemon/cc-presets.js')>(),
   getPreset: getPresetMock,
   getPresetModelCatalog: getPresetModelCatalogMock,
+  getHermesPresetTransportConfig: getHermesPresetTransportConfigMock,
   loadPresets: loadPresetsMock,
+  loadPresetsWithVersion: async () => ({ presets: await loadPresetsMock(), version: 'test-presets-v1' }),
 }));
 
 vi.mock('../../src/context/memory-search.js', () => ({
@@ -4011,6 +4015,7 @@ describe('handleWebCommand transport queue behavior', () => {
         env: { ANTHROPIC_API_KEY: 'owner-secret' },
         defaultModel: 'MiniMax-M2.7',
       }],
+      version: 'test-presets-v1',
     });
   });
 
@@ -7961,6 +7966,231 @@ describe('handleWebCommand transport queue behavior', () => {
       expect(queueTaskIntentMock).not.toHaveBeenCalled();
       expect(registerTaskIntentMock).not.toHaveBeenCalled();
       expect(transportSend).toHaveBeenCalled();
+    });
+  });
+
+  describe('Hermes preset confirmed model switch', () => {
+    const hermesRecord = {
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'hermes-acp',
+      runtimeType: 'transport',
+      state: 'idle',
+      ccPreset: 'glm5.3',
+      requestedModel: 'glm-5.3-flash',
+      activeModel: 'glm-5.3-flash',
+      modelDisplay: 'glm-5.3-flash',
+      presetContextWindow: 1_000_000,
+      sessionInstanceId: 'hermes-inst-1',
+      runtimeEpoch: 1,
+      providerSessionId: 'hermes-route-1',
+    };
+
+    beforeEach(() => {
+      getPresetMock.mockResolvedValue({
+        name: 'glm5.3',
+        env: { ANTHROPIC_MODEL: 'glm-5.3-flash' },
+        availableModels: [{ id: 'glm-5.3-flash' }, { id: 'glm-5' }],
+      });
+      getHermesPresetTransportConfigMock.mockResolvedValue({
+        env: { IMCODES_CC_PRESET: 'glm5.3', HERMES_MODEL: 'glm-5' },
+        model: 'glm-5',
+        contextWindow: 1_000_000,
+        systemPrompt: 'Authoritative runtime model: glm-5.',
+      });
+    });
+
+    it('refuses Hermes preset switch when ACP rejects without mutating systemPrompt, record, or emitting switched notice', async () => {
+      const setSystemPrompt = vi.fn();
+      const applyAgentId = vi.fn().mockRejectedValue(new Error('Session is busy; switch models while the session is idle'));
+      getSessionMock.mockReturnValue(hermesRecord);
+      getTransportRuntimeMock.mockReturnValue({
+        supportsConfirmedModelSelection: true,
+        providerSessionId: 'hermes-route-1',
+        applyAgentId,
+        setSystemPrompt,
+        pendingCount: 0,
+        sending: false,
+        getStatus: () => 'running',
+      });
+
+      const result = await switchSessionModelNow('deck_transport_brain', 'glm-5', undefined, serverLink as any);
+
+      expect(result).toMatchObject({
+        ok: false,
+        code: SESSION_MODEL_CONTROL_ERROR.MODEL_SWITCH_FAILED,
+        error: 'Session is busy; switch models while the session is idle',
+      });
+      expect(applyAgentId).toHaveBeenCalledWith('glm-5');
+      expect(setSystemPrompt).not.toHaveBeenCalled();
+      expect(upsertSessionMock).not.toHaveBeenCalled();
+      expect(emitMock).not.toHaveBeenCalledWith(
+        'deck_transport_brain',
+        'assistant.text',
+        expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED }),
+        expect.any(Object),
+      );
+    });
+
+    it('records pending requestedModel and MODEL_SWITCH_PENDING on NEXT_START without mutating activeModel, systemPrompt, or emitting usage/MODEL_SWITCHED', async () => {
+      const setSystemPrompt = vi.fn();
+      const applyAgentId = vi.fn().mockResolvedValue('next_start');
+      getSessionMock.mockReturnValue({ ...hermesRecord, providerSessionId: undefined });
+      getTransportRuntimeMock.mockReturnValue({
+        supportsConfirmedModelSelection: true,
+        providerSessionId: undefined,
+        applyAgentId,
+        setSystemPrompt,
+        pendingCount: 0,
+        sending: false,
+        getStatus: () => 'idle',
+      });
+
+      const result = await switchSessionModelNow('deck_transport_brain', 'glm-5', undefined, serverLink as any);
+
+      expect(result).toMatchObject({ ok: true, model: 'glm-5', previousModel: 'glm-5.3-flash', applied: 'next_start' });
+      expect(setSystemPrompt).not.toHaveBeenCalled();
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+        requestedModel: 'glm-5',
+        activeModel: 'glm-5.3-flash',
+        modelDisplay: 'glm-5.3-flash',
+        transportConfig: expect.objectContaining({ hermesPendingModelSwitch: 'glm-5' }),
+      }));
+      expect(emitMock).not.toHaveBeenCalledWith(
+        'deck_transport_brain',
+        'usage.update',
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(emitMock).not.toHaveBeenCalledWith(
+        'deck_transport_brain',
+        'assistant.text',
+        expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED }),
+        expect.anything(),
+      );
+      expect(emitMock).toHaveBeenCalledWith(
+        'deck_transport_brain',
+        'assistant.text',
+        expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING }),
+        expect.anything(),
+      );
+
+      // Unloaded runtime (undefined) likewise records pending state cleanly without premature activeModel/notification
+      upsertSessionMock.mockClear();
+      emitMock.mockClear();
+      getSessionMock.mockReturnValue({ ...hermesRecord, providerSessionId: undefined });
+      getTransportRuntimeMock.mockReturnValue(undefined);
+      const unloadedRes = await switchSessionModelNow('deck_transport_brain', 'glm-5', undefined, serverLink as any);
+      expect(unloadedRes).toMatchObject({ ok: true, model: 'glm-5', applied: 'next_start' });
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+        requestedModel: 'glm-5',
+        activeModel: 'glm-5.3-flash',
+        transportConfig: expect.objectContaining({ hermesPendingModelSwitch: 'glm-5' }),
+      }));
+      expect(emitMock).toHaveBeenCalledWith(
+        'deck_transport_brain',
+        'assistant.text',
+        expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING }),
+        expect.anything(),
+      );
+      expect(emitMock).not.toHaveBeenCalledWith(
+        'deck_transport_brain',
+        'usage.update',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('confirms LIVE switch and rejects if runtime ownership changes mid-flight', async () => {
+      const setSystemPrompt = vi.fn();
+      let resolveSwitch!: (val: string) => void;
+      const applyAgentId = vi.fn().mockImplementation(
+        () => new Promise<string>((resolve) => { resolveSwitch = resolve; }),
+      );
+      getSessionMock.mockReturnValue(hermesRecord);
+      getTransportRuntimeMock.mockReturnValue({
+        supportsConfirmedModelSelection: true,
+        providerSessionId: 'hermes-route-1',
+        applyAgentId,
+        setSystemPrompt,
+        pendingCount: 0,
+        sending: false,
+        getStatus: () => 'idle',
+      });
+
+      // Live confirmation
+      const okPromise = switchSessionModelNow('deck_transport_brain', 'glm-5', undefined, serverLink as any);
+      await flushAsync();
+      resolveSwitch('live');
+      const okRes = await okPromise;
+      expect(okRes).toMatchObject({ ok: true, model: 'glm-5', applied: 'live' });
+      expect(setSystemPrompt).toHaveBeenCalledWith('Authoritative runtime model: glm-5.');
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+        requestedModel: 'glm-5',
+        activeModel: 'glm-5',
+      }));
+
+      // Ownership change mid-flight refuses without mutating new owner
+      upsertSessionMock.mockClear();
+      setSystemPrompt.mockClear();
+      const racePromise = switchSessionModelNow('deck_transport_brain', 'glm-5', undefined, serverLink as any);
+      await flushAsync();
+      getSessionMock.mockReturnValue({ ...hermesRecord, sessionInstanceId: 'hermes-inst-2' });
+      resolveSwitch('live');
+      const raceRes = await racePromise;
+      expect(raceRes).toMatchObject({ ok: false, code: SESSION_MODEL_CONTROL_ERROR.SESSION_CHANGED });
+      expect(setSystemPrompt).not.toHaveBeenCalled();
+      expect(upsertSessionMock).not.toHaveBeenCalled();
+    });
+
+    it('uses running delegate route snapshot instead of mutated cc-presets.json on LIVE Hermes hot switch', async () => {
+      const setSystemPrompt = vi.fn();
+      const applyAgentId = vi.fn().mockResolvedValue('live');
+      getSessionMock.mockReturnValue(hermesRecord);
+      getTransportRuntimeMock.mockReturnValue({
+        supportsConfirmedModelSelection: true,
+        providerSessionId: 'hermes-route-1',
+        applyAgentId,
+        setSystemPrompt,
+        pendingCount: 0,
+        sending: false,
+        getStatus: () => 'idle',
+      });
+      getProviderMock.mockImplementation((providerId: string) => (
+        providerId === 'hermes-acp'
+          ? {
+              getRoutePresetSnapshot: (routeId: string) => (
+                routeId === 'hermes-route-1'
+                  ? {
+                      presetSlug: 'glm5-3',
+                      presetName: 'glm5.3',
+                      authType: 'anthropic',
+                      baseUrl: 'https://old-live-route.example/api/anthropic',
+                      contextWindow: 1_000_000,
+                    }
+                  : undefined
+              ),
+            }
+          : undefined
+      ));
+      getHermesPresetTransportConfigMock.mockResolvedValue({
+        env: { IMCODES_CC_PRESET: 'glm5.3', HERMES_MODEL: 'glm-9' },
+        model: 'glm-9',
+        contextWindow: 128_000,
+        systemPrompt: 'Authoritative provider endpoint: https://mutated-live.example/v1. Authoritative runtime model: glm-9.',
+      });
+
+      const res = await switchSessionModelNow('deck_transport_brain', 'glm-5', undefined, serverLink as any);
+      expect(res).toMatchObject({ ok: true, model: 'glm-5', applied: 'live' });
+      expect(getHermesPresetTransportConfigMock).not.toHaveBeenCalled();
+      expect(setSystemPrompt).toHaveBeenCalledWith(
+        expect.stringContaining('Authoritative provider endpoint: https://old-live-route.example/api/anthropic.'),
+      );
+      expect(setSystemPrompt).toHaveBeenCalledWith(
+        expect.stringContaining('Authoritative runtime model: glm-5.'),
+      );
+      getProviderMock.mockReset();
     });
   });
 

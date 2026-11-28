@@ -197,6 +197,22 @@ export class SharedContextDispatchError extends Error {
   }
 }
 
+export interface TurnPayloadSystemPromptRebuilder {
+  initialSystemPrompt: string | undefined;
+  rebuild: (nextSystemPrompt: string | undefined) => ProviderContextPayload;
+}
+
+const turnPayloadSystemPromptRebuilders = new WeakMap<
+  ProviderContextPayload,
+  TurnPayloadSystemPromptRebuilder
+>();
+
+export function getTurnPayloadSystemPromptRebuilder(
+  payload: ProviderContextPayload,
+): TurnPayloadSystemPromptRebuilder | undefined {
+  return turnPayloadSystemPromptRebuilders.get(payload);
+}
+
 export function dispatchSharedContextSend(
   provider: TransportProvider,
   sessionId: string,
@@ -206,6 +222,15 @@ export function dispatchSharedContextSend(
   const flags = options?.flags ?? getSharedContextCutoverFlags();
   return resolveTransportRuntimeAssemblyInput(input, options).then(async (resolvedInput) => {
     const payload = buildProviderContextPayload(provider, resolvedInput);
+    if (flags.runtimeSend) {
+      turnPayloadSystemPromptRebuilders.set(payload, {
+        initialSystemPrompt: resolvedInput.systemPrompt,
+        rebuild: (nextSystemPrompt) => buildProviderContextPayload(provider, {
+          ...resolvedInput,
+          systemPrompt: nextSystemPrompt,
+        }),
+      });
+    }
     if (flags.shadowDiagnostics) {
       options?.onShadowDiagnostics?.(payload.diagnostics);
     }

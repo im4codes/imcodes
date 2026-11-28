@@ -266,6 +266,7 @@ import { TransportSessionRuntime } from '../../src/agent/transport-session-runti
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
 import { DeepseekHarnessProvider } from '../../src/agent/providers/deepseek-harness.js';
 import { openCodeSdkRuntimeHooks } from '../../src/agent/providers/opencode-sdk.js';
+import { KimiSdkProvider } from '../../src/agent/providers/kimi-sdk.js';
 import {
   ensureTransportRuntimeAvailable,
   getTransportRuntime,
@@ -3977,7 +3978,7 @@ describe('sdk transport session restore', () => {
       }
 
       const updated = mocks.store.get(name);
-      expect(resolveEnvSpy).toHaveBeenCalledWith('custom-codex-cli-preset', undefined);
+      expect(resolveEnvSpy).toHaveBeenCalledWith('custom-codex-cli-preset', undefined, 'custom-codex-model', { syncContextWindow: false });
       expect(getPresetSpy).toHaveBeenCalledWith('custom-codex-cli-preset');
       expect(updated?.ccPreset).toBe('custom-codex-cli-preset');
       expect(updated?.codexAvailableModels).toEqual(['custom-codex-model']);
@@ -4236,6 +4237,499 @@ describe('sdk transport session restore', () => {
     } finally {
       initSpy.mockRestore();
       kimiPresetSpy.mockRestore();
+    }
+  });
+
+  it('defers Hermes preset activeModel, systemPrompt, usage.update, and MODEL_SWITCHED across restore until provider confirms pending model', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const hermesPresetSpy = vi.spyOn(ccPresets, 'getHermesPresetTransportConfig').mockImplementation(
+      async (_presetName, requestedModel) => ({
+        env: { IMCODES_CC_PRESET: 'glm5.3', HERMES_MODEL: requestedModel ?? 'glm-5.3-flash' },
+        hermesPreset: {
+          presetSlug: 'glm5-3-restore',
+          presetName: 'glm5.3',
+          authType: 'anthropic',
+          baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+          apiKey: 'test-hermes-key',
+          model: requestedModel ?? 'glm-5.3-flash',
+          availableModels: ['glm-5.3-flash', 'glm-5'],
+          contextWindow: 1_000_000,
+        },
+        model: requestedModel ?? 'glm-5.3-flash',
+        availableModels: ['glm-5.3-flash', 'glm-5'],
+        contextWindow: 1_000_000,
+        systemPrompt: `Authoritative runtime model: ${requestedModel ?? 'glm-5.3-flash'}.`,
+      }),
+    );
+    const connectSpy = vi.spyOn(KimiSdkProvider.prototype, 'connect').mockResolvedValue(undefined);
+    const createSpy = vi.spyOn(KimiSdkProvider.prototype, 'createSession').mockImplementation(
+      async (cfg) => cfg.bindExistingKey ?? cfg.sessionKey,
+    );
+    const setPromptSpy = vi.spyOn(TransportSessionRuntime.prototype, 'setSystemPrompt');
+    const name = 'deck_hermes_pending_confirm_brain';
+    try {
+      await connectProvider('hermes-acp', { binaryPath: '/fake/hermes' });
+      mocks.store.set(name, {
+        name,
+        projectName: 'hermesconfirm',
+        role: 'brain',
+        agentType: 'hermes-acp',
+        projectDir: tempDir,
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'hermes-acp',
+        providerSessionId: 'hermes-route-pending-1',
+        providerResumeId: 'hermes-acp-pending-1',
+        sessionInstanceId: 'hermes-inst-confirm-1',
+        runtimeEpoch: 'hermes-epoch-confirm-1',
+        ccPreset: 'glm5.3',
+        requestedModel: 'glm-5',
+        activeModel: 'glm-5.3-flash',
+        modelDisplay: 'glm-5.3-flash',
+        transportConfig: { hermesPendingModelSwitch: 'glm-5' },
+        presetContextWindow: 1_000_000,
+      });
+      timelineEmitterEmitMock.mockClear();
+
+      await restoreTransportSessions('hermes-acp', { sessionName: name });
+      const runtime = getTransportRuntime(name)!;
+      expect(runtime).toBeDefined();
+
+      // Before provider confirmation: activeModel & systemPrompt stay on glm-5.3-flash, no MODEL_SWITCHED or usage.update
+      expect(mocks.store.get(name)?.activeModel).toBe('glm-5.3-flash');
+      expect(mocks.store.get(name)?.requestedModel).toBe('glm-5');
+      expect(setPromptSpy).toHaveBeenCalledWith('Authoritative runtime model: glm-5.3-flash.');
+      expect(setPromptSpy).not.toHaveBeenCalledWith('Authoritative runtime model: glm-5.');
+      expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+        name,
+        'usage.update',
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+        name,
+        'assistant.text',
+        expect.objectContaining({ noticeCode: 'model_switched' }),
+        expect.anything(),
+      );
+
+      // Provider confirms pending switch via session.info
+      (runtime as any)._onSessionInfoChange?.({ model: 'glm-5' });
+      await vi.waitFor(() => {
+        expect(setPromptSpy).toHaveBeenCalledWith(expect.stringContaining('Authoritative runtime model: glm-5.'));
+      });
+      expect(setPromptSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Authoritative provider endpoint: https://open.bigmodel.cn/api/anthropic.'),
+      );
+      expect(mocks.store.get(name)?.activeModel).toBe('glm-5');
+      expect(mocks.store.get(name)?.modelDisplay).toBe('glm-5');
+      expect(mocks.store.get(name)?.transportConfig?.hermesPendingModelSwitch).toBeUndefined();
+      expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+        name,
+        'usage.update',
+        expect.objectContaining({ model: 'glm-5' }),
+        expect.anything(),
+      );
+      expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+        name,
+        'assistant.text',
+        expect.objectContaining({ noticeCode: 'model_switched' }),
+        expect.anything(),
+      );
+    } finally {
+      await stopTransportRuntimeSession(name).catch(() => {});
+      hermesPresetSpy.mockRestore();
+      connectSpy.mockRestore();
+      createSpy.mockRestore();
+      setPromptSpy.mockRestore();
+    }
+  });
+
+  it('preserves one persistent hermesProfileOwnerKey across two explicit non-fresh relaunches without copying history and rotates on fresh', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const hermesPresetSpy = vi.spyOn(ccPresets, 'getHermesPresetTransportConfig').mockImplementation(
+      async (_presetName, requestedModel) => ({
+        env: { IMCODES_CC_PRESET: 'glm5.3', HERMES_MODEL: requestedModel ?? 'glm-5.3-flash' },
+        hermesPreset: {
+          presetSlug: 'glm5-3-relaunch',
+          presetName: 'glm5.3',
+          authType: 'anthropic',
+          baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+          apiKey: 'test-hermes-key',
+          model: requestedModel ?? 'glm-5.3-flash',
+          availableModels: ['glm-5.3-flash', 'glm-5'],
+          contextWindow: 1_000_000,
+        },
+        model: requestedModel ?? 'glm-5.3-flash',
+        availableModels: ['glm-5.3-flash', 'glm-5'],
+        contextWindow: 1_000_000,
+        systemPrompt: `Authoritative runtime model: ${requestedModel ?? 'glm-5.3-flash'}.`,
+      }),
+    );
+    const { HermesAcpProvider, resolveHermesPresetProfileDir } = await import('../../src/agent/providers/hermes-acp.js');
+    const seenOwnerKeys: Array<string | undefined> = [];
+    const seenRouteKeys: string[] = [];
+    const connectSpy = vi.spyOn(KimiSdkProvider.prototype, 'connect').mockResolvedValue(undefined);
+    const createSpy = vi.spyOn(KimiSdkProvider.prototype, 'createSession').mockImplementation(async (cfg) => {
+      seenRouteKeys.push(cfg.bindExistingKey ?? cfg.sessionKey);
+      return cfg.bindExistingKey ?? cfg.sessionKey;
+    });
+    const origCreate = HermesAcpProvider.prototype.createSession;
+    const hermesCreateSpy = vi.spyOn(HermesAcpProvider.prototype, 'createSession').mockImplementation(async function (this: any, cfg) {
+      seenOwnerKeys.push(cfg.hermesPreset?.profileOwnerKey);
+      return await origCreate.call(this, cfg);
+    });
+    const name = 'deck_hermes_relaunch_twice_brain';
+    try {
+      await connectProvider('hermes-acp', { binaryPath: '/fake/hermes' });
+      await launchTransportSession({
+        name,
+        projectName: 'hermesrelaunch',
+        role: 'brain',
+        agentType: 'hermes-acp',
+        projectDir: tempDir,
+        ccPreset: 'glm5.3',
+        requestedModel: 'glm-5.3-flash',
+      });
+      const owner1 = mocks.store.get(name)?.transportConfig?.hermesProfileOwnerKey as string;
+      expect(typeof owner1).toBe('string');
+      expect(owner1.length).toBeGreaterThan(0);
+
+      // Simulate ACP issuing resumeId + turn 1 persisted in owner1's single state.db
+      const runtime0 = getTransportRuntime(name)!;
+      (runtime0 as any)._onSessionInfoChange?.({ resumeId: 'acp-relaunch-1', model: 'glm-5.3-flash' });
+      const preset = (await hermesPresetSpy.mock.results[0]!.value).hermesPreset;
+      const dir1 = resolveHermesPresetProfileDir(preset, owner1);
+      const { DatabaseSync } = (await import('node:module')).createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+      const db1 = new DatabaseSync(path.join(dir1, 'state.db'));
+      db1.exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, note TEXT);');
+      db1.prepare('INSERT INTO sessions VALUES (?, ?)').run('acp-relaunch-1', 'turn-1');
+      db1.close();
+
+      // Explicit relaunch #1 (non-fresh): routeKey rotates, ownerKey stays owner1, no DB duplicate
+      await relaunchSessionWithSettings(mocks.store.get(name)! as any, { agentType: 'hermes-acp', requestedModel: 'glm-5' });
+      expect(mocks.store.get(name)?.transportConfig?.hermesProfileOwnerKey).toBe(owner1);
+      expect(seenOwnerKeys.at(-1)).toBe(owner1);
+      expect(seenRouteKeys.at(-1)).not.toBe(seenRouteKeys[0]);
+
+      // Add turn 2 into the SAME state.db between relaunch #1 and #2
+      const db2 = new DatabaseSync(path.join(dir1, 'state.db'));
+      db2.prepare('UPDATE sessions SET note = ? WHERE id = ?').run('turn-1+turn-2', 'acp-relaunch-1');
+      db2.close();
+
+      // Explicit relaunch #2 (non-fresh): still opens owner1's exact directory with both turns intact
+      await relaunchSessionWithSettings(mocks.store.get(name)! as any, { agentType: 'hermes-acp', requestedModel: 'glm-5' });
+      expect(mocks.store.get(name)?.transportConfig?.hermesProfileOwnerKey).toBe(owner1);
+      expect(seenOwnerKeys.at(-1)).toBe(owner1);
+      const dbCheck = new DatabaseSync(path.join(dir1, 'state.db'), { readOnly: true });
+      expect(dbCheck.prepare('SELECT note FROM sessions WHERE id = ?').get('acp-relaunch-1')).toEqual({ note: 'turn-1+turn-2' });
+      dbCheck.close();
+
+      // Fresh relaunch (/clear): rotates to a brand-new ownerKey so old history is isolated
+      await relaunchSessionWithSettings(mocks.store.get(name)! as any, { agentType: 'hermes-acp', fresh: true });
+      const owner2 = mocks.store.get(name)?.transportConfig?.hermesProfileOwnerKey as string;
+      expect(owner2).toBeTruthy();
+      expect(owner2).not.toBe(owner1);
+    } finally {
+      await stopTransportRuntimeSession(name).catch(() => {});
+      hermesCreateSpy.mockRestore();
+      createSpy.mockRestore();
+      connectSpy.mockRestore();
+      hermesPresetSpy.mockRestore();
+    }
+  });
+
+  it('intercepts real first ACP prompt to deliver newly confirmed model facts (A->B), aborts send on rejection, and blocks stale confirm race', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    let resolveDelayedPreset!: (val: any) => void;
+    let delayPresetLookup = false;
+    const makePresetResult = (modelId: string) => ({
+      env: { IMCODES_CC_PRESET: 'glm5.3', HERMES_MODEL: modelId },
+      hermesPreset: {
+        presetSlug: 'glm5-3-first-turn',
+        presetName: 'glm5.3',
+        authType: 'anthropic' as const,
+        baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+        apiKey: 'test-hermes-key',
+        model: modelId,
+        availableModels: ['glm-5.3-flash', 'glm-5', 'glm-5-newer'],
+        contextWindow: 1_000_000,
+      },
+      model: modelId,
+      availableModels: ['glm-5.3-flash', 'glm-5', 'glm-5-newer'],
+      contextWindow: 1_000_000,
+      systemPrompt: `Authoritative runtime model: ${modelId}.`,
+    });
+    const hermesPresetSpy = vi.spyOn(ccPresets, 'getHermesPresetTransportConfig').mockImplementation(
+      (_presetName, requestedModel) => {
+        const target = requestedModel ?? 'glm-5.3-flash';
+        if (delayPresetLookup && target === 'glm-5') {
+          return new Promise((resolve) => { resolveDelayedPreset = resolve; });
+        }
+        return Promise.resolve(makePresetResult(target));
+      },
+    );
+    const { HermesAcpProvider } = await import('../../src/agent/providers/hermes-acp.js');
+    const promptPayloads: string[] = [];
+    let allowSetModel = true;
+    const connectSpy = vi.spyOn(KimiSdkProvider.prototype, 'connect').mockImplementation(async function (this: any) {
+      if (this.isPresetDelegate) {
+        this.config = { agent: 'hermes-acp' };
+        this.initPromise = Promise.resolve();
+        this.connection = {
+          connection: { writeQueue: Promise.resolve(), abortController: new AbortController() },
+          loadSession: vi.fn().mockResolvedValue({
+            models: { currentModelId: 'custom:glm5-3-first-turn:glm-5.3-flash' },
+          }),
+          unstable_setSessionModel: vi.fn().mockImplementation(async ({ modelId }: { modelId: string }) => {
+            if (!allowSetModel) throw new Error(`Model ${modelId} rejected`);
+          }),
+          prompt: vi.fn().mockImplementation(async (params: { prompt: Array<{ type: string; text?: string }> }) => {
+            promptPayloads.push(params.prompt[0]?.text ?? '');
+            return { stopReason: 'end_turn' };
+          }),
+        };
+      }
+    });
+
+    const nameConfirm = 'deck_hermes_first_prompt_confirm_brain';
+    const nameReject = 'deck_hermes_first_prompt_reject_brain';
+    const nameRace = 'deck_hermes_stale_confirm_race_brain';
+    try {
+      await connectProvider('hermes-acp', { binaryPath: '/fake/hermes' });
+
+      // 1) A -> B pending via NEXT_START: real first ACP prompt delivered to target.prompt MUST carry B's fact text (not A!)
+      mocks.store.set(nameConfirm, {
+        name: nameConfirm,
+        projectName: 'hermesfirstprompt',
+        role: 'brain',
+        agentType: 'hermes-acp',
+        projectDir: tempDir,
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'hermes-acp',
+        providerSessionId: 'hermes-first-prompt-route',
+        providerResumeId: 'hermes-first-prompt-acp',
+        sessionInstanceId: 'hermes-inst-fp-1',
+        runtimeEpoch: 'hermes-epoch-fp-1',
+        ccPreset: 'glm5.3',
+        requestedModel: 'glm-5',
+        activeModel: 'glm-5.3-flash',
+        modelDisplay: 'glm-5.3-flash',
+        transportConfig: { hermesPendingModelSwitch: 'glm-5', hermesProfileOwnerKey: 'owner-fp-1' },
+        presetContextWindow: 1_000_000,
+      });
+      await restoreTransportSessions('hermes-acp', { sessionName: nameConfirm });
+      const runtimeConfirm = getTransportRuntime(nameConfirm)!;
+      timelineEmitterEmitMock.mockClear();
+
+      expect(runtimeConfirm.send('What model am I running?')).toBe('sent');
+      await vi.waitFor(() => expect(promptPayloads).toHaveLength(1));
+      expect(promptPayloads[0]).toContain('Authoritative runtime model: glm-5.');
+      expect(promptPayloads[0]).not.toContain('Authoritative runtime model: glm-5.3-flash.');
+      expect(mocks.store.get(nameConfirm)?.activeModel).toBe('glm-5');
+      expect(mocks.store.get(nameConfirm)?.transportConfig?.hermesPendingModelSwitch).toBeUndefined();
+      expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+        nameConfirm,
+        'assistant.text',
+        expect.objectContaining({ noticeCode: 'model_switched' }),
+        expect.anything(),
+      );
+
+      // 2) Rejection case: if ACP rejects unstable_setSessionModel, first prompt is NOT sent and activeModel stays on A
+      allowSetModel = false;
+      promptPayloads.length = 0;
+      mocks.store.set(nameReject, {
+        name: nameReject,
+        projectName: 'hermesfirstreject',
+        role: 'brain',
+        agentType: 'hermes-acp',
+        projectDir: tempDir,
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'hermes-acp',
+        providerSessionId: 'hermes-first-reject-route',
+        providerResumeId: 'hermes-first-reject-acp',
+        sessionInstanceId: 'hermes-inst-fr-1',
+        runtimeEpoch: 'hermes-epoch-fr-1',
+        ccPreset: 'glm5.3',
+        requestedModel: 'glm-5',
+        activeModel: 'glm-5.3-flash',
+        modelDisplay: 'glm-5.3-flash',
+        transportConfig: { hermesPendingModelSwitch: 'glm-5', hermesProfileOwnerKey: 'owner-fr-1' },
+        presetContextWindow: 1_000_000,
+      });
+      await restoreTransportSessions('hermes-acp', { sessionName: nameReject });
+      const runtimeReject = getTransportRuntime(nameReject)!;
+      expect(runtimeReject.send('Should fail before prompt')).toBe('sent');
+      await vi.waitFor(() => {
+        expect(runtimeReject.lastProviderError?.message).toContain('Model glm-5 rejected');
+      });
+      expect(promptPayloads).toHaveLength(0);
+      expect(mocks.store.get(nameReject)?.activeModel).toBe('glm-5.3-flash');
+
+      // 3) Stale confirmation race: old 'glm-5' awaiting microtask commit cannot overwrite a newer switch ('glm-5-newer')
+      allowSetModel = true;
+      mocks.store.set(nameRace, {
+        name: nameRace,
+        projectName: 'hermesrace',
+        role: 'brain',
+        agentType: 'hermes-acp',
+        projectDir: tempDir,
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'hermes-acp',
+        providerSessionId: 'hermes-race-route',
+        providerResumeId: 'hermes-race-acp',
+        sessionInstanceId: 'hermes-inst-race-1',
+        runtimeEpoch: 'hermes-epoch-race-1',
+        ccPreset: 'glm5.3',
+        requestedModel: 'glm-5',
+        activeModel: 'glm-5.3-flash',
+        modelDisplay: 'glm-5.3-flash',
+        transportConfig: { hermesPendingModelSwitch: 'glm-5', hermesProfileOwnerKey: 'owner-race-1' },
+        presetContextWindow: 1_000_000,
+      });
+      await restoreTransportSessions('hermes-acp', { sessionName: nameRace });
+      const runtimeRace = getTransportRuntime(nameRace)!;
+      timelineEmitterEmitMock.mockClear();
+      (runtimeRace as any)._onSessionInfoChange?.({ model: 'glm-5' });
+
+      // Newer switch on SAME runtime supersedes intent immediately before stale confirmation microtask commits
+      await runtimeRace.applyAgentId('glm-5-newer');
+      runtimeRace.setSystemPrompt('Authoritative runtime model: glm-5-newer.');
+      mocks.store.set(nameRace, {
+        ...mocks.store.get(nameRace)!,
+        requestedModel: 'glm-5-newer',
+        activeModel: 'glm-5-newer',
+        modelDisplay: 'glm-5-newer',
+      });
+      await expect(runtimeRace.awaitPendingModelConfirmation()).resolves.toBe('Authoritative runtime model: glm-5-newer.');
+      expect(mocks.store.get(nameRace)?.activeModel).toBe('glm-5-newer');
+      expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+        nameRace,
+        'assistant.text',
+        expect.objectContaining({ noticeParams: { model: 'glm-5' } }),
+        expect.anything(),
+      );
+
+      // 4) F3-R4: Post-launch preset mutation (endpoint changed, 'glm-5' removed from preset) must NOT corrupt Turn-1 facts
+      let presetMutated = false;
+      hermesPresetSpy.mockImplementation((_presetName, requestedModel) => {
+        if (!presetMutated) {
+          const model = requestedModel ?? 'glm-5.3-flash';
+          return Promise.resolve({
+            env: { IMCODES_CC_PRESET: 'glm5.3', HERMES_MODEL: model },
+            hermesPreset: {
+              presetSlug: 'glm5-3-first-turn',
+              presetName: 'glm5.3',
+              authType: 'anthropic' as const,
+              baseUrl: 'https://old-route.example/api/anthropic',
+              apiKey: 'secret-old-route-key',
+              model,
+              availableModels: ['glm-5.3-flash', 'glm-5'],
+              contextWindow: 1_000_000,
+            },
+            model,
+            availableModels: ['glm-5.3-flash', 'glm-5'],
+            contextWindow: 1_000_000,
+            systemPrompt: `Authoritative provider endpoint: https://old-route.example/api/anthropic. Authoritative runtime model: ${model}.`,
+          });
+        }
+        return Promise.resolve({
+          env: { IMCODES_CC_PRESET: 'glm5.3', HERMES_MODEL: 'glm-9' },
+          hermesPreset: {
+            presetSlug: 'glm5-3-first-turn',
+            presetName: 'glm5.3',
+            authType: 'anthropic' as const,
+            baseUrl: 'https://mutated-new.example/v1',
+            apiKey: 'secret-mutated-key',
+            model: 'glm-9',
+            availableModels: ['glm-9'],
+            contextWindow: 128_000,
+          },
+          model: 'glm-9',
+          availableModels: ['glm-9'],
+          contextWindow: 128_000,
+          systemPrompt: 'Authoritative provider endpoint: https://mutated-new.example/v1. Authoritative runtime model: glm-9.',
+        });
+      });
+
+      const nameMutate = 'deck_hermes_mutated_preset_turn1_brain';
+      promptPayloads.length = 0;
+      mocks.store.set(nameMutate, {
+        name: nameMutate,
+        projectName: 'hermesmutate',
+        role: 'brain',
+        agentType: 'hermes-acp',
+        projectDir: tempDir,
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'hermes-acp',
+        providerSessionId: 'hermes-mutated-route',
+        providerResumeId: 'hermes-mutated-acp',
+        sessionInstanceId: 'hermes-inst-mutate-1',
+        runtimeEpoch: 'hermes-epoch-mutate-1',
+        ccPreset: 'glm5.3',
+        requestedModel: 'glm-5',
+        activeModel: 'glm-5.3-flash',
+        modelDisplay: 'glm-5.3-flash',
+        transportConfig: { hermesPendingModelSwitch: 'glm-5', hermesProfileOwnerKey: 'owner-mutate-1' },
+        presetContextWindow: 1_000_000,
+      });
+      await restoreTransportSessions('hermes-acp', { sessionName: nameMutate });
+      // Mutate preset AFTER running delegate captured launch config, BEFORE first ACP turn
+      presetMutated = true;
+      const runtimeMutate = getTransportRuntime(nameMutate)!;
+      timelineEmitterEmitMock.mockClear();
+      expect(runtimeMutate.send('Report actual running route')).toBe('sent');
+      await vi.waitFor(() => expect(promptPayloads).toHaveLength(1));
+      expect(promptPayloads[0]).toContain('Authoritative provider endpoint: https://old-route.example/api/anthropic.');
+      expect(promptPayloads[0]).toContain('Authoritative runtime model: glm-5.');
+      expect(promptPayloads[0]).not.toContain('mutated-new.example');
+      expect(promptPayloads[0]).not.toContain('glm-9');
+      expect(promptPayloads[0]).not.toContain('secret-old-route-key');
+      expect(promptPayloads[0]).not.toContain('secret-mutated-key');
+      expect(mocks.store.get(nameMutate)?.activeModel).toBe('glm-5');
+      expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+        nameMutate,
+        'usage.update',
+        expect.objectContaining({ model: 'glm-5', contextWindow: 202752 }),
+        expect.anything(),
+      );
+      expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+        nameMutate,
+        'assistant.text',
+        expect.objectContaining({ noticeCode: 'model_switched', noticeParams: { model: 'glm-5' } }),
+        expect.anything(),
+      );
+      await stopTransportRuntimeSession(nameMutate).catch(() => {});
+    } finally {
+      await stopTransportRuntimeSession(nameConfirm).catch(() => {});
+      await stopTransportRuntimeSession(nameReject).catch(() => {});
+      await stopTransportRuntimeSession(nameRace).catch(() => {});
+      connectSpy.mockRestore();
+      hermesPresetSpy.mockRestore();
     }
   });
 });

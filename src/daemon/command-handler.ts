@@ -221,7 +221,7 @@ import { getLastMuseQuotaActivityAt, recordMuseQuotaActivity, refreshMuseQuotaMe
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
 import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '../../shared/codex-credit-history.js';
-import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { buildHermesRuntimeFactsPrompt, HERMES_AGENT_PROVIDER_ID, type HermesPresetRouteSnapshot } from '../../shared/hermes-agent.js';
 import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import { refreshCodexQuotaMetadataForSessions } from './codex-quota-refresh.js';
@@ -3515,7 +3515,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         agentType: agentType as AgentType,
         projectDir: dir,
         fresh: true,
-        ...((agentType === 'deepseek-harness' || agentType === 'pi' || agentType === 'kimi-sdk') && ccPresetName ? { ccPreset: ccPresetName } : {}),
+        ...((agentType === 'deepseek-harness' || agentType === 'pi' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID) && ccPresetName ? { ccPreset: ccPresetName } : {}),
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
@@ -3890,6 +3890,14 @@ async function resolveValidatedModelList(record: SessionRecord): Promise<{ model
       const preset = await getPreset(record.ccPreset);
       return { models: preset ? getPresetAvailableModelIds(preset) : [] };
     }
+    case HERMES_AGENT_PROVIDER_ID: {
+      if (record.ccPreset) {
+        const { getPreset, getPresetAvailableModelIds } = await import('./cc-presets.js');
+        const preset = await getPreset(record.ccPreset);
+        if (preset) return { models: getPresetAvailableModelIds(preset) };
+      }
+      return null;
+    }
     default:
       return null;
   }
@@ -3931,7 +3939,9 @@ async function applyTransportModelSwitch(
   let applied: typeof SESSION_MODEL_APPLIED[keyof typeof SESSION_MODEL_APPLIED] = SESSION_MODEL_APPLIED.LIVE;
 
   const validated = await resolveValidatedModelList(record);
-  if (agentType === AGY_SDK_PROVIDER_ID) {
+  const requiresConfirmedOwner = agentType === AGY_SDK_PROVIDER_ID
+    || (agentType === HERMES_AGENT_PROVIDER_ID && Boolean(record.ccPreset));
+  if (requiresConfirmedOwner) {
     if (!currentOwner()) return modelOwnerChanged(sessionName);
     // Validation yielded. Preserve native-start/info/queue updates from the
     // current owner rather than writing back the pre-await record snapshot.
@@ -4075,7 +4085,98 @@ async function applyTransportModelSwitch(
       return refuse(SESSION_MODEL_CONTROL_ERROR.MODEL_SWITCH_FAILED, detail, DAEMON_USER_NOTICE_CODE.SESSION_INLINE_ERROR, undefined, detail);
     }
     contextWindow = resolveContextWindow(undefined, requestedModel);
+  } else if (agentType === HERMES_AGENT_PROVIDER_ID && record.ccPreset) {
+    const availableModels = validated?.models ?? [];
+    if (availableModels.length > 0 && !availableModels.includes(requestedModel)) {
+      return refuse(
+        SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+        `Unknown Hermes preset model: ${requestedModel}`,
+        DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+        availableModels,
+      );
+    }
+    let fallbackPresetContextWindow: number | undefined;
+    let fallbackPresetSystemPrompt: string | undefined;
+    const hermesProvider = getProvider(HERMES_AGENT_PROVIDER_ID) as {
+      getRoutePresetSnapshot?: (routeId: string) => HermesPresetRouteSnapshot | undefined;
+    } | undefined;
+    const routeSnapshot = record.providerSessionId
+      ? hermesProvider?.getRoutePresetSnapshot?.(record.providerSessionId)
+      : undefined;
+    if (!routeSnapshot) {
+      const { getHermesPresetTransportConfig } = await import('./cc-presets.js');
+      const presetConfig = await getHermesPresetTransportConfig(record.ccPreset, requestedModel);
+      fallbackPresetContextWindow = presetConfig.contextWindow;
+      fallbackPresetSystemPrompt = presetConfig.systemPrompt;
+    }
+    if (!currentOwner()) return modelOwnerChanged(sessionName);
+    record = getSession(sessionName)!;
+    try {
+      applied = SESSION_MODEL_APPLIED.NEXT_START;
+      if (transportRuntime?.supportsConfirmedModelSelection) {
+        applied = await transportRuntime.applyAgentId(requestedModel);
+      } else {
+        transportRuntime?.setAgentId(requestedModel);
+      }
+      if (!currentOwner()) return modelOwnerChanged(sessionName);
+    } catch (error) {
+      if (!currentOwner()) return modelOwnerChanged(sessionName);
+      const detail = typeof error === 'object' && error !== null && 'message' in error
+        ? String(error.message) : 'Hermes model selection was not confirmed';
+      return refuse(SESSION_MODEL_CONTROL_ERROR.MODEL_SWITCH_FAILED, detail, DAEMON_USER_NOTICE_CODE.SESSION_INLINE_ERROR, undefined, detail);
+    }
+    const latestRecord = getSession(sessionName) ?? record;
+    deferred = applied !== SESSION_MODEL_APPLIED.LIVE;
+    const baseTransportConfig = { ...(latestRecord.transportConfig ?? {}) };
+    delete baseTransportConfig.hermesPendingModelSwitch;
+    const nextTransportConfig = deferred && requestedModel !== latestRecord.activeModel
+      ? { ...baseTransportConfig, hermesPendingModelSwitch: requestedModel }
+      : (Object.keys(baseTransportConfig).length > 0 ? baseTransportConfig : undefined);
+    if (!deferred) {
+      const latestRouteSnapshot = (
+        latestRecord.providerSessionId
+          ? hermesProvider?.getRoutePresetSnapshot?.(latestRecord.providerSessionId)
+          : undefined
+      ) ?? routeSnapshot;
+      const presetContextWindow = latestRouteSnapshot?.contextWindow
+        ?? fallbackPresetContextWindow
+        ?? latestRecord.presetContextWindow;
+      const nextSystemPrompt = latestRouteSnapshot
+        ? buildHermesRuntimeFactsPrompt({
+            presetName: latestRouteSnapshot.presetName,
+            baseUrl: latestRouteSnapshot.baseUrl,
+            model: requestedModel,
+          })
+        : fallbackPresetSystemPrompt;
+      if (nextSystemPrompt) {
+        transportRuntime?.setSystemPrompt(nextSystemPrompt);
+      }
+      nextRecord = {
+        ...latestRecord,
+        requestedModel,
+        activeModel: requestedModel,
+        modelDisplay: requestedModel,
+        ...(nextTransportConfig ? { transportConfig: nextTransportConfig } : {}),
+        ...(presetContextWindow ? { presetContextWindow } : {}),
+        updatedAt: Date.now(),
+      };
+      if (!nextTransportConfig && 'transportConfig' in nextRecord) {
+        delete nextRecord.transportConfig;
+      }
+      contextWindow = resolveContextWindow(presetContextWindow, requestedModel);
+    } else {
+      nextRecord = {
+        ...latestRecord,
+        requestedModel,
+        ...(nextTransportConfig ? { transportConfig: nextTransportConfig } : {}),
+        updatedAt: Date.now(),
+      };
+      if (!nextTransportConfig && 'transportConfig' in nextRecord) {
+        delete nextRecord.transportConfig;
+      }
+    }
   } else if (isGenericModelSwitchAgent(agentType)) {
+    let presetContextWindow = record.presetContextWindow;
     if (agentType === 'grok-sdk' || (agentType === 'kimi-sdk' && Boolean(record.ccPreset))) {
       const availableModels = validated?.models ?? [];
       if (!availableModels.includes(requestedModel)) {
@@ -4093,9 +4194,13 @@ async function applyTransportModelSwitch(
       requestedModel,
       activeModel: requestedModel,
       modelDisplay: requestedModel,
+      ...(presetContextWindow ? { presetContextWindow } : {}),
       updatedAt: Date.now(),
     };
-    contextWindow = resolveContextWindow(agentType === 'kimi-sdk' ? record.presetContextWindow : undefined, requestedModel);
+    contextWindow = resolveContextWindow(
+      agentType === 'kimi-sdk' ? presetContextWindow : undefined,
+      requestedModel,
+    );
   } else {
     return {
       ok: false,
@@ -4111,13 +4216,14 @@ async function applyTransportModelSwitch(
     void handleGetSessions(serverLink).catch(() => {});
     syncSubSessionIfNeeded(sessionName, serverLink);
   }
-  if (agentType === AGY_SDK_PROVIDER_ID && !currentOwner()) return modelOwnerChanged(sessionName);
+  if (requiresConfirmedOwner && !currentOwner()) return modelOwnerChanged(sessionName);
   if (!deferred) timelineEmitter.emit(sessionName, 'usage.update', { model: requestedModel, contextWindow }, { source: 'daemon', confidence: 'high' });
+  const pendingNoticeText = agentType === AGY_SDK_PROVIDER_ID
+    ? `Antigravity cannot change model inside a running turn; saved ${requestedModel} and it will apply automatically when the current turn ends.`
+    : `Saved ${requestedModel}; it will apply and confirm when the session starts.`;
   timelineEmitter.emit(sessionName, 'assistant.text', {
     ...attachDaemonUserNotice(deferred ? DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING : DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED,
-      deferred
-        ? `Antigravity cannot change model inside a running turn; saved ${requestedModel} and it will apply automatically when the current turn ends.`
-        : `Switched model to ${requestedModel}`, { model: requestedModel }),
+      deferred ? pendingNoticeText : `Switched model to ${requestedModel}`, { model: requestedModel }),
     streaming: false,
     automation: true,
     memoryExcluded: true,
@@ -4191,7 +4297,7 @@ export async function switchSessionModelNow(sessionName: string, model?: string,
   // provider orders native model writes and checks its captured owner/intent.
   const release = live ? () => {} : await getMutex(sessionName).acquire();
   try {
-    if (target.record.agentType === AGY_SDK_PROVIDER_ID && !isCurrentAgyModelOwner(target.record, target.runtime)) return modelOwnerChanged(sessionName);
+    if ((target.record.agentType === AGY_SDK_PROVIDER_ID || (target.record.agentType === HERMES_AGENT_PROVIDER_ID && Boolean(target.record.ccPreset))) && !isCurrentAgyModelOwner(target.record, target.runtime)) return modelOwnerChanged(sessionName);
     const latest = getSession(sessionName) ?? target.record;
     const switched = await applyTransportModelSwitch(latest, target.runtime, requested, serverLink, modelIntent);
     if (!switched.ok) return switched;
