@@ -988,23 +988,16 @@ export async function withBootstrapProcessLock<T>(
       `Timed out acquiring controlled node bootstrap lock: ${lockDbPath}`,
     );
     inTx = true;
-    const result = await fn();
-    await runSqliteLockSqlBounded(
-      db,
-      'COMMIT;',
-      deadline,
-      `Timed out committing controlled node bootstrap lock: ${lockDbPath}`,
-    );
-    inTx = false;
-    return result;
-  } catch (err) {
+    // Mutex-only transaction: zero SQLite writes occur inside `fn()`, so once
+    // `BEGIN IMMEDIATE` succeeds, release in `finally` via `ROLLBACK` without
+    // reusing the acquisition deadline against work duration inside `fn()`.
+    return await fn();
+  } finally {
     if (inTx) {
       try {
         db.exec('ROLLBACK;');
       } catch { /* ignore rollback error */ }
     }
-    throw err;
-  } finally {
     try {
       db.close();
     } catch { /* ignore close error */ }
@@ -1174,6 +1167,19 @@ async function commitPendingReenrollment(
   };
 }
 
+function isDefinitiveRedeemRejection(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = /^enrollment_redeem_failed:(\d{3})(?::|$)/.exec(message);
+  if (match) {
+    const status = Number(match[1]);
+    return status >= 400 && status < 500 && status !== 408 && status !== 429;
+  }
+  return message === 'enrollment_abi_profile_mismatch'
+    || message === 'enrollment_server_url_invalid'
+    || message === 'enrollment_server_url_must_be_origin'
+    || message === 'enrollment_server_url_must_be_https';
+}
+
 async function reenrollExistingInstallation(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
@@ -1201,7 +1207,11 @@ async function reenrollExistingInstallation(
     && normalizeControlledNodeAbiProfile(existingPending.abiProfile) === abiProfile,
   );
   let record: PendingReenrollmentRecord = reusePending && existingPending
-    ? { ...existingPending, ...(existingPending.sourceArtifact ? {} : { sourceArtifact }) }
+    ? {
+      ...existingPending,
+      ...(existingPending.sourceArtifact ? {} : { sourceArtifact }),
+      ...(existingPending.pendingBlob ? {} : { pendingBlob: resolved.blob }),
+    }
     : {
       version: 1,
       targetOrigin,
@@ -1213,15 +1223,24 @@ async function reenrollExistingInstallation(
       },
       previousServerId: existing.serverId,
       previousServerUrl: existing.serverUrl,
+      pendingBlob: resolved.blob,
       sourceArtifact,
       createdAt: Math.max(deps.now, journal.updatedAt),
     };
-  if (!reusePending || !existingPending?.sourceArtifact) {
+  if (!reusePending || !existingPending?.sourceArtifact || !existingPending?.pendingBlob) {
     await deps.persistPendingReenrollment?.(record);
   }
 
-  const newCredential = await deps.redeemEnrollmentV2(resolved.blob, record.identity);
-  record = { ...record, redeemedCredential: newCredential, sourceArtifact };
+  let newCredential: ControlledNodeCredential;
+  try {
+    newCredential = await deps.redeemEnrollmentV2(resolved.blob, record.identity);
+  } catch (err) {
+    if (isDefinitiveRedeemRejection(err)) {
+      await deps.removePendingReenrollment?.().catch(() => {});
+    }
+    throw err;
+  }
+  record = { ...record, redeemedCredential: newCredential, pendingBlob: undefined, sourceArtifact };
   await deps.persistPendingReenrollment?.(record);
 
   return commitPendingReenrollment(
@@ -1349,8 +1368,30 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
     }
   }
   const stableRuntime = await deps.isStableRuntime(journal);
+  let preloadedPending: PendingReenrollmentRecord | null = null;
+  let pendingMatchesExisting = false;
+  if (existing) {
+    preloadedPending = (await deps.loadPendingReenrollment?.()) ?? null;
+    const committedMatch = Boolean(
+      preloadedPending?.redeemedCredential
+      && existing.serverId === preloadedPending.redeemedCredential.serverId
+      && existing.token === preloadedPending.redeemedCredential.token,
+    );
+    const previousMatch = Boolean(
+      preloadedPending?.redeemedCredential
+      && preloadedPending.previousServerId !== undefined
+      && existing.serverId === preloadedPending.previousServerId
+      && (
+        preloadedPending.previousServerUrl === undefined
+        || normalizeServerOriginForCompare(preloadedPending.previousServerUrl)
+          === normalizeServerOriginForCompare(existing.serverUrl)
+      ),
+    );
+    pendingMatchesExisting = committedMatch || previousMatch;
+  }
 
-  if (existing && stableRuntime && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
+  if (existing && stableRuntime && phaseIndex(journal.phase) >= phaseIndex('service_registered')
+    && !(pendingMatchesExisting && preloadedPending?.redeemedCredential)) {
     // A transient maintenance failure on an already healthy stable runtime must
     // not turn the node into a watchdog crash loop; keep serving and retry on
     // the next process start.
@@ -1385,7 +1426,7 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
     if (phaseIndex(journal.phase) < phaseIndex('files_staged')) {
       throw new Error('controlled node credential exists before files_staged journal phase; manual recovery required');
     }
-    if (stableRuntime) {
+    if (stableRuntime && !(pendingMatchesExisting && preloadedPending?.redeemedCredential)) {
       if (journal.phase === 'files_staged') {
         journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
           now: deps.now,
@@ -1407,10 +1448,11 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
 
     let source: VerifiedEnrollmentSource | null = null;
     try {
-      let activePending = (await deps.loadPendingReenrollment?.()) ?? null;
+      let activePending = preloadedPending ?? (await deps.loadPendingReenrollment?.()) ?? null;
       source = await deps.openVerifiedEnrollmentSource(deps.sourceExecutablePath);
       const resolved = await resolveEnrollmentSource(deps, source);
       const runningFromStagedPath = await isRunningFromStagedExecutablePath(deps);
+      const bloblessServiceRecovery = runningFromStagedPath || stableRuntime;
       const targetOrigin = resolved ? normalizeServerOriginForCompare(resolved.blob.serverUrl) : null;
       const enrollTokenHash = resolved ? hashEnrollmentToken(resolved.blob.enrollToken) : null;
       const pendingCommittedMatchesExisting = Boolean(
@@ -1446,7 +1488,7 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
             null,
             null,
             publisherTrustError,
-            runningFromStagedPath
+            bloblessServiceRecovery
               ? { startService: false, disposition: 'run_runtime' }
               : { startService: true, disposition: 'handoff_complete' },
           );
@@ -1479,7 +1521,7 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
         journal = finalized.result.journal;
         activePending = null;
       }
-      if (!resolved && runningFromStagedPath) {
+      if (!resolved && bloblessServiceRecovery) {
         if (journal.phase === 'files_staged') {
           journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
             now: deps.now,
@@ -1497,6 +1539,42 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
             ...ensureBootstrapPortForwardTrust(deps),
           },
         };
+      }
+      if (resolved
+        && activePending
+        && !activePending.redeemedCredential
+        && activePending.targetOrigin === targetOrigin
+        && activePending.enrollTokenHash !== enrollTokenHash
+        && normalizeControlledNodeAbiProfile(activePending.abiProfile) === abiProfile
+        && activePending.pendingBlob) {
+        deps.warn('controlled node resolving prior interrupted re-enrollment request before consuming new enrollment ticket');
+        try {
+          const recoveredCred = await deps.redeemEnrollmentV2(activePending.pendingBlob, activePending.identity);
+          const recoveredPending: PendingReenrollmentRecord = {
+            ...activePending,
+            redeemedCredential: recoveredCred,
+            pendingBlob: undefined,
+          };
+          await deps.persistPendingReenrollment?.(recoveredPending);
+          return await commitPendingReenrollment(
+            deps,
+            journal,
+            existing,
+            recoveredPending,
+            recoveredCred,
+            resolved,
+            source,
+            publisherTrustError,
+            { startService: true, disposition: 'handoff_complete' },
+          );
+        } catch (err) {
+          if (!isDefinitiveRedeemRejection(err)) {
+            throw err;
+          }
+          deps.warn('prior pending enrollment ticket definitively rejected; proceeding with new enrollment ticket');
+          await deps.removePendingReenrollment?.();
+          activePending = null;
+        }
       }
       if (resolved) {
         const serverUrlChanged = normalizeServerOriginForCompare(existing.serverUrl) !== targetOrigin;

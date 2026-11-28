@@ -1542,6 +1542,298 @@ describe('bootstrapControlledNodeWithDisposition via stdin enrollment', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('commits pending reenrollment on same-bytes formal restart (stableRuntime === true) both before persistCredential and before journal write (P0-1)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-stdin-same-bytes-formal-'));
+    try {
+      const sourcePath = join(dir, 'downloaded-same-imcodes-node');
+      const stagedPath = join(dir, 'staged', 'imcodes-node');
+      const identicalBytes = Buffer.from('#!/bin/sh\necho SAME_BYTES_BINARY\n');
+      await writeFile(sourcePath, identicalBytes, { mode: 0o700 });
+
+      const { journalPath, journal: initialJournal } = await seedHealthyInstallation(dir, sourcePath, stagedPath, identicalBytes);
+      let currentJournal = initialJournal;
+      const pendingPath = join(dir, 'pending-reenrollment.json');
+
+      const existingCred: ControlledNodeCredential = {
+        serverId: 'srv-old-same',
+        token: 'old-revoked-tok',
+        serverUrl: 'https://relay.example.com',
+        nodeRole: 'controlled',
+      };
+      const newCred1: ControlledNodeCredential = {
+        serverId: 'srv-same-1',
+        nodeId: '6677889900',
+        token: 'new-same-tok-1',
+        serverUrl: 'https://relay.example.com',
+        nodeRole: 'controlled',
+      };
+      const identity1: PendingInstallIdentity = {
+        installId: 'inst-same-1',
+        nodeToken: 'new-same-tok-1',
+        nodeTokenHash: createHash('sha256').update('new-same-tok-1', 'utf8').digest('hex'),
+        sourceExePath: sourcePath,
+      };
+      let failMode: 'before_cred' | 'before_journal' | 'none' = 'before_cred';
+
+      const { deps, state } = createBootstrapFixture(dir, sourcePath, stagedPath, identicalBytes, {
+        now: 1_700_000_002_000,
+        enrollmentBlob: { serverUrl: 'https://relay.example.com', enrollToken: 'same-bytes-tok-1' },
+        journalPath,
+        loadCredential: vi.fn(async () => state.credential),
+        persistCredential: vi.fn(async (cred) => {
+          if (failMode === 'before_cred') {
+            failMode = 'none';
+            throw new Error('simulated_same_bytes_crash_before_cred');
+          }
+          state.credential = cred;
+        }),
+        loadInstallIdentity: vi.fn(async () => state.identity),
+        loadPendingReenrollment: () => loadPendingReenrollment(pendingPath),
+        persistPendingReenrollment: (rec) => persistPendingReenrollment(rec, pendingPath),
+        removePendingReenrollment: () => removePendingReenrollment(pendingPath),
+        probeExistingCredential: vi.fn(async () => 'revoked' as const),
+        generateInstallIdentity: vi.fn(() => ({ ...identity1 })),
+        redeemEnrollmentV2: vi.fn(async () => newCred1),
+        loadInstallJournal: vi.fn(async () => currentJournal),
+        writeInstallPhase: vi.fn(async (p, phase, opts) => {
+          if (failMode === 'before_journal') {
+            failMode = 'none';
+            throw new Error('simulated_same_bytes_crash_before_journal');
+          }
+          currentJournal = await writeInstallPhase(p, phase, opts);
+          state.journal = currentJournal;
+          return currentJournal;
+        }),
+      });
+      state.credential = existingCred;
+      state.journal = initialJournal;
+
+      // Case A: same-bytes reinstall crashes before persistCredential -> real isCurrentExecutableStable(stagedPath) is TRUE!
+      await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow(/simulated_same_bytes_crash_before_cred/);
+      await expect(isCurrentExecutableStable(currentJournal, stagedPath)).resolves.toBe(true);
+      expect(state.credential).toEqual(existingCred);
+
+      const serviceStartMock = vi.fn(async () => {});
+      const formalResA = await bootstrapControlledNodeWithDisposition({
+        ...deps,
+        enrollmentBlob: undefined,
+        sourceExecutablePath: stagedPath,
+        isStableRuntime: (cur) => isCurrentExecutableStable(cur, stagedPath),
+        startService: serviceStartMock,
+      });
+      expect(formalResA.disposition).toBe('run_runtime');
+      expect(formalResA.credential).toEqual(newCred1);
+      expect(currentJournal.serverId).toBe('srv-same-1');
+      expect(serviceStartMock).not.toHaveBeenCalled();
+      expect(await loadPendingReenrollment(pendingPath)).toBeNull();
+
+      // Case B: same-bytes reinstall crashes AFTER persistCredential BEFORE journal commit -> stableRuntime is STILL TRUE!
+      const newCred2: ControlledNodeCredential = {
+        serverId: 'srv-same-2',
+        nodeId: '7788990012',
+        token: 'new-same-tok-2',
+        serverUrl: 'https://relay.example.com',
+        nodeRole: 'controlled',
+      };
+      const identity2: PendingInstallIdentity = {
+        installId: 'inst-same-2',
+        nodeToken: 'new-same-tok-2',
+        nodeTokenHash: createHash('sha256').update('new-same-tok-2', 'utf8').digest('hex'),
+        sourceExePath: sourcePath,
+      };
+      failMode = 'before_journal';
+      await expect(bootstrapControlledNodeWithDisposition({
+        ...deps,
+        enrollmentBlob: { serverUrl: 'https://relay.example.com', enrollToken: 'same-bytes-tok-2' },
+        generateInstallIdentity: vi.fn(() => ({ ...identity2 })),
+        redeemEnrollmentV2: vi.fn(async () => newCred2),
+      })).rejects.toThrow(/simulated_same_bytes_crash_before_journal/);
+      await expect(isCurrentExecutableStable(currentJournal, stagedPath)).resolves.toBe(true);
+      expect(state.credential).toEqual(newCred2);
+      expect(currentJournal.serverId).toBe('srv-same-1');
+
+      const formalResB = await bootstrapControlledNodeWithDisposition({
+        ...deps,
+        enrollmentBlob: undefined,
+        sourceExecutablePath: stagedPath,
+        isStableRuntime: (cur) => isCurrentExecutableStable(cur, stagedPath),
+        startService: serviceStartMock,
+      });
+      expect(formalResB.disposition).toBe('run_runtime');
+      expect(formalResB.credential).toEqual(newCred2);
+      expect(currentJournal.serverId).toBe('srv-same-2');
+      expect(serviceStartMock).not.toHaveBeenCalled();
+      expect(await loadPendingReenrollment(pendingPath)).toBeNull();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers interrupted lost-HTTP-response redeem BEFORE consuming a new UI ticket (P0-1)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-stdin-lost-http-new-ticket-'));
+    try {
+      const sourcePath = join(dir, 'downloaded-imcodes-node');
+      const stagedPath = join(dir, 'staged', 'imcodes-node');
+      const bytes = Buffer.from('BINARY_BYTES');
+      await writeFile(sourcePath, bytes, { mode: 0o700 });
+
+      const { journalPath, journal: initialJournal } = await seedHealthyInstallation(dir, sourcePath, stagedPath, bytes);
+      let currentJournal = initialJournal;
+      const pendingPath = join(dir, 'pending-reenrollment.json');
+
+      const existingCred: ControlledNodeCredential = {
+        serverId: 'srv-old',
+        token: 'old-revoked-tok',
+        serverUrl: 'https://relay.example.com',
+        nodeRole: 'controlled',
+      };
+      const redeemedLog: Array<{ enrollToken: string; installId: string }> = [];
+      let dropFirstResponse = true;
+
+      const { deps, state } = createBootstrapFixture(dir, sourcePath, stagedPath, bytes, {
+        now: 1_700_000_003_000,
+        enrollmentBlob: { serverUrl: 'https://relay.example.com', enrollToken: 'ticket-1-committed-on-server' },
+        journalPath,
+        loadCredential: vi.fn(async () => state.credential),
+        loadInstallIdentity: vi.fn(async () => state.identity),
+        loadPendingReenrollment: () => loadPendingReenrollment(pendingPath),
+        persistPendingReenrollment: (rec) => persistPendingReenrollment(rec, pendingPath),
+        removePendingReenrollment: () => removePendingReenrollment(pendingPath),
+        probeExistingCredential: vi.fn(async () => 'revoked' as const),
+        generateInstallIdentity: vi.fn(() => ({
+          installId: 'inst-attempt-1',
+          nodeToken: 'tok-attempt-1',
+          nodeTokenHash: createHash('sha256').update('tok-attempt-1', 'utf8').digest('hex'),
+          sourceExePath: sourcePath,
+        })),
+        redeemEnrollmentV2: vi.fn(async (blob, id) => {
+          redeemedLog.push({ enrollToken: blob.enrollToken, installId: id.installId });
+          if (blob.enrollToken === 'ticket-1-committed-on-server' && dropFirstResponse) {
+            dropFirstResponse = false;
+            throw new Error('network_timeout_after_server_commit');
+          }
+          if (blob.enrollToken === 'ticket-1-committed-on-server') {
+            return {
+              serverId: 'srv-recovered-from-ticket-1',
+              nodeId: '8899001122',
+              token: id.nodeToken,
+              serverUrl: blob.serverUrl,
+              nodeRole: 'controlled' as const,
+            };
+          }
+          throw new Error('unexpected_second_ticket_redemption');
+        }),
+        loadInstallJournal: vi.fn(async () => currentJournal),
+        writeInstallPhase: vi.fn(async (p, phase, opts) => {
+          currentJournal = await writeInstallPhase(p, phase, opts);
+          state.journal = currentJournal;
+          return currentJournal;
+        }),
+      });
+      state.credential = existingCred;
+      state.journal = initialJournal;
+
+      // Attempt 1: server commits Ticket 1, HTTP response drops -> pending-reenrollment.json lacks redeemedCredential.
+      await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow(/network_timeout_after_server_commit/);
+      const pendingAfterDrop = await loadPendingReenrollment(pendingPath);
+      expect(pendingAfterDrop?.redeemedCredential).toBeUndefined();
+      expect(pendingAfterDrop?.pendingBlob?.enrollToken).toBe('ticket-1-committed-on-server');
+
+      // Attempt 2: user re-clicks UI install getting a NEW enrollToken (Ticket 2) on the same relay!
+      // Bootstrap resolves Ticket 1 idempotently first and NEVER consumes Ticket 2.
+      const res2 = await bootstrapControlledNodeWithDisposition({
+        ...deps,
+        enrollmentBlob: { serverUrl: 'https://relay.example.com', enrollToken: 'ticket-2-from-ui-reclick' },
+      });
+      expect(res2.disposition).toBe('handoff_complete');
+      expect(res2.credential?.serverId).toBe('srv-recovered-from-ticket-1');
+      expect(redeemedLog).toEqual([
+        { enrollToken: 'ticket-1-committed-on-server', installId: 'inst-attempt-1' },
+        { enrollToken: 'ticket-1-committed-on-server', installId: 'inst-attempt-1' },
+      ]);
+      expect(await loadPendingReenrollment(pendingPath)).toBeNull();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('completes bootstrap and runs startService outside the lock even when locked work exceeds lockTimeoutMs acquisition budget (P0-2)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-stdin-lock-work-exceeds-budget-'));
+    try {
+      const sourcePath = join(dir, 'downloaded-imcodes-node');
+      const stagedPath = join(dir, 'staged', 'imcodes-node');
+      const bytes = Buffer.from('LOCK_WORK_LONGER_THAN_BUDGET');
+      await writeFile(sourcePath, bytes, { mode: 0o700 });
+
+      const { journalPath, journal: initialJournal } = await seedHealthyInstallation(dir, sourcePath, stagedPath, bytes);
+      let currentJournal = initialJournal;
+      const credPath = join(dir, 'cred.json');
+      const pendingPath = join(dir, 'pending-reenrollment.json');
+
+      const existingCred: ControlledNodeCredential = {
+        serverId: 'srv-old',
+        token: 'old-revoked-tok',
+        serverUrl: 'https://relay.example.com',
+        nodeRole: 'controlled',
+      };
+      const newCred: ControlledNodeCredential = {
+        serverId: 'srv-slow-work-1',
+        nodeId: '9900112233',
+        token: 'new-tok-slow-1',
+        serverUrl: 'https://relay.example.com',
+        nodeRole: 'controlled',
+      };
+      let startServiceLockProbeOk = false;
+
+      const { deps, state } = createBootstrapFixture(dir, sourcePath, stagedPath, bytes, {
+        now: 1_700_000_004_000,
+        enrollmentBlob: { serverUrl: 'https://relay.example.com', enrollToken: 'slow-work-tok' },
+        journalPath,
+        credentialPath: credPath,
+        withProcessLock: (fn, lockCredPath = credPath) => withBootstrapProcessLock(lockCredPath, fn, { lockTimeoutMs: 75 }),
+        loadCredential: vi.fn(async () => state.credential),
+        loadInstallIdentity: vi.fn(async () => state.identity),
+        loadPendingReenrollment: () => loadPendingReenrollment(pendingPath),
+        persistPendingReenrollment: (rec) => persistPendingReenrollment(rec, pendingPath),
+        removePendingReenrollment: () => removePendingReenrollment(pendingPath),
+        probeExistingCredential: vi.fn(async () => 'revoked' as const),
+        generateInstallIdentity: vi.fn(() => ({
+          installId: 'inst-slow-1',
+          nodeToken: 'new-tok-slow-1',
+          nodeTokenHash: createHash('sha256').update('new-tok-slow-1', 'utf8').digest('hex'),
+          sourceExePath: sourcePath,
+        })),
+        redeemEnrollmentV2: vi.fn(async () => {
+          // Exceeds lockTimeoutMs (75ms) by ~2x while inside the lock!
+          await new Promise((r) => setTimeout(r, 140));
+          return newCred;
+        }),
+        startService: vi.fn(async () => {
+          await withBootstrapProcessLock(credPath, async () => {
+            startServiceLockProbeOk = true;
+          }, { lockTimeoutMs: 75 });
+        }),
+        loadInstallJournal: vi.fn(async () => currentJournal),
+        writeInstallPhase: vi.fn(async (p, phase, opts) => {
+          currentJournal = await writeInstallPhase(p, phase, opts);
+          state.journal = currentJournal;
+          return currentJournal;
+        }),
+      });
+      state.credential = existingCred;
+      state.journal = initialJournal;
+
+      const res = await bootstrapControlledNodeWithDisposition(deps);
+      expect(res.disposition).toBe('handoff_complete');
+      expect(res.credential).toEqual(newCred);
+      expect(deps.startService).toHaveBeenCalledTimes(1);
+      expect(startServiceLockProbeOk).toBe(true);
+      expect(await loadPendingReenrollment(pendingPath)).toBeNull();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('probeControlledNodeCredentialStatus', () => {

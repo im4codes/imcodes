@@ -565,6 +565,8 @@ export interface PendingReenrollmentRecord {
   identity: PendingInstallIdentity;
   previousServerId?: string;
   previousServerUrl?: string;
+  /** Original enrollment blob retained only until redeem result is confirmed or rejected. */
+  pendingBlob?: EnrollmentBlob;
   redeemedCredential?: ControlledNodeCredential;
   candidateStaged?: PendingReenrollmentStagedCandidate;
   stagedReceipt?: StagedExecutableReceipt;
@@ -758,6 +760,16 @@ function isValidStagedReceiptValue(value: unknown): value is StagedExecutableRec
     && isValidFileIdentityValue(v.stagedIdentity);
 }
 
+function isValidPendingBlobValue(value: unknown): value is EnrollmentBlob {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  if (typeof v.serverUrl !== 'string' || !v.serverUrl) return false;
+  if (typeof v.enrollToken !== 'string' || !v.enrollToken) return false;
+  if (v.abiProfile !== undefined && typeof v.abiProfile !== 'string') return false;
+  if (v.ownerName !== undefined && typeof v.ownerName !== 'string') return false;
+  return true;
+}
+
 function isValidPendingReenrollmentRecord(value: unknown): value is PendingReenrollmentRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const r = value as Partial<PendingReenrollmentRecord>;
@@ -768,6 +780,7 @@ function isValidPendingReenrollmentRecord(value: unknown): value is PendingReenr
   if (!isValidPendingInstallIdentityValue(r.identity)) return false;
   if (r.previousServerId !== undefined && (typeof r.previousServerId !== 'string' || !r.previousServerId)) return false;
   if (r.previousServerUrl !== undefined && (typeof r.previousServerUrl !== 'string' || !r.previousServerUrl)) return false;
+  if (r.pendingBlob !== undefined && !isValidPendingBlobValue(r.pendingBlob)) return false;
   if (r.redeemedCredential !== undefined) {
     if (!isValidControlledNodeCredentialValue(r.redeemedCredential)) return false;
     if (r.redeemedCredential.token !== r.identity.nodeToken) return false;
