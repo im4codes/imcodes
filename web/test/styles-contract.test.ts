@@ -699,8 +699,8 @@ describe('styles.css regression contracts', () => {
     const activeBrainRule = css.match(/\.tab\.brain\.active\s*\{[^}]*\}/);
     expect(activeBrainRule).not.toBeNull();
     expect(activeBrainRule![0]).not.toMatch(/border-top-color:\s*transparent/);
-    expect(activeBrainRule![0]).toMatch(/border-color:\s*rgba\(167,\s*139,\s*250,\s*0\.52\)/);
-    expect(activeBrainRule![0]).toMatch(/border-bottom-color:\s*#8b5cf6/);
+    expect(activeBrainRule![0]).toMatch(/border-color:\s*rgba\(192,\s*132,\s*252,\s*0\.86\)/);
+    expect(activeBrainRule![0]).toMatch(/border-bottom-color:\s*#a78bfa/);
     expect(activeBrainRule![0]).toMatch(/border-bottom-width:\s*2px/);
   });
 

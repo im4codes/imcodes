@@ -1639,25 +1639,39 @@ describe('SessionTabs', () => {
     const cssText = readTabStyles();
 
     const tabRule = cssText.match(/(?:^|\n)\.tab\s*\{[^}]+\}/)?.[0] ?? '';
-    expect(tabRule).toMatch(/border:\s*1px solid rgba\(125,\s*211,\s*252,\s*0\.18\)/);
+    expect(tabRule).toMatch(/border:\s*1px solid rgba\(148,\s*163,\s*184,\s*0\.26\)/);
     expect(tabRule).toContain('border-bottom: none');
 
     const tabHoverRule = cssText.match(/(?:^|\n)\.tab:hover\s*\{[^}]+\}/)?.[0] ?? '';
-    expect(tabHoverRule).toMatch(/border-color:\s*rgba\(125,\s*211,\s*252,\s*0\.32\)/);
+    expect(tabHoverRule).toMatch(/border-color:\s*rgba\(56,\s*189,\s*248,\s*0\.50\)/);
 
     const activeTabRule = cssText.match(/(?:^|\n)\.tab\.active\s*\{[^}]+\}/)?.[0] ?? '';
-    expect(activeTabRule).toMatch(/border-color:\s*rgba\(34,\s*211,\s*238,\s*0\.46\)/);
+    expect(activeTabRule).toMatch(/border-color:\s*rgba\(56,\s*224,\s*250,\s*0\.80\)/);
+    expect(activeTabRule).toMatch(/inset 0 2px 0 rgba\(103,\s*232,\s*249,\s*0\.95\)/);
 
     const brainTabRule = cssText.match(/(?:^|\n)\.tab\.brain\s*\{[^}]+\}/)?.[0] ?? '';
-    expect(brainTabRule).toMatch(/border-color:\s*rgba\(167,\s*139,\s*250,\s*0\.28\)/);
+    expect(brainTabRule).toMatch(/border-color:\s*rgba\(167,\s*139,\s*250,\s*0\.30\)/);
 
     const brainTabHoverRule = cssText.match(/(?:^|\n)\.tab\.brain:hover\s*\{[^}]+\}/)?.[0] ?? '';
-    expect(brainTabHoverRule).toMatch(/border-color:\s*rgba\(167,\s*139,\s*250,\s*0\.40\)/);
+    expect(brainTabHoverRule).toMatch(/border-color:\s*rgba\(167,\s*139,\s*250,\s*0\.56\)/);
 
     const activeBrainRule = cssText.match(/(?:^|\n)\.tab\.brain\.active\s*\{[^}]+\}/)?.[0] ?? '';
-    expect(activeBrainRule).toMatch(/border-color:\s*rgba\(167,\s*139,\s*250,\s*0\.52\)/);
+    expect(activeBrainRule).toMatch(/border-color:\s*rgba\(192,\s*132,\s*252,\s*0\.86\)/);
     expect(activeBrainRule).not.toMatch(/border-top-color:\s*transparent/);
-    expect(activeBrainRule).toMatch(/border-bottom-color:\s*#8b5cf6/);
+    expect(activeBrainRule).toMatch(/border-bottom-color:\s*#a78bfa/);
+    expect(activeBrainRule).toMatch(/inset 0 2px 0 rgba\(221,\s*214,\s*254,\s*0\.95\)/);
+
+    // Dock framing on desktop and mobile (.tab-bar & .layout-mobile)
+    const tabBarRule = cssText.match(/(?:^|\n)\.tab-bar\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(tabBarRule).toMatch(/border-top:\s*1px solid rgba\(56,\s*189,\s*248,\s*0\.22\)/);
+    expect(tabBarRule).toMatch(/border-bottom:\s*1px solid rgba\(56,\s*189,\s*248,\s*0\.42\)/);
+
+    const mobileTabBarRule = cssText.match(/(?:^|\n)\.layout-mobile\s+\.tab-bar\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(mobileTabBarRule).toMatch(/border-top:\s*1px solid rgba\(56,\s*189,\s*248,\s*0\.30\)/);
+    expect(mobileTabBarRule).toMatch(/border-bottom:\s*1\.5px solid rgba\(34,\s*211,\s*238,\s*0\.52\)/);
+    expect(cssText).toMatch(/\.layout-mobile\s+\.tab\.active\s*\{/);
+    expect(cssText).toMatch(/\.layout-mobile\s+\.tab\.brain\.active\s*\{/);
+    expect(cssText).toMatch(/\.tab\.incognito\s*\{[^}]*border-style:\s*dashed/);
 
     // Verify rendered DOM elements
     const sessions = makeSessions([
