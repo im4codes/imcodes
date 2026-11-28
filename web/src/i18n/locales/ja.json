@@ -1301,7 +1301,17 @@
     "verification_authorize_alias": "エイリアス: {{name}}",
     "verification_authorize_node": "管理対象ノード: {{name}}",
     "search_history_placeholder": "履歴を絞り込み…",
-    "no_history_matches": "一致する履歴はありません"
+    "no_history_matches": "一致する履歴はありません",
+    "manage": "管理",
+    "done": "完了",
+    "my_phrases": "マイフレーズ",
+    "builtin_phrases": "組み込み",
+    "my_commands": "マイコマンド",
+    "builtin_commands": "組み込み",
+    "copy_item": "コピー",
+    "copied_item": "コピー済み",
+    "edit_item": "編集",
+    "delete_item": "削除"
   },
   "file_browser": {
     "title_dir": "ディレクトリを選択",

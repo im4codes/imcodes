@@ -1301,7 +1301,17 @@
     "verification_authorize_alias": "Alias: {{name}}",
     "verification_authorize_node": "Nodo: {{name}}",
     "search_history_placeholder": "Filtrar historial…",
-    "no_history_matches": "No hay historial coincidente"
+    "no_history_matches": "No hay historial coincidente",
+    "manage": "Gestionar",
+    "done": "Listo",
+    "my_phrases": "Mis frases",
+    "builtin_phrases": "Integrados",
+    "my_commands": "Mis comandos",
+    "builtin_commands": "Integrados",
+    "copy_item": "Copiar",
+    "copied_item": "Copiado",
+    "edit_item": "Editar",
+    "delete_item": "Eliminar"
   },
   "file_browser": {
     "title_dir": "Seleccionar directorio",

@@ -21,6 +21,7 @@ import type { WsClient } from '../ws-client.js';
 import type { MachineListItem } from '../api/machines.js';
 import type { JSX, RefObject } from 'preact';
 import { DEFAULT_QUICK_PHRASES, getDefaultQuickCommands } from '../quick-commands.js';
+import { copyToClipboard } from '../util/clipboard.js';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 import {
   VERIFICATION_MACHINE_KINDS,
@@ -1542,10 +1543,33 @@ interface Props {
 
 const HISTORY_PAGE_SIZE = 10;
 const TRUNCATE_THRESHOLD = 40;
+const BUILTIN_COMMANDS_COLLAPSED_KEY = 'imcodes:qp:builtin-commands-collapsed';
+const BUILTIN_PHRASES_COLLAPSED_KEY = 'imcodes:qp:builtin-phrases-collapsed';
 type AddTarget = 'command' | 'phrase' | null;
 type HistoryScope = 'session' | 'global';
 type QpTab = 'quick' | 'files' | 'alias' | 'machines' | 'verification';
 type VerificationSourceTab = 'alias' | 'controlled_node';
+
+function readStoredBoolean(key: string, fallback = false): boolean {
+  if (typeof localStorage === 'undefined') return fallback;
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+  } catch { /* ignore */ }
+  return fallback;
+}
+
+function writeStoredBoolean(key: string, value: boolean): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(key, value ? 'true' : 'false');
+  } catch { /* ignore */ }
+}
+
+function normalizeSingleLinePreview(text: string): string {
+  return text.replace(/\r\n?/g, '\n').replace(/\n/g, ' ↵ ');
+}
 
 /** Truncate long text: "start of text...end of text" */
 function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
@@ -1555,7 +1579,16 @@ function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
 }
 
 function formatPreviewText(text: string, max = TRUNCATE_THRESHOLD): string {
-  return truncateMiddle(text.replace(/\r\n?/g, '\n').replace(/\n/g, ' ↵ '), max);
+  return truncateMiddle(normalizeSingleLinePreview(text), max);
+}
+
+function CopyCardIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="5" y="5" width="9" height="9" rx="1.5" />
+      <path d="M11 3H3.5A1.5 1.5 0 0 0 2 4.5V12" />
+    </svg>
+  );
 }
 
 export function QuickInputPanel({
@@ -1575,6 +1608,12 @@ export function QuickInputPanel({
   const [editingItem, setEditingItem] = useState<{ type: 'command' | 'phrase'; original: string } | null>(null);
   const [editValue, setEditValue] = useState('');
   const editInputRef = useRef<HTMLInputElement>(null);
+  const [manageCommands, setManageCommands] = useState(false);
+  const [managePhrases, setManagePhrases] = useState(false);
+  const [builtinCommandsCollapsed, setBuiltinCommandsCollapsed] = useState(() => readStoredBoolean(BUILTIN_COMMANDS_COLLAPSED_KEY, false));
+  const [builtinPhrasesCollapsed, setBuiltinPhrasesCollapsed] = useState(() => readStoredBoolean(BUILTIN_PHRASES_COLLAPSED_KEY, false));
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [historyPage, setHistoryPage] = useState(0);
   const [historyScope, setHistoryScope] = useState<HistoryScope>('session');
   const [historySearch, setHistorySearch] = useState('');
@@ -1747,6 +1786,31 @@ export function QuickInputPanel({
   useEffect(() => {
     if (editingItem) setTimeout(() => editInputRef.current?.focus(), 50);
   }, [editingItem]);
+  useEffect(() => {
+    if (data.commands.length === 0 && manageCommands) setManageCommands(false);
+  }, [data.commands.length, manageCommands]);
+  useEffect(() => {
+    if (data.phrases.length === 0 && managePhrases) setManagePhrases(false);
+  }, [data.phrases.length, managePhrases]);
+  useEffect(() => {
+    if (!open) {
+      setManageCommands(false);
+      setManagePhrases(false);
+      setEditingItem(null);
+      setEditValue('');
+      setCopiedKey(null);
+      if (copiedTimerRef.current) {
+        clearTimeout(copiedTimerRef.current);
+        copiedTimerRef.current = null;
+      }
+    }
+  }, [open]);
+  useEffect(() => () => {
+    if (copiedTimerRef.current) {
+      clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = null;
+    }
+  }, []);
   // Focus the name input only when a form is (re)opened — NOT on every keystroke.
   // `aliasForm` is a fresh object on each field edit, so depending on it re-ran
   // this effect and stole focus back to `name` while typing value/desc/tags.
@@ -1861,6 +1925,209 @@ export function QuickInputPanel({
   const handleEditKeyDown = (e: KeyboardEvent) => {
     if (e.key === 'Enter') { e.preventDefault(); commitEdit(); }
     if (e.key === 'Escape') { setEditingItem(null); setEditValue(''); }
+  };
+
+  const handleCopyItem = (kind: 'command' | 'phrase', value: string, e: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    const itemKey = `${kind}:${value}`;
+    copyToClipboard(
+      value,
+      () => {
+        if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+        setCopiedKey(itemKey);
+        copiedTimerRef.current = setTimeout(() => {
+          copiedTimerRef.current = null;
+          setCopiedKey((prev) => (prev === itemKey ? null : prev));
+        }, 1500);
+      },
+    );
+  };
+
+  const toggleBuiltinCollapsed = (kind: 'command' | 'phrase') => {
+    if (kind === 'command') {
+      setBuiltinCommandsCollapsed((prev) => {
+        const next = !prev;
+        writeStoredBoolean(BUILTIN_COMMANDS_COLLAPSED_KEY, next);
+        return next;
+      });
+      return;
+    }
+    setBuiltinPhrasesCollapsed((prev) => {
+      const next = !prev;
+      writeStoredBoolean(BUILTIN_PHRASES_COLLAPSED_KEY, next);
+      return next;
+    });
+  };
+
+  const toggleManageSection = (kind: 'command' | 'phrase') => {
+    if (kind === 'command') {
+      setManageCommands((prev) => {
+        const next = !prev;
+        if (!next && editingItem?.type === 'command') {
+          setEditingItem(null);
+          setEditValue('');
+        }
+        return next;
+      });
+      return;
+    }
+    setManagePhrases((prev) => {
+      const next = !prev;
+      if (!next && editingItem?.type === 'phrase') {
+        setEditingItem(null);
+        setEditValue('');
+      }
+      return next;
+    });
+  };
+
+  const renderQuickEntriesSection = ({
+    kind,
+    title,
+    myTitle,
+    builtinTitle,
+    builtinItems,
+    customItems,
+    managing,
+    builtinCollapsed,
+    onRemoveItem,
+  }: {
+    kind: 'command' | 'phrase';
+    title: string;
+    myTitle: string;
+    builtinTitle: string;
+    builtinItems: readonly string[];
+    customItems: readonly string[];
+    managing: boolean;
+    builtinCollapsed: boolean;
+    onRemoveItem: (item: string) => void;
+  }) => {
+    const isCommand = kind === 'command';
+    return (
+      <section class={`qp-section qp-section-${kind}`} data-qp-section={kind}>
+        <div class="qp-section-header">
+          <span class="qp-section-title-wrap">
+            <span>{title}</span>
+            <span class="qp-section-count">{builtinItems.length + customItems.length}</span>
+          </span>
+          {customItems.length > 0 && (
+            <div class="qp-section-actions">
+              <button
+                type="button"
+                class={`qp-manage-btn${managing ? ' is-active' : ''}`}
+                aria-pressed={managing}
+                onClick={() => toggleManageSection(kind)}
+              >
+                {managing ? t('quick_input.done') : t('quick_input.manage')}
+              </button>
+            </div>
+          )}
+        </div>
+
+        {customItems.length > 0 && (
+          <div class="qp-subsection qp-subsection-custom">
+            <div class="qp-sub-header">
+              <span>{myTitle}</span>
+              <span class="qp-section-count">{customItems.length}</span>
+            </div>
+            <div class="qp-custom-grid">
+              {customItems.map((item) => (
+                editingItem?.type === kind && editingItem.original === item ? (
+                  <div key={item} class="qp-custom-card qp-custom-card-editing">
+                    <input
+                      ref={editInputRef}
+                      class="qp-edit-input qp-card-edit-input"
+                      value={editValue}
+                      onInput={(e) => setEditValue((e.target as HTMLInputElement).value)}
+                      onKeyDown={handleEditKeyDown}
+                      onBlur={commitEdit}
+                    />
+                  </div>
+                ) : (
+                  <div
+                    key={item}
+                    class={`qp-custom-card${isCommand ? ' is-command' : ''}${managing ? ' is-managing' : ''}`}
+                    title={item}
+                  >
+                    <button
+                      type="button"
+                      class="qp-custom-card-text"
+                      title={item}
+                      onClick={() => handleSend(item)}
+                    >
+                      {normalizeSingleLinePreview(item)}
+                    </button>
+                    <div class="qp-card-actions">
+                      <button
+                        type="button"
+                        class={`qp-card-action-btn qp-card-copy-btn${copiedKey === `${kind}:${item}` ? ' is-copied' : ''}`}
+                        title={copiedKey === `${kind}:${item}` ? t('quick_input.copied_item') : t('quick_input.copy_item')}
+                        aria-label={copiedKey === `${kind}:${item}` ? t('quick_input.copied_item') : t('quick_input.copy_item')}
+                        onClick={(e) => handleCopyItem(kind, item, e)}
+                      >
+                        {copiedKey === `${kind}:${item}` ? '✓' : <CopyCardIcon />}
+                      </button>
+                      {managing && (
+                        <>
+                          <button
+                            type="button"
+                            class="qp-card-action-btn qp-card-edit-btn"
+                            title={t('quick_input.edit_item')}
+                            aria-label={`${t('quick_input.edit_item')} ${item}`}
+                            onClick={(e) => { e.stopPropagation(); startEdit(kind, item); }}
+                          >✎</button>
+                          <button
+                            type="button"
+                            class="qp-card-action-btn qp-card-del-btn"
+                            title={t('quick_input.delete_item')}
+                            aria-label={`${t('quick_input.delete_item')} ${item}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (confirm(t('quick_input.confirm_delete'))) onRemoveItem(item);
+                            }}
+                          >✕</button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )
+              ))}
+            </div>
+          </div>
+        )}
+
+        {builtinItems.length > 0 && (
+          <div class="qp-subsection qp-subsection-builtin">
+            <div class="qp-sub-header qp-sub-header-collapsible">
+              <button
+                type="button"
+                class="qp-sub-header-toggle"
+                aria-expanded={!builtinCollapsed}
+                onClick={() => toggleBuiltinCollapsed(kind)}
+              >
+                <span class={`qp-sub-chevron${builtinCollapsed ? ' is-collapsed' : ''}`} aria-hidden="true">⌄</span>
+                <span>{builtinTitle}</span>
+                <span class="qp-section-count">{builtinItems.length}</span>
+              </button>
+            </div>
+            {!builtinCollapsed && (
+              <div class="qp-builtin-chips">
+                {builtinItems.map((item) => (
+                  <button
+                    key={item}
+                    type="button"
+                    class={`qp-chip-default${isCommand ? ' is-command' : ''}`}
+                    onClick={() => handleSend(item)}
+                  >
+                    {item}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+    );
   };
 
   // ── Alias tab handlers ──
@@ -2279,75 +2546,31 @@ export function QuickInputPanel({
         <div class="qp-list">
           {!loaded && <div class="qp-empty">{t('quick_input.loading')}</div>}
 
-          {/* Commands — pill wrap */}
-          {loaded && (
-            <>
-              <div class="qp-section-header">
-                <span>{t('quick_input.commands')}</span>
-                <span class="qp-section-count">{defaultCmds.length + data.commands.length}</span>
-              </div>
-              <div class="qp-pills">
-                {defaultCmds.map((cmd) => (
-                  <button key={cmd} class="qp-pill qp-pill-default" onClick={() => handleSend(cmd)}>{cmd}</button>
-                ))}
-                {data.commands.map((cmd) => (
-                  editingItem?.type === 'command' && editingItem.original === cmd ? (
-                    <span key={cmd} class="qp-pill qp-pill-editing">
-                      <input
-                        ref={editInputRef}
-                        class="qp-edit-input"
-                        value={editValue}
-                        onInput={(e) => setEditValue((e.target as HTMLInputElement).value)}
-                        onKeyDown={handleEditKeyDown}
-                        onBlur={commitEdit}
-                      />
-                    </span>
-                  ) : (
-                    <span key={cmd} class="qp-pill qp-pill-custom" title={cmd.length > TRUNCATE_THRESHOLD ? cmd : undefined}>
-                      <button type="button" class="qp-pill-text" onClick={() => handleSend(cmd)}>{formatPreviewText(cmd)}</button>
-                      <button class="qp-pill-edit" onClick={() => startEdit('command', cmd)}>✎</button>
-                      <button class="qp-pill-del" onClick={() => { if (confirm(t('quick_input.confirm_delete'))) onRemoveCommand(cmd); }}>✕</button>
-                    </span>
-                  )
-                ))}
-              </div>
-            </>
-          )}
+          {/* Commands */}
+          {loaded && renderQuickEntriesSection({
+            kind: 'command',
+            title: t('quick_input.commands'),
+            myTitle: t('quick_input.my_commands'),
+            builtinTitle: t('quick_input.builtin_commands'),
+            builtinItems: defaultCmds,
+            customItems: data.commands,
+            managing: manageCommands,
+            builtinCollapsed: builtinCommandsCollapsed,
+            onRemoveItem: onRemoveCommand,
+          })}
 
-          {/* Phrases — pill wrap */}
-          {loaded && (
-            <>
-              <div class="qp-section-header">
-                <span>{t('quick_input.phrases')}</span>
-                <span class="qp-section-count">{DEFAULT_QUICK_PHRASES.length + data.phrases.length}</span>
-              </div>
-              <div class="qp-pills">
-                {DEFAULT_QUICK_PHRASES.map((phrase) => (
-                  <button key={phrase} class="qp-pill qp-pill-default" onClick={() => handleSend(phrase)}>{phrase}</button>
-                ))}
-                {data.phrases.map((phrase) => (
-                  editingItem?.type === 'phrase' && editingItem.original === phrase ? (
-                    <span key={phrase} class="qp-pill qp-pill-editing">
-                      <input
-                        ref={editInputRef}
-                        class="qp-edit-input"
-                        value={editValue}
-                        onInput={(e) => setEditValue((e.target as HTMLInputElement).value)}
-                        onKeyDown={handleEditKeyDown}
-                        onBlur={commitEdit}
-                      />
-                    </span>
-                  ) : (
-                    <span key={phrase} class="qp-pill qp-pill-custom" title={phrase.length > TRUNCATE_THRESHOLD ? phrase : undefined}>
-                      <button type="button" class="qp-pill-text" onClick={() => handleSend(phrase)}>{formatPreviewText(phrase)}</button>
-                      <button class="qp-pill-edit" onClick={() => startEdit('phrase', phrase)}>✎</button>
-                      <button class="qp-pill-del" onClick={() => { if (confirm(t('quick_input.confirm_delete'))) onRemovePhrase(phrase); }}>✕</button>
-                    </span>
-                  )
-                ))}
-              </div>
-            </>
-          )}
+          {/* Phrases */}
+          {loaded && renderQuickEntriesSection({
+            kind: 'phrase',
+            title: t('quick_input.phrases'),
+            myTitle: t('quick_input.my_phrases'),
+            builtinTitle: t('quick_input.builtin_phrases'),
+            builtinItems: DEFAULT_QUICK_PHRASES,
+            customItems: data.phrases,
+            managing: managePhrases,
+            builtinCollapsed: builtinPhrasesCollapsed,
+            onRemoveItem: onRemovePhrase,
+          })}
 
           {/* History — scope toggle + search + rows with last-sent timestamp */}
           {loaded && (

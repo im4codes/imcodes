@@ -1301,7 +1301,17 @@
     "verification_authorize_alias": "别名：{{name}}",
     "verification_authorize_node": "受控节点：{{name}}",
     "search_history_placeholder": "筛选历史记录…",
-    "no_history_matches": "无匹配历史记录"
+    "no_history_matches": "无匹配历史记录",
+    "manage": "管理",
+    "done": "完成",
+    "my_phrases": "我的短语",
+    "builtin_phrases": "常用内置",
+    "my_commands": "我的命令",
+    "builtin_commands": "常用内置",
+    "copy_item": "复制",
+    "copied_item": "已复制",
+    "edit_item": "编辑",
+    "delete_item": "删除"
   },
   "file_browser": {
     "title_dir": "选择目录",

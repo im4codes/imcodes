@@ -2336,4 +2336,33 @@ describe('styles.css regression contracts', () => {
     expect(css).toMatch(/\.incognito-help-body\s*\{/);
     expect(css).toMatch(/\.btn-primary\.incognito-launch-btn\s*\{/);
   });
+
+  it('uses structured 2-col/1-col grid cards for Quick Input custom phrases/commands with opaque blurred surface and compact built-in micro-chips', () => {
+    const qpRule = cssWithoutComments.match(/\.qp\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(qpRule).toMatch(/backdrop-filter:\s*blur\(12px\)/);
+    expect(qpRule).toMatch(/border:\s*1px solid rgba\(56,\s*189,\s*248,\s*0\.24\)/);
+
+    const gridRule = cssWithoutComments.match(/\.qp-custom-grid\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(gridRule).toMatch(/display:\s*grid/);
+    expect(gridRule).toMatch(/grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
+
+    const cardRule = cssWithoutComments.match(/\.qp-custom-card\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(cardRule).toMatch(/border-radius:\s*7px/);
+    expect(cardRule).toMatch(/border-left:\s*2px solid/);
+
+    const cardTextRule = cssWithoutComments.match(/\.qp-custom-card-text\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(cardTextRule).toMatch(/white-space:\s*nowrap/);
+    expect(cardTextRule).toMatch(/text-overflow:\s*ellipsis/);
+    expect(cardTextRule).toMatch(/overflow:\s*hidden/);
+
+    const chipRule = cssWithoutComments.match(/\.qp-chip-default\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(chipRule).toMatch(/border-radius:\s*6px/);
+
+    const mobileBlocks = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(max-width:\s*640px\)/).join('\n');
+    expect(mobileBlocks).toMatch(/\.qp-custom-grid\s*\{[^}]*grid-template-columns:\s*1fr/);
+
+    // Alias tab selector contract remains intact
+    expect(cssWithoutComments).toMatch(/\.qp-pill\.qp-alias-item\s*\{/);
+    expect(cssWithoutComments).toMatch(/\.qp-pill-custom\s*\{[^}]*border-radius:\s*999px/);
+  });
 });

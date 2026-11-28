@@ -4398,7 +4398,7 @@ next --flag='x:y'`;
     const dialog = rendered.getByRole('dialog', { name: 'quick_input.title' });
     expect(dialog.style.zIndex).toBe('10050');
     expect(rendered.queryByRole('button', { name: 'alias.tab' })).toBeNull();
-    const command = document.querySelector('.qp-pill-custom .qp-pill-text') as HTMLElement;
+    const command = document.querySelector('.qp-custom-card .qp-custom-card-text') as HTMLElement;
     expect(command.textContent).toContain('printf');
     act(() => command.click());
 
@@ -4446,7 +4446,7 @@ next --flag='x:y'`;
     expect(panel.contains(dialog)).toBe(true);
     expect(dialog.hidden).toBe(false);
 
-    fireEvent.click(dialog.querySelector('.qp-pill-custom .qp-pill-text') as HTMLButtonElement);
+    fireEvent.click(dialog.querySelector('.qp-custom-card .qp-custom-card-text') as HTMLButtonElement);
     expect(textByServer).toHaveBeenCalledWith('server-1', exactText);
     expect(document.activeElement).toBe(rendered.stage);
     expect(trigger.getAttribute('aria-expanded')).toBe('false');
@@ -4487,7 +4487,7 @@ next --flag='x:y'`;
     expect(workspace.contains(dialog)).toBe(true);
     expect(dialog.hidden).toBe(false);
 
-    fireEvent.click(dialog.querySelector('.qp-pill-custom .qp-pill-text') as HTMLButtonElement);
+    fireEvent.click(dialog.querySelector('.qp-custom-card .qp-custom-card-text') as HTMLButtonElement);
     expect(textByServer).toHaveBeenCalledWith('workspace-host', exactText);
     expect(document.activeElement).toBe(stage);
     animationFrame.mockRestore();
@@ -4503,7 +4503,7 @@ next --flag='x:y'`;
     fireEvent.click(trigger);
     expect(trigger.getAttribute('aria-expanded')).toBe('true');
 
-    const entry = document.querySelector('.qp-pill-custom .qp-pill-text') as HTMLButtonElement;
+    const entry = document.querySelector('.qp-custom-card .qp-custom-card-text') as HTMLButtonElement;
     for (let presses = 0; presses < 20 && document.activeElement !== entry; presses += 1) {
       fireEvent.keyDown(document, { key: 'Tab' });
     }
@@ -4569,7 +4569,7 @@ next --flag='x:y'`;
       expect(trigger.getAttribute('aria-expanded')).toBe('true');
       expect(styles).toMatch(/@media \(max-width: 640px\)[\s\S]*?\.qp\s*\{[^}]*position:\s*fixed/);
       expect(styles).toMatch(/@media \(pointer: coarse\)[\s\S]*?\.remote-desktop-mobile-input-switch\s*\{[^}]*display:\s*flex/);
-      fireEvent.click(dialog.querySelector('.qp-pill-custom .qp-pill-text') as HTMLButtonElement);
+      fireEvent.click(dialog.querySelector('.qp-custom-card .qp-custom-card-text') as HTMLButtonElement);
       expect(textByServer).toHaveBeenCalledWith('server-1', exactText);
     } finally {
       if (innerWidth) Object.defineProperty(window, 'innerWidth', innerWidth);
@@ -4588,7 +4588,7 @@ next --flag='x:y'`;
     act(() => (rendered.getByRole('button', {
       name: 'remote_desktop.quick_input',
     }) as HTMLButtonElement).click());
-    const staleCommand = document.querySelector('.qp-pill-custom .qp-pill-text') as HTMLElement;
+    const staleCommand = document.querySelector('.qp-custom-card .qp-custom-card-text') as HTMLElement;
 
     act(() => clientHooks[0]!.onSnapshot({
       state: REMOTE_DESKTOP_STATE.RECONNECTING,
@@ -4617,7 +4617,8 @@ next --flag='x:y'`;
     fireEvent.click(document.querySelector('.qp-add-confirm') as HTMLButtonElement);
     expect(quickData.addPhrase).toHaveBeenCalledWith(`say: 'yes' & wait`);
 
-    fireEvent.click(document.querySelector('.qp-pill-custom .qp-pill-edit') as HTMLButtonElement);
+    fireEvent.click(document.querySelector('[data-qp-section="command"] .qp-manage-btn') as HTMLButtonElement);
+    fireEvent.click(document.querySelector('.qp-custom-card .qp-card-edit-btn') as HTMLButtonElement);
     const editInput = document.querySelector('.qp-edit-input') as HTMLInputElement;
     fireEvent.input(editInput, { target: { value: '/saved --flag="x:y"; next' } });
     fireEvent.keyDown(editInput, { key: 'Enter' });
@@ -4625,7 +4626,7 @@ next --flag='x:y'`;
     expect(quickData.addCommand).toHaveBeenCalledWith('/saved --flag="x:y"; next');
 
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
-    fireEvent.click(document.querySelector('.qp-pill-custom .qp-pill-del') as HTMLButtonElement);
+    fireEvent.click(document.querySelector('.qp-custom-card .qp-card-del-btn') as HTMLButtonElement);
     expect(confirm).toHaveBeenCalled();
     expect(quickData.removeCommand).toHaveBeenLastCalledWith('/saved --flag="a&b"');
     confirm.mockRestore();
@@ -4659,7 +4660,7 @@ next --flag='x:y'`;
       act(() => (rendered.getByRole('button', {
         name: 'remote_desktop.quick_input',
       }) as HTMLButtonElement).click());
-      return document.querySelector('.qp-pill-custom .qp-pill-text') as HTMLElement;
+      return document.querySelector('.qp-custom-card .qp-custom-card-text') as HTMLElement;
     };
 
     let stale = openAndCapture();
@@ -4753,7 +4754,7 @@ next --flag='x:y'`;
 
     const activePanel = rendered.container.querySelector('[aria-label="remote_desktop.title"]:not([hidden])') as HTMLElement;
     act(() => (activePanel.querySelector('.remote-desktop-quick-input button') as HTMLButtonElement).click());
-    const hostASelection = document.querySelector('.qp-pill-custom .qp-pill-text') as HTMLElement;
+    const hostASelection = document.querySelector('.qp-custom-card .qp-custom-card-text') as HTMLElement;
 
     rendered.rerender(panels('host-b'));
     await act(async () => { await Promise.resolve(); });
@@ -4762,7 +4763,7 @@ next --flag='x:y'`;
 
     const hostBPanel = rendered.container.querySelector('[aria-label="remote_desktop.title"]:not([hidden])') as HTMLElement;
     act(() => (hostBPanel.querySelector('.remote-desktop-quick-input button') as HTMLButtonElement).click());
-    act(() => (document.querySelector('.qp-pill-custom .qp-pill-text') as HTMLElement).click());
+    act(() => (document.querySelector('.qp-custom-card .qp-custom-card-text') as HTMLElement).click());
 
     expect(textByServer).toHaveBeenCalledTimes(1);
     expect(textByServer).toHaveBeenCalledWith('host-b', exactText);

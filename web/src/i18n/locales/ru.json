@@ -1301,7 +1301,17 @@
     "verification_authorize_alias": "Псевдоним: {{name}}",
     "verification_authorize_node": "Управляемый узел: {{name}}",
     "search_history_placeholder": "Фильтр истории…",
-    "no_history_matches": "Нет подходящей истории"
+    "no_history_matches": "Нет подходящей истории",
+    "manage": "Управление",
+    "done": "Готово",
+    "my_phrases": "Мои фразы",
+    "builtin_phrases": "Встроенные",
+    "my_commands": "Мои команды",
+    "builtin_commands": "Встроенные",
+    "copy_item": "Копировать",
+    "copied_item": "Скопировано",
+    "edit_item": "Изменить",
+    "delete_item": "Удалить"
   },
   "file_browser": {
     "title_dir": "Выбрать директорию",

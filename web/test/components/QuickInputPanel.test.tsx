@@ -44,6 +44,16 @@ vi.mock('react-i18next', () => ({
         'quick_input.label_command': 'Command',
         'quick_input.label_phrase': 'Phrase',
         'quick_input.placeholder_phrase': 'phrase',
+        'quick_input.manage': 'Manage',
+        'quick_input.done': 'Done',
+        'quick_input.my_phrases': 'My Phrases',
+        'quick_input.builtin_phrases': 'Built-in',
+        'quick_input.my_commands': 'My Commands',
+        'quick_input.builtin_commands': 'Built-in',
+        'quick_input.copy_item': 'Copy',
+        'quick_input.copied_item': 'Copied',
+        'quick_input.edit_item': 'Edit',
+        'quick_input.delete_item': 'Delete',
       };
       return map[key] ?? key;
     },
@@ -438,10 +448,10 @@ describe('QuickInputPanel history scope', () => {
     expect(screen.getByRole('button', { name: 'Older' })).toBeDefined();
   });
 
-  it('removes a custom phrase when its delete action is confirmed', () => {
+  it('removes a custom phrase when Manage mode is enabled and delete is confirmed', () => {
     const removePhrase = vi.fn();
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
-    const { container } = render(
+    render(
       <QuickInputPanel
         open
         onClose={vi.fn()}
@@ -462,7 +472,13 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const deleteButton = document.querySelector('.qp-pill-custom .qp-pill-del') as HTMLButtonElement | null;
+    expect(document.querySelector('[data-qp-section="phrase"] .qp-card-del-btn')).toBeNull();
+    const manageButton = document.querySelector('[data-qp-section="phrase"] .qp-manage-btn') as HTMLButtonElement | null;
+    expect(manageButton?.textContent).toBe('Manage');
+    fireEvent.click(manageButton!);
+    expect(manageButton?.textContent).toBe('Done');
+
+    const deleteButton = document.querySelector('[data-qp-section="phrase"] .qp-custom-card .qp-card-del-btn') as HTMLButtonElement | null;
     expect(deleteButton).not.toBeNull();
     fireEvent.click(deleteButton!);
 
@@ -471,10 +487,10 @@ describe('QuickInputPanel history scope', () => {
     confirmSpy.mockRestore();
   });
 
-  it('removes a custom command when its delete action is confirmed', () => {
+  it('removes a custom command when Manage mode is enabled and delete is confirmed', () => {
     const removeCommand = vi.fn();
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
-    const { container } = render(
+    render(
       <QuickInputPanel
         open
         onClose={vi.fn()}
@@ -495,7 +511,10 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const deleteButton = document.querySelector('.qp-pill-custom .qp-pill-del') as HTMLButtonElement | null;
+    expect(document.querySelector('[data-qp-section="command"] .qp-card-del-btn')).toBeNull();
+    fireEvent.click(document.querySelector('[data-qp-section="command"] .qp-manage-btn')!);
+
+    const deleteButton = document.querySelector('[data-qp-section="command"] .qp-custom-card .qp-card-del-btn') as HTMLButtonElement | null;
     expect(deleteButton).not.toBeNull();
     fireEvent.click(deleteButton!);
 
@@ -504,10 +523,10 @@ describe('QuickInputPanel history scope', () => {
     confirmSpy.mockRestore();
   });
 
-  it('replaces a custom phrase when edited and committed', () => {
+  it('replaces a custom phrase when edited and committed in Manage mode', () => {
     const addPhrase = vi.fn();
     const removePhrase = vi.fn();
-    const { container } = render(
+    render(
       <QuickInputPanel
         open
         onClose={vi.fn()}
@@ -528,7 +547,10 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const editButton = document.querySelector('.qp-pill-custom .qp-pill-edit') as HTMLButtonElement | null;
+    expect(document.querySelector('[data-qp-section="phrase"] .qp-card-edit-btn')).toBeNull();
+    fireEvent.click(document.querySelector('[data-qp-section="phrase"] .qp-manage-btn')!);
+
+    const editButton = document.querySelector('[data-qp-section="phrase"] .qp-custom-card .qp-card-edit-btn') as HTMLButtonElement | null;
     expect(editButton).not.toBeNull();
     fireEvent.click(editButton!);
 
@@ -541,10 +563,10 @@ describe('QuickInputPanel history scope', () => {
     expect(addPhrase).toHaveBeenCalledWith('updated phrase');
   });
 
-  it('replaces a custom command when edited and committed', () => {
+  it('replaces a custom command when edited and committed in Manage mode', () => {
     const addCommand = vi.fn();
     const removeCommand = vi.fn();
-    const { container } = render(
+    render(
       <QuickInputPanel
         open
         onClose={vi.fn()}
@@ -565,7 +587,10 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const editButton = document.querySelector('.qp-pill-custom .qp-pill-edit') as HTMLButtonElement | null;
+    expect(document.querySelector('[data-qp-section="command"] .qp-card-edit-btn')).toBeNull();
+    fireEvent.click(document.querySelector('[data-qp-section="command"] .qp-manage-btn')!);
+
+    const editButton = document.querySelector('[data-qp-section="command"] .qp-custom-card .qp-card-edit-btn') as HTMLButtonElement | null;
     expect(editButton).not.toBeNull();
     fireEvent.click(editButton!);
 
@@ -600,7 +625,7 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const commandPills = Array.from(document.querySelectorAll('.qp-section-header + .qp-pills .qp-pill-default')).map((el) => el.textContent?.trim());
+    const commandPills = Array.from(document.querySelectorAll('[data-qp-section="command"] .qp-chip-default')).map((el) => el.textContent?.trim());
     expect(commandPills).toContain('/clear');
     expect(commandPills).toContain('/model');
     expect(commandPills).toContain('/thinking');
@@ -629,7 +654,7 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const commandPills = Array.from(document.querySelectorAll('.qp-section-header + .qp-pills .qp-pill-default')).map((el) => el.textContent?.trim());
+    const commandPills = Array.from(document.querySelectorAll('[data-qp-section="command"] .qp-chip-default')).map((el) => el.textContent?.trim());
     expect(commandPills).toContain('/clear');
     expect(commandPills).toContain('/model');
     expect(commandPills).toContain('/compact');
@@ -658,7 +683,7 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const commands = Array.from(document.querySelectorAll('.qp-section-header + .qp-pills .qp-pill-default')).map((el) => el.textContent?.trim());
+    const commands = Array.from(document.querySelectorAll('[data-qp-section="command"] .qp-chip-default')).map((el) => el.textContent?.trim());
     expect(commands).toEqual(expect.arrayContaining(['/compact', '/clear', '/model']));
     expect(commands).not.toContain('/thinking');
   });
@@ -687,7 +712,7 @@ describe('QuickInputPanel history scope', () => {
 
     // The empty model catalogue makes `/model <id>` the free-text entry point
     // for the daemon's DeepSeek Harness model plumbing.
-    const commands = Array.from(document.querySelectorAll('.qp-section-header + .qp-pills .qp-pill-default')).map((el) => el.textContent?.trim());
+    const commands = Array.from(document.querySelectorAll('[data-qp-section="command"] .qp-chip-default')).map((el) => el.textContent?.trim());
     expect(commands).toEqual(expect.arrayContaining(['/clear', '/model']));
     expect(commands).not.toContain('/compact');
     expect(commands).not.toContain('/thinking');
@@ -715,7 +740,7 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const commands = Array.from(document.querySelectorAll('.qp-section-header + .qp-pills .qp-pill-default')).map((el) => el.textContent?.trim());
+    const commands = Array.from(document.querySelectorAll('[data-qp-section="command"] .qp-chip-default')).map((el) => el.textContent?.trim());
     expect(commands).toEqual(expect.arrayContaining(['/clear', '/model']));
     expect(commands).not.toContain('/compact');
     expect(commands).not.toContain('/thinking');
@@ -2175,5 +2200,236 @@ describe('useQuickData persistence guard', () => {
     expect(readOwnRecordValueSafe(serverSnapshot.sessionHistoryTimestamps?.s1, 'B')).toBeUndefined();
     expect(serverSnapshot.sessionHistoryTimestamps?.s1).toEqual({ C: 1500, A: 1000 });
     view.unmount();
+  });
+});
+
+describe('QuickInputPanel structured layout, manage toggle, and copy actions', () => {
+  beforeEach(() => {
+    localStorage.removeItem('imcodes:qp:builtin-commands-collapsed');
+    localStorage.removeItem('imcodes:qp:builtin-phrases-collapsed');
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    localStorage.removeItem('imcodes:qp:builtin-commands-collapsed');
+    localStorage.removeItem('imcodes:qp:builtin-phrases-collapsed');
+  });
+
+  function renderPanel(overrides: Partial<Parameters<typeof QuickInputPanel>[0]> = {}) {
+    return render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+        {...overrides}
+      />,
+    );
+  }
+
+  it('prioritizes custom phrases and custom commands above built-in chips and omits empty custom blocks', () => {
+    const emptyView = renderPanel();
+    expect(document.querySelector('[data-qp-section="command"] .qp-subsection-custom')).toBeNull();
+    expect(document.querySelector('[data-qp-section="phrase"] .qp-subsection-custom')).toBeNull();
+    expect(document.querySelector('[data-qp-section="command"] .qp-manage-btn')).toBeNull();
+    expect(document.querySelector('[data-qp-section="phrase"] .qp-manage-btn')).toBeNull();
+    expect(document.querySelectorAll('[data-qp-section="phrase"] .qp-chip-default').length).toBeGreaterThan(0);
+    emptyView.unmount();
+
+    renderPanel({
+      data: {
+        history: [],
+        sessionHistory: {},
+        commands: ['./scripts/restart-daemon.sh restart'],
+        phrases: ['汇报整体任务进度和时间估算'],
+      },
+    });
+
+    const phraseSubsections = Array.from(document.querySelectorAll('[data-qp-section="phrase"] .qp-subsection'));
+    expect(phraseSubsections).toHaveLength(2);
+    expect(phraseSubsections[0]?.classList.contains('qp-subsection-custom')).toBe(true);
+    expect(phraseSubsections[1]?.classList.contains('qp-subsection-builtin')).toBe(true);
+
+    const cmdSubsections = Array.from(document.querySelectorAll('[data-qp-section="command"] .qp-subsection'));
+    expect(cmdSubsections).toHaveLength(2);
+    expect(cmdSubsections[0]?.classList.contains('qp-subsection-custom')).toBe(true);
+    expect(cmdSubsections[1]?.classList.contains('qp-subsection-builtin')).toBe(true);
+  });
+
+  it('toggles Manage/Done mode cleanly, cancels inline edit on Done, and auto-exits when last item is deleted', () => {
+    const onSend = vi.fn();
+    const { rerender } = renderPanel({
+      onSend,
+      data: { history: [], sessionHistory: {}, commands: [], phrases: ['alpha phrase', 'beta phrase'] },
+    });
+
+    const phraseSection = () => document.querySelector('[data-qp-section="phrase"]')!;
+    expect(phraseSection().querySelector('.qp-card-edit-btn')).toBeNull();
+    expect(phraseSection().querySelector('.qp-card-del-btn')).toBeNull();
+
+    const manageBtn = phraseSection().querySelector('.qp-manage-btn') as HTMLButtonElement;
+    expect(manageBtn.textContent).toBe('Manage');
+    expect(manageBtn.getAttribute('aria-pressed')).toBe('false');
+
+    fireEvent.click(manageBtn);
+    expect(manageBtn.textContent).toBe('Done');
+    expect(manageBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(phraseSection().querySelectorAll('.qp-card-edit-btn')).toHaveLength(2);
+    expect(phraseSection().querySelectorAll('.qp-card-del-btn')).toHaveLength(2);
+
+    // Enter inline edit, then click Done -> cancels edit and hides management controls
+    fireEvent.click(phraseSection().querySelector('.qp-card-edit-btn')!);
+    expect(phraseSection().querySelector('.qp-edit-input')).not.toBeNull();
+    fireEvent.click(manageBtn);
+    expect(phraseSection().querySelector('.qp-edit-input')).toBeNull();
+    expect(phraseSection().querySelector('.qp-card-edit-btn')).toBeNull();
+    expect(manageBtn.textContent).toBe('Manage');
+
+    // Re-enter manage mode, delete down to empty -> manage state auto-resets if custom phrases later reappear
+    fireEvent.click(manageBtn);
+    expect(manageBtn.getAttribute('aria-pressed')).toBe('true');
+    rerender(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={onSend}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+    expect(phraseSection().querySelector('.qp-manage-btn')).toBeNull();
+
+    rerender(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={onSend}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: ['gamma phrase'] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+    expect((phraseSection().querySelector('.qp-manage-btn') as HTMLButtonElement).getAttribute('aria-pressed')).toBe('false');
+    expect(phraseSection().querySelector('.qp-card-edit-btn')).toBeNull();
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it('copies exact full untruncated multiline phrase and command without sending or closing, with temporary ✓ feedback', async () => {
+    vi.useFakeTimers();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+
+    const longMultilinePhrase = `${'A'.repeat(120)}\nsecond line with /path/to/file --flag="x"`;
+    const longCommand = `/run --long-flag=${'z'.repeat(95)}`;
+    const onSend = vi.fn();
+    const onSelect = vi.fn();
+    const onClose = vi.fn();
+
+    renderPanel({
+      onSend,
+      onSelect,
+      onClose,
+      data: {
+        history: [],
+        sessionHistory: {},
+        commands: [longCommand],
+        phrases: [longMultilinePhrase],
+      },
+    });
+
+    const phraseCard = document.querySelector('[data-qp-section="phrase"] .qp-custom-card') as HTMLElement;
+    const phraseTextBtn = phraseCard.querySelector('.qp-custom-card-text') as HTMLButtonElement;
+    const phraseCopyBtn = phraseCard.querySelector('.qp-card-copy-btn') as HTMLButtonElement;
+    expect(phraseTextBtn.getAttribute('title')).toBe(longMultilinePhrase);
+
+    fireEvent.click(phraseCopyBtn);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(writeText).toHaveBeenCalledWith(longMultilinePhrase);
+    expect(phraseCopyBtn.classList.contains('is-copied')).toBe(true);
+    expect(phraseCopyBtn.textContent).toBe('✓');
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Switching copy target before 1500ms moves ✓ feedback cleanly to command card
+    const cmdCopyBtn = document.querySelector('[data-qp-section="command"] .qp-card-copy-btn') as HTMLButtonElement;
+    fireEvent.click(cmdCopyBtn);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(writeText).toHaveBeenCalledWith(longCommand);
+    expect(cmdCopyBtn.classList.contains('is-copied')).toBe(true);
+    expect(phraseCopyBtn.classList.contains('is-copied')).toBe(false);
+
+    act(() => { vi.advanceTimersByTime(1500); });
+    expect(cmdCopyBtn.classList.contains('is-copied')).toBe(false);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('collapses and expands built-in phrases and commands and persists preference in localStorage', () => {
+    const view = renderPanel({
+      data: { history: [], sessionHistory: {}, commands: ['/mine'], phrases: ['my phrase'] },
+    });
+
+    const phraseToggle = document.querySelector('[data-qp-section="phrase"] .qp-sub-header-toggle') as HTMLButtonElement;
+    expect(phraseToggle.getAttribute('aria-expanded')).toBe('true');
+    expect(document.querySelector('[data-qp-section="phrase"] .qp-builtin-chips')).not.toBeNull();
+
+    fireEvent.click(phraseToggle);
+    expect(phraseToggle.getAttribute('aria-expanded')).toBe('false');
+    expect(document.querySelector('[data-qp-section="phrase"] .qp-builtin-chips')).toBeNull();
+    expect(localStorage.getItem('imcodes:qp:builtin-phrases-collapsed')).toBe('true');
+
+    view.unmount();
+
+    renderPanel({
+      data: { history: [], sessionHistory: {}, commands: ['/mine'], phrases: ['my phrase'] },
+    });
+    const reopenedToggle = document.querySelector('[data-qp-section="phrase"] .qp-sub-header-toggle') as HTMLButtonElement;
+    expect(reopenedToggle.getAttribute('aria-expanded')).toBe('false');
+    expect(document.querySelector('[data-qp-section="phrase"] .qp-builtin-chips')).toBeNull();
+
+    fireEvent.click(reopenedToggle);
+    expect(reopenedToggle.getAttribute('aria-expanded')).toBe('true');
+    expect(document.querySelector('[data-qp-section="phrase"] .qp-builtin-chips')).not.toBeNull();
+    expect(localStorage.getItem('imcodes:qp:builtin-phrases-collapsed')).toBe('false');
   });
 });
